@@ -98,3 +98,7 @@ app.json
 
 # Project-local Serena configuration and memories.
 .serena/
+
+# Gemini CLI settings and GitHub App credentials used by the AI review workflow.
+.gemini/
+gha-creds-*.json
