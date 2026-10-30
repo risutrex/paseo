@@ -13,6 +13,7 @@ import {
   RequestError,
   ndJsonStream,
   type Agent,
+  type Client as ACPClient,
   type CreateTerminalRequest,
   PermissionOption,
   PromptResponse,
@@ -2531,6 +2532,194 @@ describe("ACPAgentClient listImportableSessions", () => {
       ).rejects.toThrow(/session\/list timed out/);
       await vi.advanceTimersByTimeAsync(20_000);
       await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("ACPAgentClient listImportableSessions with a busy provider", () => {
+  // Providers answer ACP requests one at a time. A session/load that never
+  // finishes therefore blocks every later request on the same connection -
+  // including the next session/list page, which used to time out and fail the
+  // whole listing.
+  function makeClient(args: {
+    listSessions: ReturnType<typeof vi.fn>;
+    loadSession: ReturnType<typeof vi.fn>;
+    terminateProcess: (child: unknown, options: unknown) => Promise<void>;
+    onSpawn?: (index: number, client: ACPClient | undefined) => void;
+  }) {
+    const children: unknown[] = [];
+    class TestACPAgentClient extends ACPAgentClient {
+      protected override async spawnProcess(
+        _launchEnv?: Record<string, string>,
+        options?: { client?: ACPClient },
+      ): Promise<SpawnedACPProcess> {
+        const child = {
+          kill: vi.fn(),
+          exitCode: 0,
+          signalCode: null,
+          once: vi.fn(),
+          stdin: { destroy: vi.fn() },
+          stdout: { destroy: vi.fn() },
+          stderr: { destroy: vi.fn() },
+        };
+        children.push(child);
+        args.onSpawn?.(children.length - 1, options?.client);
+        return {
+          child: child as never,
+          connection: { listSessions: args.listSessions, loadSession: args.loadSession },
+          initialize: {
+            agentCapabilities: { sessionCapabilities: { list: {} }, loadSession: true },
+          },
+        } as unknown as SpawnedACPProcess;
+      }
+    }
+
+    const client = new TestACPAgentClient({
+      provider: "kimi",
+      logger: createTestLogger(),
+      defaultCommand: ["kimi", "acp"],
+      defaultModes: [],
+      terminateProcess: args.terminateProcess as never,
+    });
+    return { client, children };
+  }
+
+  function userMessage(text: string): SessionUpdate {
+    return {
+      sessionUpdate: "user_message_chunk",
+      messageId: "user-1",
+      content: { type: "text", text },
+    } as SessionUpdate;
+  }
+
+  test("reads the next list page from a fresh probe after the provider got stuck", async () => {
+    vi.useFakeTimers();
+    try {
+      let probeClient: ACPClient | undefined;
+      let probeIndex = 0;
+      const listProbes: number[] = [];
+      const loadProbes: number[] = [];
+      let page = 0;
+      const listSessions = vi.fn(async () => {
+        listProbes.push(probeIndex);
+        page += 1;
+        return page === 1
+          ? {
+              sessions: [
+                {
+                  sessionId: "stuck",
+                  cwd: "/Users/moonshot",
+                  title: "huge",
+                  updatedAt: "2026-06-13T00:00:00.000Z",
+                },
+              ],
+              nextCursor: "cursor-2",
+            }
+          : {
+              sessions: [
+                {
+                  sessionId: "next",
+                  cwd: "/Users/moonshot",
+                  title: "next",
+                  updatedAt: "2026-06-14T00:00:00.000Z",
+                },
+              ],
+              nextCursor: null,
+            };
+      });
+      let loads = 0;
+      const loadSession = vi.fn(async (params: { sessionId: string }) => {
+        loadProbes.push(probeIndex);
+        loads += 1;
+        // The first history never finishes: the provider is busy with it.
+        if (loads === 1) return await new Promise<never>(() => {});
+        await probeClient?.sessionUpdate({
+          sessionId: params.sessionId,
+          update: userMessage("hello"),
+        });
+      });
+
+      const { client } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess: async () => {},
+        onSpawn: (index, spawned) => {
+          probeIndex = index;
+          probeClient = spawned;
+        },
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await listing;
+
+      expect(result.map((session) => session.providerHandleId)).toEqual(["stuck", "next"]);
+      // The stuck provider answers no request, so the next page has to come
+      // from the replacement probe.
+      expect(listProbes).toEqual([0, 1]);
+      expect(loadProbes).toEqual([0, 1]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("replaces a probe whose provider is stuck on a session history", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      let probeClient: ACPClient | undefined;
+      const listSessions = vi.fn(async () => ({
+        sessions: [
+          {
+            sessionId: "stuck",
+            cwd: "/Users/moonshot",
+            title: "huge",
+            updatedAt: "2026-06-13T00:00:00.000Z",
+          },
+          {
+            sessionId: "fast",
+            cwd: "/Users/moonshot",
+            title: "small",
+            updatedAt: "2026-06-14T00:00:00.000Z",
+          },
+        ],
+        nextCursor: null,
+      }));
+      let loads = 0;
+      const loadSession = vi.fn(async (params: { sessionId: string }) => {
+        loads += 1;
+        // The first history never finishes: the provider is busy with it.
+        if (loads === 1) return await new Promise<never>(() => {});
+        await probeClient?.sessionUpdate({
+          sessionId: params.sessionId,
+          update: userMessage("hello"),
+        });
+      });
+
+      const { client, children } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+        onSpawn: (_index, spawned) => {
+          probeClient = spawned;
+        },
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await listing;
+
+      // The stuck session stays visible, the rest of the listing still works.
+      expect(result.map((session) => session.providerHandleId)).toEqual(["stuck", "fast"]);
+      expect(result[0].firstPromptPreview).toBeNull();
+      expect(result[1].firstPromptPreview).toBe("hello");
+      // The stuck provider was killed and replaced by a fresh probe.
+      expect(children).toHaveLength(2);
+      expect(terminateProcess).toHaveBeenCalledTimes(2);
+      expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
+      expect(terminateProcess.mock.calls[1]?.[0]).toBe(children[1]);
     } finally {
       vi.useRealTimers();
     }
