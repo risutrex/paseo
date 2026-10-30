@@ -1117,16 +1117,23 @@ export class AgentManager {
     const providerResults = await Promise.all(
       providerEntries.map(async ([provider, client]) => {
         try {
+          // The provider does expensive work for a listing (loading session
+          // histories). Give it an abort signal so an abandoned listing stops
+          // the provider instead of leaving it running in the background.
+          const controller = new AbortController();
           const sessions = await withTimeout(
             client.listImportableSessions!({
               limit: options?.limit,
               query: options?.query,
               scanLimit: options?.scanLimit,
               cwd: options?.cwd,
+              signal: controller.signal,
             }),
             IMPORTABLE_SESSION_LIST_TIMEOUT_MS,
             `Timed out listing importable sessions for provider '${provider}' after ${IMPORTABLE_SESSION_LIST_TIMEOUT_MS}ms`,
-          );
+          ).finally(() => {
+            controller.abort();
+          });
           return {
             sessions: sessions
               .filter((session) => matchesImportableSessionQuery(session, options?.query))

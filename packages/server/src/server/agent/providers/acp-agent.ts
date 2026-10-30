@@ -333,6 +333,9 @@ const ACP_TURN_RELEASE_TIMEOUT_MS = 1_500;
 // stuck provider. Bound it instead of letting the interruption hang.
 const ACP_CANCEL_NOTIFICATION_TIMEOUT_MS = 1_000;
 const ACP_IMPORT_HISTORY_LOAD_TIMEOUT_MS = 30_000;
+// A provider that never answers `session/list` must not block the listing
+// forever: bound the call and let the caller retry.
+const ACP_IMPORT_SESSION_LIST_TIMEOUT_MS = 20_000;
 const ACP_IMPORT_HISTORY_BUDGET_MS = 60_000;
 
 function summarizeMalformedACPStdoutError(error: unknown): { type: string; message: string } {
@@ -1245,6 +1248,10 @@ export class ACPAgentClient implements AgentClient {
     const probe = await this.spawnProcess(PROBE_ENV, {
       client: this.buildProbeClient((params) => history.accept(params)),
     });
+    // An abandoned listing must not leave the probe running: the provider keeps
+    // working on the requests it already received, so cancelling the caller is
+    // not enough - the child process has to go.
+    const abort = this.bindImportAbort(options?.signal, probe);
     try {
       if (!probe.initialize.agentCapabilities?.sessionCapabilities?.list) {
         return [];
@@ -1258,9 +1265,10 @@ export class ACPAgentClient implements AgentClient {
       let scanned = 0;
       let cursor: string | null | undefined;
       for (;;) {
-        const page: ListSessionsResponse = await this.runACPRequest(() =>
-          probe.connection.listSessions(acpSessionListRequest(cursor, options?.cwd)),
-        );
+        if (abort.triggered()) {
+          throw new Error("ACP import session listing was aborted");
+        }
+        const page = await this.fetchImportSessionsPage(probe, cursor, options?.cwd);
         for (const session of page.sessions) {
           if (scanned >= scanLimit || sessions.length >= resultLimit) break;
           scanned += 1;
@@ -1280,8 +1288,42 @@ export class ACPAgentClient implements AgentClient {
 
       return sessions;
     } finally {
+      abort.dispose();
       await this.closeProbe(probe);
     }
+  }
+
+  /**
+   * Terminates the probe process when the caller gives up on the listing, so
+   * an abandoned request cannot leave the provider working in the background.
+   */
+  private bindImportAbort(
+    signal: AbortSignal | undefined,
+    probe: SpawnedACPProcess,
+  ): { triggered: () => boolean; dispose: () => void } {
+    let aborted = false;
+    const handleAbort = (): void => {
+      aborted = true;
+      void terminateChildProcess(probe.child, 2_000, this.terminateProcess);
+    };
+    signal?.addEventListener("abort", handleAbort, { once: true });
+    return {
+      triggered: () => aborted,
+      dispose: () => signal?.removeEventListener("abort", handleAbort),
+    };
+  }
+
+  /** A provider that never answers `session/list` must not block the listing. */
+  private async fetchImportSessionsPage(
+    probe: SpawnedACPProcess,
+    cursor: string | null | undefined,
+    cwd: string | undefined,
+  ): Promise<ListSessionsResponse> {
+    return withTimeout(
+      this.runACPRequest(() => probe.connection.listSessions(acpSessionListRequest(cursor, cwd))),
+      ACP_IMPORT_SESSION_LIST_TIMEOUT_MS,
+      `ACP session/list timed out after ${ACP_IMPORT_SESSION_LIST_TIMEOUT_MS}ms`,
+    );
   }
 
   private async describeImportableSession(
