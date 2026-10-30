@@ -555,6 +555,12 @@ export interface ListImportableSessionsOptions {
    * sessions by working directory should do so before doing expensive work.
    */
   cwd?: string;
+  /**
+   * Aborts the listing. Providers must stop their work and release every
+   * resource they acquired for it, so an abandoned listing cannot leave a
+   * provider process running.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ImportableProviderSession {

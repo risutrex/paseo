@@ -11601,6 +11601,35 @@ test("listImportableSessions returns healthy rows alongside thrown and timed-out
   }
 });
 
+test("listImportableSessions aborts the provider when the listing times out", async () => {
+  vi.useFakeTimers();
+  try {
+    const hangingClient = new RecordingPersistedAgentsClient("pi");
+    let receivedSignal: AbortSignal | undefined;
+    hangingClient.listImportableSessions = async (options) => {
+      receivedSignal = options?.signal;
+      return await new Promise(() => undefined);
+    };
+    const manager = new AgentManager({
+      clients: { pi: hangingClient },
+      providerDefinitions: {
+        pi: { enabled: true, derivedFromProviderId: null },
+      },
+      logger,
+    });
+
+    const resultPromise = manager.listImportableSessions();
+    await vi.advanceTimersByTimeAsync(90_000);
+    await resultPromise;
+
+    // The provider must learn that nobody is waiting any more, so it can stop
+    // the work it started instead of running on in the background.
+    expect(receivedSignal?.aborted).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("listImportableSessions searches every provider result before global ranking", async () => {
   const client = new RecordingPersistedAgentsClient("claude");
   client.listImportableSessions = async () => [

@@ -2371,11 +2371,26 @@ describe("ACPAgentClient fetchCatalog", () => {
 });
 
 describe("ACPAgentClient listImportableSessions", () => {
-  function makeClient(args: { listSessions: ReturnType<typeof vi.fn>; supportsList?: boolean }) {
+  function makeClient(args: {
+    listSessions: ReturnType<typeof vi.fn>;
+    supportsList?: boolean;
+    terminateProcess?: (child: unknown, options: unknown) => Promise<void>;
+    child?: unknown;
+  }) {
+    const kill = vi.fn();
+    const defaultChild = {
+      kill,
+      exitCode: 0,
+      signalCode: null,
+      once: vi.fn(),
+      stdin: { destroy: vi.fn() },
+      stdout: { destroy: vi.fn() },
+      stderr: { destroy: vi.fn() },
+    };
     class TestACPAgentClient extends ACPAgentClient {
       protected override async spawnProcess(): Promise<SpawnedACPProcess> {
         return {
-          child: { kill: vi.fn(), exitCode: 0, signalCode: null, once: vi.fn() },
+          child: (args.child ?? defaultChild) as never,
           connection: { listSessions: args.listSessions },
           initialize: {
             agentCapabilities:
@@ -2392,6 +2407,7 @@ describe("ACPAgentClient listImportableSessions", () => {
       logger: createTestLogger(),
       defaultCommand: ["kimi", "acp"],
       defaultModes: [],
+      ...(args.terminateProcess ? { terminateProcess: args.terminateProcess as never } : {}),
     });
   }
 
@@ -2469,6 +2485,55 @@ describe("ACPAgentClient listImportableSessions", () => {
       cursor: "cursor-2",
       cwd: "/Users/moonshot",
     });
+  });
+
+  test("terminates the probe process when the listing is aborted", async () => {
+    // The provider answers the first page and then stops answering. Without an
+    // abort signal the probe keeps running for as long as the provider needs
+    // to finish the requests it already received.
+    let rejectSecondPage!: (error: Error) => void;
+    const secondPage = new Promise<never>((_resolve, reject) => {
+      rejectSecondPage = reject;
+    });
+    const listSessions = vi
+      .fn()
+      .mockResolvedValueOnce({
+        sessions: [{ sessionId: "s1", cwd: "/Users/moonshot", title: null, updatedAt: null }],
+        nextCursor: "cursor-2",
+      })
+      .mockReturnValue(secondPage);
+    const terminateProcess = vi.fn().mockImplementation(async () => {
+      rejectSecondPage(new Error("probe terminated"));
+    });
+    const client = makeClient({ listSessions, terminateProcess });
+    const controller = new AbortController();
+
+    const listing = client.listImportableSessions({
+      cwd: "/Users/moonshot",
+      signal: controller.signal,
+    });
+    // let the first page resolve so the listing is waiting on the second one
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    controller.abort();
+
+    await expect(listing).rejects.toThrow();
+    expect(terminateProcess).toHaveBeenCalledTimes(1);
+  });
+
+  test("bounds session/list so a provider that never answers cannot hang the listing", async () => {
+    vi.useFakeTimers();
+    try {
+      const listSessions = vi.fn().mockImplementation(() => new Promise<never>(() => {}));
+      const client = makeClient({ listSessions });
+
+      const assertion = expect(
+        client.listImportableSessions({ cwd: "/Users/moonshot" }),
+      ).rejects.toThrow(/session\/list timed out/);
+      await vi.advanceTimersByTimeAsync(20_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
