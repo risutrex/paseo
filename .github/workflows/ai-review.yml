@@ -28,7 +28,7 @@ jobs:
     # Только свои ветки: секрет не должен попасть к коду из чужого форка.
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
       - name: Checkout repository
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # ratchet:actions/checkout@v6
@@ -46,6 +46,7 @@ jobs:
           ADDITIONAL_CONTEXT: 'Focus on correctness, races and resource leaks in the ACP provider code.'
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: '${{ vars.GEMINI_MODEL }}'
           github_pr_number: ${{ github.event.pull_request.number }}
           workflow_name: 'ai-review'
           settings: |-
