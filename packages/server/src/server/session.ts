@@ -6399,6 +6399,9 @@ export class Session {
             ? { filteredAlreadyImportedCount: result.filteredAlreadyImportedCount }
             : {}),
           ...(result.providerErrors.length > 0 ? { providerErrors: result.providerErrors } : {}),
+          // The client needs to know that the listing was built without prompt
+          // previews: the search then covered titles and folders only.
+          ...(result.previewsUnavailable ? { previewsUnavailable: true } : {}),
         },
       });
     } catch (error) {

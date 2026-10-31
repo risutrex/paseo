@@ -53,6 +53,7 @@ import type {
   AgentTimelineItem,
   ImportProviderSessionInput,
   ImportProviderSessionContext,
+  ListImportableSessionsOptions,
   ResolveAgentDefaultModeInput,
 } from "./agent-sdk-types.js";
 import type { PaseoToolCatalog } from "./tools/types.js";
@@ -11551,6 +11552,102 @@ test("listImportableSessions skips providers that lack supportsSessionListing ev
   expect(listableClient.calls).toBe(1);
   expect(nonListableClient.calls).toBe(0);
   expect(result.sessions.map((d) => d.provider)).toEqual(["claude"]);
+});
+
+test("listImportableSessions skips previews for providers that cannot load them cheaply", async () => {
+  const expensiveClient = new RecordingPersistedAgentsClient("minimax-code");
+  // A preview here means a full session restore inside the provider process, so
+  // the manager must not ask for one at all.
+  Object.defineProperty(expensiveClient, "capabilities", {
+    value: { ...TEST_CAPABILITIES, importSessionPreviewsAreCheap: false },
+  });
+  const received: Array<ListImportableSessionsOptions | undefined> = [];
+  expensiveClient.listImportableSessions = async (options) => {
+    received.push(options);
+    return [
+      {
+        providerHandleId: "huge-session",
+        cwd: "/tmp/recent",
+        title: "Release notes for 2.0",
+        firstPromptPreview: null,
+        lastPromptPreview: null,
+        lastActivityAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ];
+  };
+  const manager = new AgentManager({
+    clients: { "minimax-code": expensiveClient },
+    providerDefinitions: {
+      "minimax-code": { enabled: true, derivedFromProviderId: null },
+    },
+    logger,
+  });
+
+  const result = await manager.listImportableSessions({ query: "release notes" });
+
+  expect(received[0]?.includePreviews).toBe(false);
+  // Without previews the descriptor still answers a query, because the title
+  // survives the cheap listing.
+  expect(result.sessions.map((session) => session.providerHandleId)).toEqual(["huge-session"]);
+  expect(result.previewsUnavailable).toBe(true);
+});
+
+test("listImportableSessions keeps requesting previews from providers that did not opt out", async () => {
+  const cheapClient = new RecordingPersistedAgentsClient("claude");
+  const received: Array<ListImportableSessionsOptions | undefined> = [];
+  cheapClient.listImportableSessions = async (options) => {
+    received.push(options);
+    return [
+      {
+        providerHandleId: "claude-session",
+        cwd: "/tmp/recent",
+        title: "Cheap preview",
+        firstPromptPreview: "first prompt",
+        lastPromptPreview: "last prompt",
+        lastActivityAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ];
+  };
+  const manager = new AgentManager({
+    clients: { claude: cheapClient },
+    providerDefinitions: {
+      claude: { enabled: true, derivedFromProviderId: null },
+    },
+    logger,
+  });
+
+  const result = await manager.listImportableSessions();
+
+  expect(received[0]?.includePreviews).toBe(true);
+  expect(result.sessions[0]?.firstPromptPreview).toBe("first prompt");
+  // Nothing is missing, so the flag stays off the result.
+  expect(result.previewsUnavailable).toBeUndefined();
+  expect("previewsUnavailable" in result).toBe(false);
+});
+
+test("listImportableSessions does not blame previews for a provider that failed", async () => {
+  const failingClient = new RecordingPersistedAgentsClient("minimax-code");
+  Object.defineProperty(failingClient, "capabilities", {
+    value: { ...TEST_CAPABILITIES, importSessionPreviewsAreCheap: false },
+  });
+  failingClient.listImportableSessions = async () => {
+    throw new Error("minimax-code listing failed");
+  };
+  const manager = new AgentManager({
+    clients: { "minimax-code": failingClient },
+    providerDefinitions: {
+      "minimax-code": { enabled: true, derivedFromProviderId: null },
+    },
+    logger,
+  });
+
+  const result = await manager.listImportableSessions();
+
+  // The provider answered with an error and no rows at all, so saying that its
+  // previews were missing would point the search at the wrong reason.
+  expect(result.providerErrors).toHaveLength(1);
+  expect(result.previewsUnavailable).toBeUndefined();
+  expect("previewsUnavailable" in result).toBe(false);
 });
 
 test("listImportableSessions returns healthy rows alongside thrown and timed-out provider errors", async () => {

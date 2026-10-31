@@ -379,6 +379,34 @@ test("listImportableProviderSessions requests a bounded deep scan for search res
   ]);
 });
 
+test("listImportableProviderSessions reports that previews were unavailable", async () => {
+  const expensiveSession = makeImportableSession({
+    provider: "minimax-code",
+    sessionId: "huge-session",
+    title: "Release notes for 2.0",
+    lastActivityAt: "2026-04-30T12:00:00.000Z",
+  });
+
+  const result = await listImportableProviderSessions({
+    request: makeRequest({ providers: ["minimax-code"], limit: 5 }),
+    agentManager: {
+      listAgents: () => [],
+      listImportableSessions: async () => ({
+        ...makeImportableSessionsResult([expensiveSession]),
+        // The provider listed its descriptors without paying for a
+        // session/load per session.
+        previewsUnavailable: true,
+      }),
+    },
+    agentStorage: { list: async () => [] },
+    providerSnapshotManager: { getProviderLabel: (provider) => provider },
+  });
+
+  // The client needs to know why these rows have no prompt text.
+  expect(result.previewsUnavailable).toBe(true);
+  expect(result.entries.map((entry) => entry.providerHandleId)).toEqual(["huge-session"]);
+});
+
 test("listImportableProviderSessions includes a provider session after its Paseo agent is archived", async () => {
   const cwd = "/tmp/project";
   const archivedSession = makeImportableSession({

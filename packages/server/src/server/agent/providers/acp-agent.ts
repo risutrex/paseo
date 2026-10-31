@@ -273,6 +273,12 @@ export const DEFAULT_ACP_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: true,
   supportsSessionPersistence: true,
   supportsSessionListing: true,
+  // ACP has no cheap transcript read: the only way to a prompt preview is
+  // session/load, which makes the provider rebuild the whole session in its own
+  // memory. For a large minimax-code session that is 2.7 GB of RAM per listing
+  // (322 MB of snapshots replayed on every load), so the import list asks for
+  // previews only when the caller can pay for them.
+  importSessionPreviewsAreCheap: false,
   supportsDynamicModes: true,
   supportsMcpServers: true,
   supportsReasoningStream: true,
@@ -1337,7 +1343,13 @@ export class ACPAgentClient implements AgentClient {
     const sessions: ImportableProviderSession[] = [];
     const resultLimit = options?.limit ?? Number.POSITIVE_INFINITY;
     const scanLimit = Math.min(options?.scanLimit ?? 500, 500);
-    const canLoadHistory = probe.initialize.agentCapabilities?.loadSession === true;
+    // A session/list descriptor is already enough to list a session (title, cwd,
+    // updatedAt), and the preview is the only part that needs session/load.
+    // Skipping it keeps a 500 candidate search cheap; the scan limit stays as it
+    // is because descriptors alone are nearly free to walk.
+    const canLoadHistory =
+      options?.includePreviews !== false &&
+      probe.initialize.agentCapabilities?.loadSession === true;
     // One deadline for the history loads. Together with the page timeouts it
     // has to stay below the agent manager's 90s budget for the listing.
     const historyDeadline = this.now() + ACP_IMPORT_HISTORY_BUDGET_MS;

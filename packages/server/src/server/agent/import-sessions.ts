@@ -72,6 +72,8 @@ export interface ListImportableProviderSessionsResult {
   entries: RecentProviderSessionDescriptorPayload[];
   filteredAlreadyImportedCount: number;
   providerErrors: Array<{ provider: string; message: string }>;
+  /** Set when a provider listed sessions without loading their prompt previews. */
+  previewsUnavailable?: boolean;
 }
 
 export interface ImportProviderSessionInput {
@@ -174,6 +176,7 @@ export async function listImportableProviderSessions(
     entries,
     filteredAlreadyImportedCount,
     providerErrors: listing.providerErrors,
+    ...(listing.previewsUnavailable ? { previewsUnavailable: true } : {}),
   };
 }
 

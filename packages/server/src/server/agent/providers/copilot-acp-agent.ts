@@ -26,6 +26,10 @@ const COPILOT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: true,
   supportsSessionPersistence: true,
   supportsSessionListing: true,
+  // Copilot speaks ACP, so a prompt preview costs the same session/load as
+  // for any other ACP provider: the whole conversation is restored in the
+  // provider's memory just to read the first prompt.
+  importSessionPreviewsAreCheap: false,
   supportsDynamicModes: true,
   supportsMcpServers: true,
   supportsReasoningStream: true,

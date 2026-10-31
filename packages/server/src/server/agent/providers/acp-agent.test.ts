@@ -3142,6 +3142,130 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
   });
 });
 
+describe("ACPAgentClient listImportableSessions without previews", () => {
+  // ACP has no cheap transcript read, so a preview costs a session/load - and
+  // minimax-code answers that by restoring the whole session: 322 MB of
+  // snapshots become 2.7 GB of RAM and a pinned CPU core. The import list still
+  // has to show those sessions, so the preview is the only thing it drops.
+  function makeClient(args: {
+    listSessions: ReturnType<typeof vi.fn>;
+    loadSession: ReturnType<typeof vi.fn>;
+    onSpawn?: (client: ACPClient | undefined) => void;
+  }) {
+    class TestACPAgentClient extends ACPAgentClient {
+      protected override async spawnProcess(
+        _launchEnv?: Record<string, string>,
+        options?: { client?: ACPClient },
+      ): Promise<SpawnedACPProcess> {
+        args.onSpawn?.(options?.client);
+        return {
+          child: {
+            kill: vi.fn(),
+            exitCode: 0,
+            signalCode: null,
+            once: vi.fn(),
+            stdin: { destroy: vi.fn() },
+            stdout: { destroy: vi.fn() },
+            stderr: { destroy: vi.fn() },
+          } as never,
+          connection: { listSessions: args.listSessions, loadSession: args.loadSession },
+          initialize: {
+            agentCapabilities: { sessionCapabilities: { list: {} }, loadSession: true },
+          },
+        } as unknown as SpawnedACPProcess;
+      }
+
+      protected override async closeProbe(): Promise<void> {}
+    }
+
+    return new TestACPAgentClient({
+      provider: "minimax-code",
+      logger: createTestLogger(),
+      defaultCommand: ["minimax-code", "acp"],
+      defaultModes: [],
+      terminateProcess: (async () => {}) as never,
+    });
+  }
+
+  test("lists descriptors without a single history load when previews are excluded", async () => {
+    const listSessions = vi.fn(async () => ({
+      sessions: [
+        {
+          sessionId: "huge",
+          cwd: "/Users/moonshot",
+          title: "Release notes for 2.0",
+          updatedAt: "2026-06-13T00:00:00.000Z",
+        },
+      ],
+      nextCursor: null,
+    }));
+    const loadSession = vi.fn(async () => {
+      throw new Error("session/load must not run when previews are excluded");
+    });
+
+    const client = makeClient({ listSessions, loadSession });
+
+    const result = await client.listImportableSessions({
+      cwd: "/Users/moonshot",
+      query: "release notes",
+      includePreviews: false,
+    });
+
+    // The provider is never asked to restore a session for the listing.
+    expect(loadSession).not.toHaveBeenCalled();
+    // The descriptor alone still describes the session, title included, so the
+    // manager can match a query against it without any preview text.
+    expect(result).toEqual([
+      {
+        providerHandleId: "huge",
+        cwd: "/Users/moonshot",
+        title: "Release notes for 2.0",
+        firstPromptPreview: null,
+        lastPromptPreview: null,
+        lastActivityAt: new Date("2026-06-13T00:00:00.000Z"),
+      },
+    ]);
+  });
+
+  test("loads prompt previews when the caller does not exclude them", async () => {
+    let probeClient: ACPClient | undefined;
+    const listSessions = vi.fn(async () => ({
+      sessions: [
+        {
+          sessionId: "small",
+          cwd: "/Users/moonshot",
+          title: "small",
+          updatedAt: "2026-06-13T00:00:00.000Z",
+        },
+      ],
+      nextCursor: null,
+    }));
+    const loadSession = vi.fn(async (params: { sessionId: string }) => {
+      await probeClient?.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "user_message_chunk",
+          messageId: "user-1",
+          content: { type: "text", text: "hello" },
+        } as SessionUpdate,
+      });
+    });
+
+    const client = makeClient({
+      listSessions,
+      loadSession,
+      onSpawn: (spawned) => {
+        probeClient = spawned;
+      },
+    });
+
+    const result = await client.listImportableSessions({ cwd: "/Users/moonshot", limit: 20 });
+
+    expect(loadSession).toHaveBeenCalledTimes(1);
+    expect(result[0].firstPromptPreview).toBe("hello");
+  });
+});
+
 describe("ACP providers advertise session listing", () => {
   // The daemon's agent-manager only queries providers whose
   // capabilities.supportsSessionListing is true. Without it, ACP providers
@@ -3158,6 +3282,24 @@ describe("ACP providers advertise session listing", () => {
   test("Copilot ACP client reports supportsSessionListing", () => {
     const client = new CopilotACPAgentClient({ logger: createTestLogger() });
     expect(client.capabilities.supportsSessionListing).toBe(true);
+  });
+
+  test("generic ACP clients report that import previews are not cheap", () => {
+    // The import list only skips previews for providers that say so, so this
+    // flag is what keeps a big minimax-code session from being restored into
+    // memory on every keystroke in the import search.
+    const client = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: ["minimax-code", "acp"],
+    });
+    expect(client.capabilities.importSessionPreviewsAreCheap).toBe(false);
+  });
+
+  test("Copilot ACP client reports that import previews are not cheap", () => {
+    // Copilot replaces the ACP capabilities wholesale, so without the flag it
+    // would keep loading every session to read its first prompt.
+    const client = new CopilotACPAgentClient({ logger: createTestLogger() });
+    expect(client.capabilities.importSessionPreviewsAreCheap).toBe(false);
   });
 });
 
