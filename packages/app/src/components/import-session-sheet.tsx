@@ -75,6 +75,7 @@ type RecentSessionsResponse = Awaited<
 type SessionsQueryKey = ReadonlyArray<string | number | null>;
 
 function buildSessionsQueryKey(input: {
+  serverId: string | null;
   cwd: string | null;
   query: string;
   limit: number;
@@ -82,6 +83,9 @@ function buildSessionsQueryKey(input: {
 }): SessionsQueryKey {
   return [
     "recent-provider-sessions",
+    // The host is part of the identity of the answer: two hosts can serve the
+    // same directory, and a key without it mixes their listings.
+    input.serverId,
     input.cwd,
     input.query,
     input.limit,
@@ -96,11 +100,26 @@ interface SessionsQueryConfig {
   // Query's default retry would keep the header spinner turning and pile up
   // in-flight daemon requests behind a dead provider (#2512).
   retry: false;
+  // The app-wide default keeps a query fresh forever and never refetches it
+  // on mount, which is wrong for a listing that changes while the user works:
+  // sessions come and go, and a sheet opened later must not show what the
+  // host knew hours ago. A listing is therefore always stale, so opening the
+  // sheet asks the host again; the cached rows stay on screen meanwhile.
+  staleTime: number;
+  refetchOnMount: boolean | "always";
   placeholderData: typeof keepPreviousData;
   queryFn: () => Promise<RecentSessionsResponse>;
 }
 
+/**
+ * A listing is never considered fresh: the provider's session list changes
+ * while the user works, and a sheet opened later must not show a list from
+ * hours ago.
+ */
+const IMPORT_SESSIONS_STALE_TIME_MS = 0;
+
 function buildSessionsQueriesConfig(args: {
+  serverId: string | null;
   providersToFetch: AgentProvider[] | null;
   visible: boolean;
   client: RecentProviderSessionsClient | null;
@@ -109,13 +128,24 @@ function buildSessionsQueriesConfig(args: {
   limit: number;
   hostDisconnectedMessage?: string;
 }): SessionsQueryConfig[] {
-  const { providersToFetch, visible, client, cwd, query, limit, hostDisconnectedMessage } = args;
+  const {
+    serverId,
+    providersToFetch,
+    visible,
+    client,
+    cwd,
+    query,
+    limit,
+    hostDisconnectedMessage,
+  } = args;
   if (providersToFetch === null) return [];
   const enabled = visible && Boolean(client);
   return providersToFetch.map((provider) => ({
-    queryKey: buildSessionsQueryKey({ cwd, query, limit, provider }),
+    queryKey: buildSessionsQueryKey({ serverId, cwd, query, limit, provider }),
     enabled,
     retry: false as const,
+    staleTime: IMPORT_SESSIONS_STALE_TIME_MS,
+    refetchOnMount: "always",
     placeholderData: keepPreviousData,
     queryFn: async () => {
       if (!client) {
@@ -543,11 +573,15 @@ export function ImportSessionSheet({
     [snapshotEntries],
   );
 
-  const sessionsQueryRoot = useMemo(() => ["recent-provider-sessions", scopeCwd], [scopeCwd]);
+  const sessionsQueryRoot = useMemo(
+    () => ["recent-provider-sessions", serverId, scopeCwd] as const,
+    [serverId, scopeCwd],
+  );
 
   const queriesConfig = useMemo(
     () =>
       buildSessionsQueriesConfig({
+        serverId,
         providersToFetch,
         visible,
         client,
@@ -556,7 +590,7 @@ export function ImportSessionSheet({
         limit: pageLimit,
         hostDisconnectedMessage: t("workspace.terminal.hostDisconnected"),
       }),
-    [providersToFetch, visible, client, scopeCwd, query, pageLimit, t],
+    [serverId, providersToFetch, visible, client, scopeCwd, query, pageLimit, t],
   );
 
   const queries = useQueries({ queries: queriesConfig });
@@ -738,10 +772,16 @@ export function ImportSessionSheet({
   const handleRetryProvider = useCallback(
     (provider: string) => {
       void queryClient.refetchQueries({
-        queryKey: buildSessionsQueryKey({ cwd: scopeCwd, query, limit: pageLimit, provider }),
+        queryKey: buildSessionsQueryKey({
+          serverId,
+          cwd: scopeCwd,
+          query,
+          limit: pageLimit,
+          provider,
+        }),
       });
     },
-    [pageLimit, query, queryClient, scopeCwd],
+    [pageLimit, query, queryClient, scopeCwd, serverId],
   );
 
   const handleShowAll = useCallback(() => setIsShowingAllDirectories(true), []);
