@@ -3440,6 +3440,49 @@ describe("ACPAgentSession", () => {
     ]);
   });
 
+  test("retries the prompt when the provider still owns the previous turn", async () => {
+    // A provider that just answered a cancelled prompt frees the session a
+    // moment later and refuses the next prompt in that window.
+    const session = createSession();
+    const turnIdDuringRetry: (string | null)[] = [];
+    const prompt = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      )
+      .mockImplementation(async () => {
+        turnIdDuringRetry.push(asInternals<ACPSessionInternals>(session).activeForegroundTurnId);
+        return { stopReason: "end_turn" };
+      });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt };
+
+    const { turnId } = await session.startTurn("hello");
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+
+    expect(prompt).toHaveBeenCalledTimes(2);
+    // The retried prompt carries the same message, so the run stays one run.
+    expect(prompt.mock.calls[1]?.[0]).toEqual(prompt.mock.calls[0]?.[0]);
+    // The foreground turn stays owned by the same run across the retry.
+    expect(turnIdDuringRetry).toEqual([turnId]);
+  });
+
+  test("does not retry a prompt that failed for another reason", async () => {
+    const session = createSession();
+    const prompt = vi.fn().mockRejectedValue(new Error("Internal error: something else"));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt };
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalled());
+
+    expect(prompt).toHaveBeenCalledTimes(1);
+  });
+
   test("startTurn returns before the ACP prompt settles and completes later via subscribers", async () => {
     const session = createSession();
     const events: Array<{ type: string; turnId?: string }> = [];

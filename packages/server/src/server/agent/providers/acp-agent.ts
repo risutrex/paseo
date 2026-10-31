@@ -330,6 +330,12 @@ const ACP_CLOSE_REQUEST_TIMEOUT_MS = 2_000;
 // interruption as not acknowledged, and the adapter's descriptive error never
 // reaches the caller.
 const ACP_TURN_RELEASE_TIMEOUT_MS = 1_200;
+// A provider that just answered a cancelled prompt frees the session a
+// moment later. The prompt it refuses in that window ("Session already has
+// an active Turn") is the same message, so it is delivered again after a
+// short pause instead of failing the run.
+const ACP_BUSY_PROMPT_RETRY_DELAY_MS = 250;
+const ACP_BUSY_PROMPT_RETRY_LIMIT = 2;
 // `session/cancel` is a notification, so the write itself can block on a
 // stuck provider. Bound it instead of letting the interruption hang.
 const ACP_CANCEL_NOTIFICATION_TIMEOUT_MS = 500;
@@ -2230,6 +2236,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (!this.connection || !this.sessionId) {
       throw new Error(`${this.provider} session is not initialized`);
     }
+    const connection = this.connection;
     if (this.activeForegroundTurnId) {
       throw new Error("A foreground turn is already active");
     }
@@ -2244,11 +2251,13 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
     this.emitSubmittedUserMessage(prompt, messageId, turnId, options?.clientMessageId);
 
-    const promptRequest = this.connection.prompt({
+    const promptParams = {
       sessionId: this.sessionId,
       messageId,
       prompt: toACPContentBlocks(prompt),
-    });
+    };
+    let busyRetries = 0;
+    const promptRequest = connection.prompt(promptParams);
     let settleForegroundPrompt!: (outcome: ForegroundTurnOutcome) => void;
     const outcome = new Promise<ForegroundTurnOutcome>((resolve) => {
       settleForegroundPrompt = resolve;
@@ -2256,10 +2265,12 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.foregroundPrompts.set(turnId, { turnId, outcome, settle: settleForegroundPrompt });
     // Only an answer from the provider confirms that the turn ended. A
     // rejected prompt leaves the session state unknown, so it must not be
-    // reported as a release.
+    // reported as a release - unless the provider only refused the prompt
+    // because it still owned the previous turn. Such a refusal is temporary,
+    // so the same prompt is sent again after a short pause.
     promptRequest.then(
       () => settleForegroundPrompt("released"),
-      () => settleForegroundPrompt("unconfirmed"),
+      () => undefined,
     );
 
     void promptRequest
@@ -2267,7 +2278,34 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         this.handlePromptResponse(response, turnId);
         return;
       })
-      .catch((error) => {
+      .catch(async (error: unknown) => {
+        if (busyRetries < ACP_BUSY_PROMPT_RETRY_LIMIT && this.isProviderBusyError(error)) {
+          busyRetries += 1;
+          this.logger.warn(
+            { err: error },
+            "ACP provider still owns the previous turn; retrying the prompt",
+          );
+          await new Promise((resolve) => setTimeout(resolve, ACP_BUSY_PROMPT_RETRY_DELAY_MS));
+          try {
+            const retried = await connection.prompt(promptParams);
+            this.handlePromptResponse(retried, turnId);
+            settleForegroundPrompt("released");
+            return;
+          } catch (retryError: unknown) {
+            const summary = summarizeACPRequestError(retryError);
+            settleForegroundPrompt("unconfirmed");
+            this.finishTurn({
+              type: "turn_failed",
+              provider: this.provider,
+              error: summary.message,
+              code: summary.code,
+              diagnostic: this.collectDiagnostic(summary.diagnostic ?? summary.message),
+              turnId,
+            });
+            return;
+          }
+        }
+        settleForegroundPrompt("unconfirmed");
         const summary = summarizeACPRequestError(error);
         this.finishTurn({
           type: "turn_failed",
@@ -2854,6 +2892,16 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       return;
     }
     await this.waitForForegroundTurnRelease(pending);
+  }
+
+  /**
+   * Reports whether the provider refused a prompt because it still owns the
+   * previous turn. The refusal is temporary: the same message is accepted
+   * once the provider has released the session.
+   */
+  private isProviderBusyError(error: unknown): boolean {
+    const summary = summarizeACPRequestError(error);
+    return /already has an active turn/i.test(summary.message);
   }
 
   /**
