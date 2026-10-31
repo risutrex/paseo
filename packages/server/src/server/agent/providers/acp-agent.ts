@@ -362,6 +362,11 @@ const ACP_IMPORT_HISTORY_SLOW_LOAD_MS = 5_000;
 // How often the import may replace a stuck probe before it gives up on
 // previews altogether.
 const ACP_IMPORT_MAX_PROBE_RECYCLES = 3;
+// A probe that never finishes its handshake is unreachable for the abort
+// handler until the handshake ends, so the handshake itself has to be
+// bounded: otherwise a provider that stalls in `initialize` leaves a child
+// process that nobody can kill.
+const ACP_IMPORT_PROBE_INITIALIZE_TIMEOUT_MS = 15_000;
 
 function summarizeMalformedACPStdoutError(error: unknown): { type: string; message: string } {
   return {
@@ -964,6 +969,19 @@ function isACPCreateConfigUnattended(input: AgentCreateConfigUnattendedInput): b
   );
 }
 
+/**
+ * The live probe of an import listing.
+ *
+ * `current` is the probe that answered its handshake; `child` is the process
+ * behind it. They are not the same moment: the child exists before the
+ * handshake finished, and the abort handler has to be able to reach it in
+ * that window, otherwise a stalled handshake leaves a process nobody can kill.
+ */
+interface ImportProbeState {
+  current: SpawnedACPProcess | null;
+  child: ChildProcessWithoutNullStreams | null;
+}
+
 export class ACPAgentClient implements AgentClient {
   readonly provider: string;
   private readonly usageProvider?: string;
@@ -1273,73 +1291,104 @@ export class ACPAgentClient implements AgentClient {
     // The live probe lives in a shared holder: a stuck provider is replaced
     // while the listing runs, and the abort handler has to kill the probe that
     // is actually alive.
-    const probeState: { current: SpawnedACPProcess } = {
-      current: await this.spawnImportProbe(history),
-    };
+    const probeState: ImportProbeState = { current: null, child: null };
     // An abandoned listing must not leave the probe running: the provider keeps
     // working on the requests it already received, so cancelling the caller is
-    // not enough - the child process has to go.
+    // not enough - the child process has to go. The handler is bound before
+    // the probe is spawned, so a caller that gives up during the handshake
+    // still reaches the child.
     const abort = this.bindImportAbort(options?.signal, probeState);
     try {
-      if (!probeState.current.initialize.agentCapabilities?.sessionCapabilities?.list) {
-        return [];
+      if (abort.triggered()) {
+        // The caller gave up before the probe even existed: starting one now
+        // would only cost a process that nobody waits for.
+        throw new Error("ACP import session listing was aborted");
       }
-
-      const sessions: ImportableProviderSession[] = [];
-      const resultLimit = options?.limit ?? Number.POSITIVE_INFINITY;
-      const scanLimit = Math.min(options?.scanLimit ?? 500, 500);
-      const canLoadHistory = probeState.current.initialize.agentCapabilities.loadSession === true;
-      // One deadline for the history loads. Together with the page timeouts it
-      // has to stay below the agent manager's 90s budget for the listing.
-      const historyDeadline = this.now() + ACP_IMPORT_HISTORY_BUDGET_MS;
-      const seen = new Set<string>();
-      let scanned = 0;
-      let recycles = 0;
-      let cursor: string | null | undefined;
-      // A probe that is known to be stuck stays known to be stuck: the rest of
-      // the scan asks it for no more previews.
-      let historiesAvailable = canLoadHistory;
-      for (;;) {
-        if (abort.triggered()) {
-          throw new Error("ACP import session listing was aborted");
-        }
-        const page = await this.fetchImportSessionsPage(probeState.current, cursor, options?.cwd);
-        const candidates = page.sessions.filter((session) => !seen.has(session.sessionId));
-        const collected = await this.collectImportablePage(probeState, history, candidates, {
-          abort,
-          canLoadHistory: historiesAvailable,
-          historyDeadline,
-          collected: sessions.length,
-          resultLimit,
-          scanLimit,
-          scanned,
-          recycles,
-          seen,
-        });
-        sessions.push(...collected.sessions);
-        scanned = collected.scanned;
-        recycles = collected.recycles;
-        historiesAvailable = collected.canLoadHistory;
-        cursor = page.nextCursor ?? null;
-        if (collected.recycled) {
-          // The page came from a probe that has been replaced, so its cursor
-          // says nothing about the new one. Read the list again from the
-          // start; the sessions already seen are skipped.
-          cursor = null;
-          continue;
-        }
-        if (!cursor) break;
-        if (scanned >= scanLimit || sessions.length >= resultLimit) break;
-      }
-
+      const probe = await this.spawnImportProbe(history, probeState, abort);
+      probeState.current = probe;
       if (abort.triggered()) {
         throw new Error("ACP import session listing was aborted");
       }
-      return sessions;
+      if (!probe.initialize.agentCapabilities?.sessionCapabilities?.list) {
+        return [];
+      }
+
+      return await this.scanImportableSessions(probe, probeState, history, abort, options);
     } finally {
       abort.dispose();
-      await this.closeProbe(probeState.current);
+      if (probeState.current) {
+        await this.closeProbe(probeState.current);
+      }
+      probeState.child = null;
     }
+  }
+
+  /**
+   * Walks the provider's session list page by page and collects the sessions
+   * that can be imported.
+   */
+  private async scanImportableSessions(
+    probe: SpawnedACPProcess,
+    probeState: ImportProbeState,
+    history: ACPImportHistoryCollector,
+    abort: { triggered: () => boolean },
+    options: ListImportableSessionsOptions | undefined,
+  ): Promise<ImportableProviderSession[]> {
+    const sessions: ImportableProviderSession[] = [];
+    const resultLimit = options?.limit ?? Number.POSITIVE_INFINITY;
+    const scanLimit = Math.min(options?.scanLimit ?? 500, 500);
+    const canLoadHistory = probe.initialize.agentCapabilities?.loadSession === true;
+    // One deadline for the history loads. Together with the page timeouts it
+    // has to stay below the agent manager's 90s budget for the listing.
+    const historyDeadline = this.now() + ACP_IMPORT_HISTORY_BUDGET_MS;
+    const seen = new Set<string>();
+    let scanned = 0;
+    let recycles = 0;
+    let cursor: string | null | undefined;
+    // A probe that is known to be stuck stays known to be stuck: the rest of
+    // the scan asks it for no more previews.
+    let historiesAvailable = canLoadHistory;
+    for (;;) {
+      if (abort.triggered()) {
+        throw new Error("ACP import session listing was aborted");
+      }
+      const liveProbe = probeState.current;
+      if (!liveProbe) {
+        throw new Error("ACP import session listing has no live probe");
+      }
+      const page = await this.fetchImportSessionsPage(liveProbe, cursor, options?.cwd);
+      const candidates = page.sessions.filter((session) => !seen.has(session.sessionId));
+      const collected = await this.collectImportablePage(probeState, history, candidates, {
+        abort,
+        canLoadHistory: historiesAvailable,
+        historyDeadline,
+        collected: sessions.length,
+        resultLimit,
+        scanLimit,
+        scanned,
+        recycles,
+        seen,
+      });
+      sessions.push(...collected.sessions);
+      scanned = collected.scanned;
+      recycles = collected.recycles;
+      historiesAvailable = collected.canLoadHistory;
+      cursor = page.nextCursor ?? null;
+      if (collected.recycled) {
+        // The page came from a probe that has been replaced, so its cursor
+        // says nothing about the new one. Read the list again from the
+        // start; the sessions already seen are skipped.
+        cursor = null;
+        continue;
+      }
+      if (!cursor) break;
+      if (scanned >= scanLimit || sessions.length >= resultLimit) break;
+    }
+
+    if (abort.triggered()) {
+      throw new Error("ACP import session listing was aborted");
+    }
+    return sessions;
   }
 
   /**
@@ -1348,7 +1397,7 @@ export class ACPAgentClient implements AgentClient {
    * sessions and the next list page are answered by a fresh probe.
    */
   private async collectImportablePage(
-    probeState: { current: SpawnedACPProcess },
+    probeState: ImportProbeState,
     history: ACPImportHistoryCollector,
     candidates: ListSessionsResponse["sessions"],
     context: {
@@ -1382,13 +1431,12 @@ export class ACPAgentClient implements AgentClient {
       if (context.collected + sessions.length >= context.resultLimit) break;
       scanned += 1;
       context.seen.add(session.sessionId);
+      const probe = probeState.current;
+      if (!probe) {
+        throw new Error("ACP import session listing has no live probe");
+      }
       const outcome = canLoadHistory
-        ? await this.loadImportPromptPreviews(
-            probeState.current,
-            history,
-            session,
-            context.historyDeadline,
-          )
+        ? await this.loadImportPromptPreviews(probe, history, session, context.historyDeadline)
         : { status: "skipped" as const };
       if (context.abort.triggered()) {
         // The caller gave up while the provider was loading. The probe is
@@ -1407,7 +1455,7 @@ export class ACPAgentClient implements AgentClient {
         if (recycles < ACP_IMPORT_MAX_PROBE_RECYCLES) {
           recycles += 1;
           recycled = true;
-          probeState.current = await this.recycleImportProbe(probeState.current, history);
+          probeState.current = await this.recycleImportProbe(probeState, history, context.abort);
         } else {
           // The probe is known to be stuck and may not be replaced any more.
           // Stop asking it for previews instead of waiting for every remaining
@@ -1420,17 +1468,49 @@ export class ACPAgentClient implements AgentClient {
         sessions.push(this.toImportableSession(session, null));
         continue;
       }
+      if (outcome.status === "expired") {
+        // The listing budget is spent. The session stays visible, but the
+        // remaining ones are listed without previews instead of paying for a
+        // load that the budget cannot pay for.
+        sessions.push(this.toImportableSession(session, null));
+        canLoadHistory = false;
+        continue;
+      }
       if (outcome.previews.hasConversation === false) continue;
       sessions.push(this.toImportableSession(session, outcome.previews));
     }
     return { sessions, scanned, recycles, recycled, canLoadHistory };
   }
 
-  /** Spawns a probe that feeds its session updates into the history collector. */
-  private async spawnImportProbe(history: ACPImportHistoryCollector): Promise<SpawnedACPProcess> {
-    return await this.spawnProcess(PROBE_ENV, {
+  /**
+   * Spawns a probe that feeds its session updates into the history collector.
+   *
+   * The child is registered with the shared holder as soon as it exists, and
+   * the handshake is bounded: a provider that stalls in `initialize` would
+   * otherwise leave a process that no abort can reach.
+   */
+  private async spawnImportProbe(
+    history: ACPImportHistoryCollector,
+    probeState: ImportProbeState,
+    abort: { triggered: () => boolean },
+  ): Promise<SpawnedACPProcess> {
+    const probe = await this.spawnProcess(PROBE_ENV, {
       client: this.buildProbeClient((params) => history.accept(params)),
+      initializeTimeoutMs: ACP_IMPORT_PROBE_INITIALIZE_TIMEOUT_MS,
+      onSpawned: (spawned) => {
+        probeState.child = spawned.child;
+        if (abort.triggered()) {
+          void terminateChildProcess(spawned.child, 2_000, this.terminateProcess).catch(
+            () => undefined,
+          );
+        }
+      },
     });
+    probeState.child = probe.child;
+    if (abort.triggered()) {
+      void terminateChildProcess(probe.child, 2_000, this.terminateProcess).catch(() => undefined);
+    }
+    return probe;
   }
 
   /**
@@ -1439,11 +1519,16 @@ export class ACPAgentClient implements AgentClient {
    * over the remaining sessions.
    */
   private async recycleImportProbe(
-    probe: SpawnedACPProcess,
+    probeState: ImportProbeState,
     history: ACPImportHistoryCollector,
+    abort: { triggered: () => boolean },
   ): Promise<SpawnedACPProcess> {
-    await this.closeProbe(probe);
-    return await this.spawnImportProbe(history);
+    const previous = probeState.current;
+    if (previous) {
+      probeState.child = null;
+      await this.closeProbe(previous);
+    }
+    return await this.spawnImportProbe(history, probeState, abort);
   }
 
   private toImportableSession(
@@ -1468,15 +1553,17 @@ export class ACPAgentClient implements AgentClient {
    */
   private bindImportAbort(
     signal: AbortSignal | undefined,
-    probeState: { current: SpawnedACPProcess },
+    probeState: ImportProbeState,
   ): { triggered: () => boolean; dispose: () => void } {
     let aborted = false;
     const handleAbort = (): void => {
       if (aborted) return;
       aborted = true;
-      void terminateChildProcess(probeState.current.child, 2_000, this.terminateProcess).catch(
-        () => undefined,
-      );
+      // The child is reachable before the handshake finished, so an abort
+      // during the handshake still kills the process.
+      const child = probeState.child ?? probeState.current?.child;
+      if (!child) return;
+      void terminateChildProcess(child, 2_000, this.terminateProcess).catch(() => undefined);
     };
     if (signal?.aborted) {
       // An already aborted signal never fires the listener.
@@ -1511,6 +1598,7 @@ export class ACPAgentClient implements AgentClient {
     | { status: "loaded"; previews: ACPImportPromptPreviews }
     | { status: "skipped" }
     | { status: "slow" }
+    | { status: "expired" }
   > {
     const updatedAt = session.updatedAt ?? null;
     const cached = this.importPromptCache.get(session.sessionId);
@@ -1527,6 +1615,12 @@ export class ACPAgentClient implements AgentClient {
 
     const remainingMs = historyDeadline - this.now();
     if (remainingMs <= 0) return { status: "skipped" };
+    // The listing budget is nearly spent. A load started here could only be
+    // abandoned by the slow guard, and the probe that would be replaced
+    // afterwards would cost a fresh process for a result nobody waits for.
+    if (remainingMs < ACP_IMPORT_HISTORY_SLOW_LOAD_MS) {
+      return { status: "expired" };
+    }
     const loadTimeoutMs = Math.min(ACP_IMPORT_HISTORY_LOAD_TIMEOUT_MS, remainingMs);
 
     history.begin(session.sessionId);
@@ -1569,6 +1663,10 @@ export class ACPAgentClient implements AgentClient {
    * or got stuck. A load that runs longer than
    * ACP_IMPORT_HISTORY_SLOW_LOAD_MS means the provider is busy with that
    * session: every later request on the same connection would queue behind it.
+   *
+   * A load that only hits the wait timeout is reported as a failure: the
+   * budget for previews is nearly spent at that point, and the listing stops
+   * asking for previews instead of replacing a probe that is not stuck.
    */
   private async raceImportHistoryLoad(
     loadPromise: Promise<unknown>,
@@ -1682,34 +1780,46 @@ export class ACPAgentClient implements AgentClient {
       }),
       stdio: ["pipe", "pipe", "pipe"],
     });
-    assertChildWithPipes(child);
+    try {
+      assertChildWithPipes(child);
 
-    const stderrChunks: string[] = [];
-    child.stderr.on("data", (chunk: Buffer | string) => {
-      stderrChunks.push(chunk.toString());
-    });
-
-    const spawnErrorPromise = rejectOnSpawnError(child, stderrChunks);
-    const spawnReadyPromise = new Promise<void>((resolve) => {
-      child.once("spawn", () => {
-        resolve();
+      const stderrChunks: string[] = [];
+      child.stderr.on("data", (chunk: Buffer | string) => {
+        stderrChunks.push(chunk.toString());
       });
-    });
 
-    const stream = createLoggedNdJsonStream(
-      Writable.toWeb(child.stdin),
-      Readable.toWeb(child.stdout),
-      { logger: this.logger, provider: this.provider },
-    );
-    const connection = new ClientSideConnection(() => client, stream);
+      const spawnErrorPromise = rejectOnSpawnError(child, stderrChunks);
+      const spawnReadyPromise = new Promise<void>((resolve) => {
+        child.once("spawn", () => {
+          resolve();
+        });
+      });
 
-    return {
-      child,
-      connection,
-      stderrChunks,
-      spawnReady: spawnReadyPromise,
-      spawnError: spawnErrorPromise,
-    };
+      const stream = createLoggedNdJsonStream(
+        Writable.toWeb(child.stdin),
+        Readable.toWeb(child.stdout),
+        { logger: this.logger, provider: this.provider },
+      );
+      const connection = new ClientSideConnection(() => client, stream);
+
+      return {
+        child,
+        connection,
+        stderrChunks,
+        spawnReady: spawnReadyPromise,
+        spawnError: spawnErrorPromise,
+      };
+    } catch (error) {
+      // The child is already running here. If the transport cannot be set up,
+      // the process would outlive the caller without anyone able to reach it:
+      // the probe is not registered anywhere yet.
+      await terminateChildProcess(
+        child as ChildProcessWithoutNullStreams,
+        2_000,
+        this.terminateProcess,
+      ).catch(() => undefined);
+      throw error;
+    }
   }
 
   protected async initializeTransport(

@@ -2543,6 +2543,110 @@ describe("ACPAgentClient listImportableSessions", () => {
   });
 });
 
+describe("ACPAgentClient listImportableSessions while the probe handshake stalls", () => {
+  // The probe is only useful once its handshake finished, but the child exists
+  // earlier than that. A provider that never answers `initialize` used to leave
+  // a process nobody could reach: the abort handler only saw the probe after
+  // the handshake, and nothing bounded the handshake itself.
+  function makeClient(args: {
+    initialize: () => Promise<{ agentCapabilities: Record<string, unknown> }>;
+    terminateProcess?: ProcessTerminator;
+  }) {
+    const children: ChildProcessWithoutNullStreams[] = [];
+    class TestACPAgentClient extends ACPAgentClient {
+      // Only the transport is faked, so the real `spawnProcess` keeps its
+      // handshake timeout and its cleanup path.
+      protected override async spawnTransport() {
+        const child = createProbeChildStub();
+        children.push(child);
+        return {
+          child,
+          connection: { initialize: args.initialize } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => {}),
+        };
+      }
+    }
+
+    const client = new TestACPAgentClient({
+      provider: "kimi",
+      logger: createTestLogger(),
+      defaultCommand: ["kimi", "acp"],
+      defaultModes: [],
+      ...(args.terminateProcess ? { terminateProcess: args.terminateProcess } : {}),
+    });
+    return { client, children };
+  }
+
+  test("fails the listing and kills the probe when the handshake never finishes", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      const { client, children } = makeClient({
+        initialize: () => new Promise<never>(() => {}),
+        terminateProcess,
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      const assertion = expect(listing).rejects.toThrow(/ACP initialize timed out/);
+
+      // The provider is still in `initialize`: the listing waits, but not
+      // forever.
+      await vi.advanceTimersByTimeAsync(14_000);
+      expect(terminateProcess).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await assertion;
+
+      // The stalled probe is gone instead of lingering as an orphan.
+      expect(children).toHaveLength(1);
+      expect(terminateProcess).toHaveBeenCalledTimes(1);
+      expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("kills the probe child when the listing is aborted during the handshake", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      let finishHandshake: (() => void) | undefined;
+      const { client, children } = makeClient({
+        initialize: () =>
+          new Promise<{ agentCapabilities: Record<string, unknown> }>((resolve) => {
+            finishHandshake = () => resolve({ agentCapabilities: {} });
+          }),
+        terminateProcess,
+      });
+
+      const controller = new AbortController();
+      const listing = client.listImportableSessions({
+        cwd: "/Users/moonshot",
+        signal: controller.signal,
+      });
+      const assertion = expect(listing).rejects.toThrow(/aborted/);
+
+      // The child exists while the handshake is still running - this is the
+      // window in which an abort used to reach nothing.
+      await vi.waitFor(() => expect(children).toHaveLength(1));
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(terminateProcess).toHaveBeenCalled();
+      expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
+
+      // The caller already gave up, so the late handshake must not hand out a
+      // probe that nobody waits for any more.
+      finishHandshake?.();
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("ACPAgentClient listImportableSessions with a busy provider", () => {
   // Providers answer ACP requests one at a time. A session/load that never
   // finishes therefore blocks every later request on the same connection -
@@ -2553,6 +2657,7 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
     loadSession: ReturnType<typeof vi.fn>;
     terminateProcess: (child: unknown, options: unknown) => Promise<void>;
     onSpawn?: (index: number, client: ACPClient | undefined) => void;
+    now?: () => number;
   }) {
     const children: unknown[] = [];
     class TestACPAgentClient extends ACPAgentClient {
@@ -2587,6 +2692,7 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
       defaultCommand: ["kimi", "acp"],
       defaultModes: [],
       terminateProcess: args.terminateProcess as never,
+      ...(args.now ? { now: args.now } : {}),
     });
     return { client, children };
   }
@@ -2725,6 +2831,109 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
       expect(terminateProcess).toHaveBeenCalledTimes(2);
       expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
       expect(terminateProcess.mock.calls[1]?.[0]).toBe(children[1]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("replaces the probe when the provider never answers a history load", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      let probeIndex = 0;
+      const listProbes: number[] = [];
+      const listSessions = vi.fn(async () => {
+        listProbes.push(probeIndex);
+        return {
+          sessions: [
+            {
+              sessionId: "mute",
+              cwd: "/Users/moonshot",
+              title: "mute",
+              updatedAt: "2026-06-13T00:00:00.000Z",
+            },
+          ],
+          nextCursor: null,
+        };
+      });
+      // The provider never answers, so the request stays pending on its side
+      // and the connection never becomes free again.
+      const loadSession = vi.fn(() => new Promise<never>(() => {}));
+
+      const { client, children } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+        onSpawn: (index) => {
+          probeIndex = index;
+        },
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      // Inside the slow threshold the probe is still considered usable.
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(children).toHaveLength(1);
+
+      // Once the threshold passes the probe is replaced, not kept.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(children).toHaveLength(2);
+      // The follow-up list page comes from the replacement probe instead of
+      // queueing behind the load the provider is still working on.
+      expect(listProbes).toEqual([0, 1]);
+
+      const result = await listing;
+      expect(result.map((session) => session.providerHandleId)).toEqual(["mute"]);
+      expect(result[0].firstPromptPreview).toBeNull();
+      expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("stops asking for previews when the listing budget is nearly spent", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      // The history budget is measured with the client clock. Moving it
+      // forward leaves less than the slow-load threshold for the load, so a
+      // load could only be abandoned by the guard - and the probe that would
+      // be replaced afterwards would cost a fresh process for a result nobody
+      // waits for.
+      let clock = 0;
+      const listSessions = vi.fn(async () => {
+        clock = 41_000;
+        return {
+          sessions: [
+            {
+              sessionId: "slow",
+              cwd: "/Users/moonshot",
+              title: "slow",
+              updatedAt: "2026-06-13T00:00:00.000Z",
+            },
+          ],
+          nextCursor: null,
+        };
+      });
+      const loadSession = vi.fn(() => new Promise<never>(() => {}));
+
+      const { client, children } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+        now: () => clock,
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+
+      // The session stays visible, without a preview, and no replacement
+      // probe is started for a load that the budget cannot pay for.
+      await expect(listing).resolves.toHaveLength(1);
+      expect(loadSession).not.toHaveBeenCalled();
+      expect(children).toHaveLength(1);
+      // Only the cleanup of the one probe that was started - no replacement
+      // probe was spawned for a load the budget cannot pay for.
+      expect(terminateProcess).toHaveBeenCalledTimes(1);
+      expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
     } finally {
       vi.useRealTimers();
     }
@@ -2926,11 +3135,10 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
       }),
     ).rejects.toThrow(/aborted/);
     expect(listSessions).not.toHaveBeenCalled();
-    // The abort handler kills the probe and the cleanup path terminates it
-    // again - the terminator is idempotent.
-    expect(terminateProcess).toHaveBeenCalledTimes(2);
-    expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
-    expect(terminateProcess.mock.calls[1]?.[0]).toBe(children[0]);
+    // The caller gave up before the probe existed, so no process is started
+    // at all - there is nothing left to terminate.
+    expect(children).toHaveLength(0);
+    expect(terminateProcess).not.toHaveBeenCalled();
   });
 });
 
