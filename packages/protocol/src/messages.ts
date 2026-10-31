@@ -802,6 +802,14 @@ export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
     reason: z.string(),
   }),
   z.object({
+    // The provider holds the message for a later turn instead of running it
+    // now. The message is not lost; the agent picks it up when it is done.
+    type: z.literal("turn_queued"),
+    provider: AgentProviderSchema,
+    turnId: z.string().optional(),
+    reason: z.string(),
+  }),
+  z.object({
     type: z.literal("timeline"),
     provider: AgentProviderSchema,
     item: AgentTimelineItemPayloadSchema,

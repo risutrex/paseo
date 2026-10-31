@@ -3825,6 +3825,107 @@ describe("ACPAgentSession", () => {
     expect(turnIdDuringRetry).toEqual([turnId]);
   });
 
+  test("queues the message when the provider is busy and offers a queue", async () => {
+    // The provider refuses the prompt because it still owns the previous turn.
+    // Its own error points at its queue, so the message goes there instead of
+    // being dropped with an error.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn().mockResolvedValue({});
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(extMethod).toHaveBeenCalled());
+
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/enqueue", {
+      sessionId: "session-1",
+      text: "hello",
+    });
+    // The turn ends as queued, not as a failure: the message is not lost.
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+    expect(events.some((event) => event.type === "turn_queued")).toBe(true);
+    expect(
+      events.some((event) => event.type === "timeline" && event.item.type === "notification"),
+    ).toBe(true);
+  });
+
+  test("queues the message when the provider reports an active prompt", async () => {
+    // A provider that tracks its own prompt refuses the second one with its
+    // own wording instead of the runtime's busy message.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    const prompt = vi.fn().mockRejectedValue({
+      code: -32602,
+      message: "Invalid params: A prompt is already active for this session.",
+    });
+    const extMethod = vi.fn().mockResolvedValue({});
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(extMethod).toHaveBeenCalled());
+
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/enqueue", {
+      sessionId: "session-1",
+      text: "hello",
+    });
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+    expect(events.some((event) => event.type === "turn_queued")).toBe(true);
+  });
+
+  test("fails the turn when the provider is busy and offers no queue", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn().mockResolvedValue({});
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/steer"] },
+    };
+
+    const hasTurnFailed = (): boolean => events.some((event) => event.type === "turn_failed");
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(hasTurnFailed()).toBe(true));
+
+    // A provider without a queue keeps the old behaviour: the user sees the
+    // failure instead of a promise the provider will not keep.
+    expect(extMethod).not.toHaveBeenCalled();
+    expect(events.some((event) => event.type === "turn_queued")).toBe(false);
+  });
+
   test("does not deliver the prompt again after the turn was interrupted", async () => {
     const session = createSession();
     const prompt = vi

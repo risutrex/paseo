@@ -441,6 +441,16 @@ export type AgentStreamEvent =
     }
   | { type: "turn_canceled"; provider: AgentProvider; reason: string; turnId?: string }
   | {
+      /**
+       * The provider holds the message for a later turn. It is not lost: the
+       * agent picks it up once it is done with the turn it is running.
+       */
+      type: "turn_queued";
+      provider: AgentProvider;
+      reason: string;
+      turnId?: string;
+    }
+  | {
       type: "timeline";
       item: AgentTimelineItem;
       provider: AgentProvider;

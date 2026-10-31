@@ -25,7 +25,7 @@ const DISPLAY_VOLUME_RELEASE = 0.18;
 
 type TurnEventType = Extract<
   AgentStreamEventPayload["type"],
-  "turn_started" | "turn_completed" | "turn_failed" | "turn_canceled"
+  "turn_started" | "turn_completed" | "turn_failed" | "turn_canceled" | "turn_queued"
 >;
 
 export type VoiceRuntimePhase =

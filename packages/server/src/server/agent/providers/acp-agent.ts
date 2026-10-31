@@ -352,6 +352,13 @@ const ACP_BUSY_PROMPT_RETRY_LIMIT = 2;
 // and answers with the turn it steered plus the disposition of the message.
 const MCODE_EXTENSIONS_META_KEY = "minimax-code/extensions";
 const MCODE_STEER_METHOD = "mcode/session/steer";
+// A provider that still owns its previous turn refuses a new prompt and tells
+// the client to use its queue instead. MiniMax Code answers such a refusal
+// with "Session already has an active Turn. Use queue send to deliver the
+// message after it." and exposes the queue as `mcode/session/queue/enqueue`.
+// Without it the message is not delivered at all: the client only sees an
+// error, and the text the user typed is gone.
+const MCODE_QUEUE_ENQUEUE_METHOD = "mcode/session/queue/enqueue";
 // `session/cancel` is a notification, so the write itself can block on a
 // stuck provider. Bound it instead of letting the interruption hang.
 const ACP_CANCEL_NOTIFICATION_TIMEOUT_MS = 500;
@@ -2425,7 +2432,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         return;
       })
       .catch(async (error: unknown) => {
-        if (busyRetries < ACP_BUSY_PROMPT_RETRY_LIMIT && this.isProviderBusyError(error)) {
+        if (this.isProviderBusyError(error) && busyRetries < ACP_BUSY_PROMPT_RETRY_LIMIT) {
           busyRetries += 1;
           this.logger.warn(
             { err: error },
@@ -2448,6 +2455,24 @@ export class ACPAgentSession implements AgentSession, ACPClient {
             settleForegroundPrompt("released");
             return;
           } catch (retryError: unknown) {
+            const queued = await this.queuePromptForLaterTurn({
+              error: retryError,
+              prompt,
+              turnId,
+              ...(options?.clientMessageId ? { clientMessageId: options.clientMessageId } : {}),
+            });
+            if (queued) {
+              // The message is safe in the provider's queue, and the provider is
+              // still busy: the session may not take another prompt yet.
+              settleForegroundPrompt("unconfirmed");
+              this.finishTurn({
+                type: "turn_queued",
+                provider: this.provider,
+                reason: "The provider took the message into its queue while it was busy",
+                turnId,
+              });
+              return;
+            }
             const summary = summarizeACPRequestError(retryError);
             settleForegroundPrompt("unconfirmed");
             this.finishTurn({
@@ -3106,6 +3131,82 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     return Array.isArray(methods) && methods.includes(MCODE_STEER_METHOD);
   }
 
+  /**
+   * Reports whether the provider advertised a queue extension.
+   */
+  private supportsVendorQueue(): boolean {
+    const extensions = this.agentMeta?.[MCODE_EXTENSIONS_META_KEY];
+    if (!extensions || typeof extensions !== "object") {
+      return false;
+    }
+    const methods = (extensions as { methods?: unknown }).methods;
+    return Array.isArray(methods) && methods.includes(MCODE_QUEUE_ENQUEUE_METHOD);
+  }
+
+  /**
+   * Hands the message to the provider's queue instead of losing it.
+   *
+   * A provider that still owns its previous turn refuses a new prompt. That
+   * refusal is temporary, but a refusal is not a delivery: the user's message
+   * would be dropped with an error and never reach the agent. Providers that
+   * expose a queue (MiniMax Code does, and its own error message points at
+   * it) can take the message for a later turn, so the agent picks it up once
+   * it is done with the current one.
+   *
+   * Returns false when the message could not be queued, and the caller reports
+   * the original failure.
+   */
+  private async queuePromptForLaterTurn(args: {
+    error: unknown;
+    prompt: AgentPromptInput;
+    turnId: string;
+    clientMessageId?: string;
+  }): Promise<boolean> {
+    const { error, prompt, turnId, clientMessageId } = args;
+    if (!this.isProviderBusyError(error)) {
+      return false;
+    }
+    if (!this.supportsVendorQueue()) {
+      return false;
+    }
+    const connection = this.connection;
+    if (!connection || !this.sessionId) {
+      return false;
+    }
+    const text = extractPromptText(prompt);
+    if (!text.trim()) {
+      return false;
+    }
+    if (!isTextOnlyPrompt(prompt)) {
+      // The queue carries text. A prompt with an attachment would lose it, so
+      // it has to fail loudly instead of half-delivering.
+      return false;
+    }
+    try {
+      await connection.extMethod(MCODE_QUEUE_ENQUEUE_METHOD, {
+        sessionId: this.sessionId,
+        text,
+        ...(clientMessageId ? { clientRequestId: clientMessageId } : {}),
+      });
+    } catch (queueError) {
+      this.logger.warn(
+        { err: queueError },
+        "ACP provider refused to queue the prompt for a later turn",
+      );
+      return false;
+    }
+    this.pushEvent(
+      this.wrapTimeline({
+        type: "notification",
+        level: "info",
+        message:
+          "Message accepted into the provider's queue: the agent picks it up after the current turn.",
+      }),
+    );
+    this.logger.info({ turnId }, "ACP provider took the prompt into its queue while it was busy");
+    return true;
+  }
+
   async interrupt(): Promise<void> {
     if (!this.connection || !this.sessionId) {
       return;
@@ -3148,10 +3249,18 @@ export class ACPAgentSession implements AgentSession, ACPClient {
    * Reports whether the provider refused a prompt because it still owns the
    * previous turn. The refusal is temporary: the same message is accepted
    * once the provider has released the session.
+   *
+   * The refusal comes in two shapes. A provider that tracks its own prompt
+   * rejects the second one with "A prompt is already active for this
+   * session."; a provider whose runtime is busy answers with "Session already
+   * has an active Turn. Use queue send to deliver the message after it.".
    */
   private isProviderBusyError(error: unknown): boolean {
     const summary = summarizeACPRequestError(error);
-    return /already has an active turn/i.test(summary.message);
+    return (
+      /already has an active turn/i.test(summary.message) ||
+      /a prompt is already active for this session/i.test(summary.message)
+    );
   }
 
   /**
@@ -4080,7 +4189,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   private finishTurn(
-    event: Extract<AgentStreamEvent, { type: "turn_completed" | "turn_failed" | "turn_canceled" }>,
+    event: Extract<
+      AgentStreamEvent,
+      { type: "turn_completed" | "turn_failed" | "turn_canceled" | "turn_queued" }
+    >,
   ): void {
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     // A turn that ends without completing leaves no way to answer its open
@@ -4379,6 +4491,20 @@ function extractPromptText(prompt: AgentPromptInput): string {
     )
     .map((block) => block.text)
     .join("");
+}
+
+/**
+ * Reports whether the prompt carries nothing but text.
+ *
+ * A provider's queue takes text. A prompt that also carries an image or an
+ * attachment cannot be queued faithfully, and queuing the text alone would
+ * quietly drop the rest.
+ */
+function isTextOnlyPrompt(prompt: AgentPromptInput): boolean {
+  if (typeof prompt === "string") {
+    return true;
+  }
+  return prompt.every((block) => block.type === "text");
 }
 
 function contentBlockToText(content: ContentBlock): string {
