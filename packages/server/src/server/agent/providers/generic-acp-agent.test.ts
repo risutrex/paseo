@@ -26,6 +26,11 @@ vi.mock("./acp-agent.js", () => ({
       mockState.superConstructorOptions.push(options);
     }
   },
+  isMiniMaxCodeProvider: (providerId: string | undefined, command: readonly string[] | undefined) =>
+    providerId === "minimax-code" || (command ?? []).some((part) => /mcode|minimax/i.test(part)),
+  MCODE_CLIENT_CAPABILITY_META: {
+    "minimax-code/extensions": { version: 1, notifications: true },
+  },
 }));
 
 import { GenericACPAgentClient } from "./generic-acp-agent.js";

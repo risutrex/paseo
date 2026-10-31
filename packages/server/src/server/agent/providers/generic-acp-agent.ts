@@ -8,6 +8,8 @@ import {
   type ACPConfigFeatureOption,
   DEFAULT_ACP_CAPABILITIES,
   type ACPExtensionCommandsParser,
+  isMiniMaxCodeProvider,
+  MCODE_CLIENT_CAPABILITY_META,
 } from "./acp-agent.js";
 import {
   buildBinaryDiagnosticRows,
@@ -53,7 +55,11 @@ export class GenericACPAgentClient extends ACPAgentClient {
       // session/new, so the first listCommands() waits for that batch.
       waitForInitialCommands: options.waitForInitialCommands ?? true,
       initialCommandsWaitTimeoutMs: options.initialCommandsWaitTimeoutMs,
-      clientCapabilityMeta: options.clientCapabilityMeta,
+      clientCapabilityMeta:
+        options.clientCapabilityMeta ??
+        (isMiniMaxCodeProvider(options.providerId, options.command)
+          ? MCODE_CLIENT_CAPABILITY_META
+          : undefined),
       configFeatureOptions: options.configFeatureOptions,
       extensionCommandsParser: options.extensionCommandsParser,
       catalogModelResolver: options.catalogModelResolver,

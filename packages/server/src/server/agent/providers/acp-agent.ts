@@ -355,10 +355,31 @@ const MCODE_STEER_METHOD = "mcode/session/steer";
 // MiniMax Code sends its extension notifications only when the client asks for
 // them in the handshake. Without this the provider keeps its background work
 // to itself: no delegation updates, no queue updates, no goal updates and no
-// notice that another client owns the session.
-const DEFAULT_ACP_CLIENT_CAPABILITY_META: ACPClientCapabilityMeta = {
+// notice that another client owns the session. The request is a vendor
+// extension, so it goes only to a provider that is MiniMax Code: another ACP
+// provider has no business receiving it.
+export const MCODE_CLIENT_CAPABILITY_META: ACPClientCapabilityMeta = {
   [MCODE_EXTENSIONS_META_KEY]: { version: 1, notifications: true },
 };
+
+/**
+ * Reports whether a provider is MiniMax Code.
+ *
+ * The provider id is the usual answer, but a user may register the same
+ * command under a name of their own, so the command is checked as well.
+ */
+export function isMiniMaxCodeProvider(
+  providerId: string | undefined,
+  command: readonly string[] | undefined,
+): boolean {
+  if (providerId === "minimax-code") {
+    return true;
+  }
+  return (command ?? []).some((part) => {
+    const lowered = part.toLowerCase();
+    return lowered.includes("mcode") || lowered.includes("minimax");
+  });
+}
 const MCODE_DELEGATION_GET_METHOD = "mcode/session/delegation/get";
 const MCODE_DELEGATION_UPDATE_NOTIFICATION = "mcode/session/delegation_update";
 // A provider that still owns its previous turn refuses a new prompt and tells
@@ -1064,7 +1085,7 @@ export class ACPAgentClient implements AgentClient {
     this.configOptionsTransformer = options.configOptionsTransformer;
     this.configFeatureOptions = options.configFeatureOptions ?? [];
     this.clientCapabilities = options.clientCapabilities;
-    this.clientCapabilityMeta = options.clientCapabilityMeta ?? DEFAULT_ACP_CLIENT_CAPABILITY_META;
+    this.clientCapabilityMeta = options.clientCapabilityMeta;
     this.modeIdTransformer = options.modeIdTransformer;
     this.toolSnapshotTransformer = options.toolSnapshotTransformer;
     this.providerModeWriter = options.providerModeWriter;
@@ -2219,7 +2240,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.configFeatureOptions = options.configFeatureOptions ?? [];
     this.configuredModelIds = new Set(options.configuredModelIds);
     this.clientCapabilities = options.clientCapabilities;
-    this.clientCapabilityMeta = options.clientCapabilityMeta ?? DEFAULT_ACP_CLIENT_CAPABILITY_META;
+    this.clientCapabilityMeta = options.clientCapabilityMeta;
     this.modeIdTransformer = options.modeIdTransformer;
     this.toolSnapshotTransformer = options.toolSnapshotTransformer;
     this.providerModeWriter = options.providerModeWriter;

@@ -3317,6 +3317,20 @@ describe("ACP providers advertise session listing", () => {
       "minimax-code/extensions": { version: 1, notifications: true },
     });
   });
+  test("does not offer the MiniMax Code extensions to another ACP provider", () => {
+    // The extension request is a vendor handshake. Another ACP provider has
+    // no business receiving it, and a client that carries it announces
+    // capabilities the provider does not know.
+    const client = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: [process.execPath, "fake-acp-agent.mjs"],
+      providerId: "configured-acp",
+    });
+    const meta = asInternals<{ clientCapabilityMeta?: Record<string, unknown> }>(
+      client,
+    ).clientCapabilityMeta;
+    expect(meta).toBeUndefined();
+  });
 });
 
 describe("transformPiModels", () => {
