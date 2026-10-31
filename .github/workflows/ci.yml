@@ -1,11 +1,12 @@
 name: CI
 
+# Automatic triggers are off on purpose in this fork: a full run costs about
+# 200 runner-minutes against the 20 concurrent jobs of the account, and GitHub
+# keeps disabling workflows on forks that burn compute on inherited triggers.
+# Run the checks on demand instead:
+#   gh workflow run ci.yml -R risutrex/paseo --ref <branch>
+# Re-enable push/pull_request/merge_group only when a full run is really needed.
 on:
-  push:
-    branches: [main]
-  # Every base branch, so stacked PRs and PRs into any base get the same checks.
-  pull_request:
-  merge_group:
   workflow_dispatch:
 
 # A newer push to the same ref cancels the run still in progress, main included.
