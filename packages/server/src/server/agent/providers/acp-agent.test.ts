@@ -3959,6 +3959,51 @@ describe("ACPAgentSession", () => {
     ]);
   });
 
+  test("keeps a sub-agent that has not started yet out of the finished state", async () => {
+    // Some providers project a child that has not started yet as finished, with
+    // the same timestamp for its creation and its last update. Reporting that
+    // as finished claims the work is done before it began.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    const member = (status: string, updatedAtMs: number) => ({
+      schemaVersion: 1,
+      rootSessionId: "session-1",
+      members: [
+        {
+          sessionId: "child-1",
+          parentSessionId: "session-1",
+          agentName: "explore",
+          task: "List files in the project",
+          status,
+          createdAtMs: 1_700_000_000_000,
+          updatedAtMs,
+        },
+      ],
+    });
+
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: member("completed", 1_700_000_000_000),
+    });
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: member("running", 1_700_000_000_500),
+    });
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: member("completed", 1_700_000_009_000),
+    });
+
+    expect(
+      events.map((event) => (event.type === "provider_subagent" ? event.event.status : undefined)),
+    ).toEqual(["running", "running", "completed"]);
+  });
+
   test("does not republish an unchanged delegation tree", async () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];

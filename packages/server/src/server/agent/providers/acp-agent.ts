@@ -2138,6 +2138,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   // The last delegation tree the provider published, so a repeated snapshot
   // does not redraw the same rows.
   private delegationSignature: string | null = null;
+  // Sub-agents the provider has already reported as running. A child that has
+  // not started yet is projected as finished by some providers, and only a
+  // child known to have started may be reported as finished on equal
+  // timestamps.
+  private readonly startedDelegationMembers = new Set<string>();
   private readonly terminalEntries = new Map<string, TerminalEntry>();
   private readonly persistedHistory: AgentTimelineItem[] = [];
   private readonly initialHandle?: AgentPersistenceHandle;
@@ -3200,6 +3205,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         member.parentSessionId && memberIds.has(member.parentSessionId)
           ? member.parentSessionId
           : null;
+      const status = this.readDelegationStatus(member);
       this.pushEvent({
         type: "provider_subagent",
         provider: this.provider,
@@ -3208,7 +3214,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
           id: member.sessionId,
           title: member.task,
           description: member.agentName,
-          status: member.status,
+          status,
           parentSubagentId,
           ...(member.updatedAtMs !== null
             ? { timestamp: new Date(member.updatedAtMs).toISOString() }
@@ -3216,6 +3222,36 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         },
       });
     }
+  }
+
+  /**
+   * Reads the status of one delegation member.
+   *
+   * Some providers project a child that has not started yet as finished, with
+   * the same timestamp for its creation and its last update. Reporting that
+   * as finished would claim the work is done before it began, so such a child
+   * stays running until the provider says otherwise. A child the provider
+   * already reported as running is taken at its word when it finishes.
+   */
+  private readDelegationStatus(
+    member: ProviderDelegationMember,
+  ): ProviderDelegationMember["status"] {
+    if (member.status === "running") {
+      this.startedDelegationMembers.add(member.sessionId);
+      return "running";
+    }
+    const neverStarted =
+      member.createdAtMs !== null &&
+      member.updatedAtMs !== null &&
+      member.createdAtMs === member.updatedAtMs;
+    if (
+      member.status === "completed" &&
+      neverStarted &&
+      !this.startedDelegationMembers.has(member.sessionId)
+    ) {
+      return "running";
+    }
+    return member.status;
   }
 
   /**
@@ -4632,6 +4668,7 @@ interface ProviderDelegationMember {
   agentName: string | null;
   task: string | null;
   status: "running" | "completed" | "failed" | "canceled";
+  createdAtMs: number | null;
   updatedAtMs: number | null;
 }
 
@@ -4684,6 +4721,7 @@ function readDelegationMembers(snapshot: unknown): ProviderDelegationMember[] | 
       agentName: typeof entry.agentName === "string" && entry.agentName ? entry.agentName : null,
       task: typeof entry.task === "string" && entry.task ? entry.task : null,
       status: readDelegationMemberStatus(entry.status),
+      createdAtMs: typeof entry.createdAtMs === "number" ? entry.createdAtMs : null,
       updatedAtMs: typeof entry.updatedAtMs === "number" ? entry.updatedAtMs : null,
     });
   }
