@@ -556,9 +556,10 @@ export interface ListImportableSessionsOptions {
    */
   cwd?: string;
   /**
-   * Aborts the listing. Providers must stop their work and release every
-   * resource they acquired for it, so an abandoned listing cannot leave a
-   * provider process running.
+   * Aborts the listing. Providers that support it (currently the ACP adapter)
+   * must stop their work and release every resource they acquired for it, so
+   * an abandoned listing cannot leave a provider process running. Providers
+   * that do not support the signal may ignore it.
    */
   signal?: AbortSignal;
 }

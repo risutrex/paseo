@@ -2724,6 +2724,157 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
       vi.useRealTimers();
     }
   });
+
+  test("kills the live probe when the listing is aborted after a recycle", async () => {
+    vi.useFakeTimers();
+    try {
+      // The provider connection breaks when its process is killed, so the
+      // pending request rejects the same way it does in a real run.
+      let rejectPending: ((error: Error) => void) | undefined;
+      const terminateProcess = vi.fn(async () => {
+        rejectPending?.(new Error("probe terminated"));
+      });
+      let page = 0;
+      const listSessions = vi.fn(async () => {
+        page += 1;
+        return page === 1
+          ? {
+              sessions: [
+                {
+                  sessionId: "s1",
+                  cwd: "/Users/moonshot",
+                  title: "one",
+                  updatedAt: "2026-06-13T00:00:00.000Z",
+                },
+              ],
+              nextCursor: "cursor-2",
+            }
+          : {
+              sessions: [
+                {
+                  sessionId: "s2",
+                  cwd: "/Users/moonshot",
+                  title: "two",
+                  updatedAt: "2026-06-14T00:00:00.000Z",
+                },
+              ],
+              nextCursor: null,
+            };
+      });
+      // Every history stays unanswered: the provider is stuck on each of them.
+      const loadSession = vi.fn(
+        async () =>
+          await new Promise<never>((_resolve, reject) => {
+            rejectPending = reject;
+          }),
+      );
+
+      const { client, children } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+      });
+
+      const controller = new AbortController();
+      const listing = client.listImportableSessions({
+        cwd: "/Users/moonshot",
+        signal: controller.signal,
+      });
+      // The first history times out as slow and the probe is replaced.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(children).toHaveLength(2);
+      const killsBeforeAbort = terminateProcess.mock.calls.length;
+      controller.abort();
+
+      await expect(listing).rejects.toThrow(/aborted/);
+      // The probe that was alive at the moment of the abort is the one that
+      // gets killed, not the replaced one.
+      const killsAfterAbort = terminateProcess.mock.calls.slice(killsBeforeAbort);
+      expect(killsAfterAbort[0]?.[0]).toBe(children[1]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("stops asking a stuck probe for previews once the recycle budget is spent", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      const stuckSessions = Array.from({ length: 5 }, (_value, index) => ({
+        sessionId: `s${index + 1}`,
+        cwd: "/Users/moonshot",
+        title: `session ${index + 1}`,
+        updatedAt: "2026-06-13T00:00:00.000Z",
+      }));
+      const listSessions = vi.fn(async () => ({
+        sessions: stuckSessions,
+        nextCursor: null,
+      }));
+      const loadSession = vi.fn(async () => await new Promise<never>(() => {}));
+
+      const { client, children } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      await vi.advanceTimersByTimeAsync(20_000);
+      const result = await listing;
+
+      // The probe is replaced a bounded number of times and then left alone.
+      expect(children).toHaveLength(4);
+      expect(loadSession).toHaveBeenCalledTimes(4);
+      // Every session stays visible, the ones without a preview included.
+      expect(result.map((session) => session.providerHandleId)).toEqual([
+        "s1",
+        "s2",
+        "s3",
+        "s4",
+        "s5",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("aborts immediately when the signal is already aborted", async () => {
+    const terminateProcess = vi.fn(async () => {});
+    const listSessions = vi.fn(async () => ({
+      sessions: [
+        {
+          sessionId: "s1",
+          cwd: "/Users/moonshot",
+          title: "one",
+          updatedAt: "2026-06-13T00:00:00.000Z",
+        },
+      ],
+      nextCursor: null,
+    }));
+    const loadSession = vi.fn(async () => await new Promise<never>(() => {}));
+
+    const { client, children } = makeClient({
+      listSessions,
+      loadSession,
+      terminateProcess,
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      client.listImportableSessions({
+        cwd: "/Users/moonshot",
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow(/aborted/);
+    expect(listSessions).not.toHaveBeenCalled();
+    // The abort handler kills the probe and the cleanup path terminates it
+    // again - the terminator is idempotent.
+    expect(terminateProcess).toHaveBeenCalledTimes(2);
+    expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
+    expect(terminateProcess.mock.calls[1]?.[0]).toBe(children[0]);
+  });
 });
 
 describe("ACP providers advertise session listing", () => {

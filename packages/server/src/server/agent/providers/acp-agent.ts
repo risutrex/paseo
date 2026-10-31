@@ -323,20 +323,21 @@ const ACP_PROBE_CLOSE_TIMEOUT_MS = 2_000;
 // or the provider process is never terminated.
 const ACP_CLOSE_REQUEST_TIMEOUT_MS = 2_000;
 // An ACP provider answers the cancelled `session/prompt` with a `cancelled`
-// stop reason. Interruption waits for that answer so the session is really
-// free before the caller sends a replacement prompt. The budget has to stay
-// below the agent manager's interrupt rescue timeout (2s), otherwise the
-// manager gives up first and the adapter's descriptive error never reaches
-// the caller.
-const ACP_TURN_RELEASE_TIMEOUT_MS = 1_500;
+// stop reason. Interruption waits for that answer so the session is released
+// before the caller sends a replacement prompt. The two waits below run one
+// after another, so their sum has to stay below the agent manager's interrupt
+// rescue timeout (2s): otherwise the manager gives up first, reports the
+// interruption as not acknowledged, and the adapter's descriptive error never
+// reaches the caller.
+const ACP_TURN_RELEASE_TIMEOUT_MS = 1_200;
 // `session/cancel` is a notification, so the write itself can block on a
 // stuck provider. Bound it instead of letting the interruption hang.
-const ACP_CANCEL_NOTIFICATION_TIMEOUT_MS = 1_000;
+const ACP_CANCEL_NOTIFICATION_TIMEOUT_MS = 500;
 const ACP_IMPORT_HISTORY_LOAD_TIMEOUT_MS = 30_000;
 // A provider that never answers `session/list` must not block the listing
 // forever: bound the call and let the caller retry.
 const ACP_IMPORT_SESSION_LIST_TIMEOUT_MS = 20_000;
-const ACP_IMPORT_HISTORY_BUDGET_MS = 60_000;
+const ACP_IMPORT_HISTORY_BUDGET_MS = 45_000;
 // A history load that takes longer than this means the provider is stuck on
 // that session. Providers answer ACP requests one at a time, so every later
 // request on the same connection queues behind it; the import gives up on the
@@ -1253,21 +1254,29 @@ export class ACPAgentClient implements AgentClient {
     options?: ListImportableSessionsOptions,
   ): Promise<ImportableProviderSession[]> {
     const history = new ACPImportHistoryCollector();
-    let probe = await this.spawnImportProbe(history);
+    // The live probe lives in a shared holder: a stuck provider is replaced
+    // while the listing runs, and the abort handler has to kill the probe that
+    // is actually alive.
+    const probeState: { current: SpawnedACPProcess } = {
+      current: await this.spawnImportProbe(history),
+    };
     // An abandoned listing must not leave the probe running: the provider keeps
     // working on the requests it already received, so cancelling the caller is
     // not enough - the child process has to go.
-    const abort = this.bindImportAbort(options?.signal, () => probe);
+    const abort = this.bindImportAbort(options?.signal, probeState);
     try {
-      if (!probe.initialize.agentCapabilities?.sessionCapabilities?.list) {
+      if (!probeState.current.initialize.agentCapabilities?.sessionCapabilities?.list) {
         return [];
       }
 
       const sessions: ImportableProviderSession[] = [];
       const resultLimit = options?.limit ?? Number.POSITIVE_INFINITY;
       const scanLimit = Math.min(options?.scanLimit ?? 500, 500);
-      const canLoadHistory = probe.initialize.agentCapabilities.loadSession === true;
+      const canLoadHistory = probeState.current.initialize.agentCapabilities.loadSession === true;
+      // One deadline for the history loads. Together with the page timeouts it
+      // has to stay below the agent manager's 90s budget for the listing.
       const historyDeadline = this.now() + ACP_IMPORT_HISTORY_BUDGET_MS;
+      const seen = new Set<string>();
       let scanned = 0;
       let recycles = 0;
       let cursor: string | null | undefined;
@@ -1275,8 +1284,10 @@ export class ACPAgentClient implements AgentClient {
         if (abort.triggered()) {
           throw new Error("ACP import session listing was aborted");
         }
-        const page = await this.fetchImportSessionsPage(probe, cursor, options?.cwd);
-        const collected = await this.collectImportablePage(probe, history, page.sessions, {
+        const page = await this.fetchImportSessionsPage(probeState.current, cursor, options?.cwd);
+        const candidates = page.sessions.filter((session) => !seen.has(session.sessionId));
+        const collected = await this.collectImportablePage(probeState, history, candidates, {
+          abort,
           canLoadHistory,
           historyDeadline,
           collected: sessions.length,
@@ -1284,20 +1295,30 @@ export class ACPAgentClient implements AgentClient {
           scanLimit,
           scanned,
           recycles,
+          seen,
         });
-        probe = collected.probe;
         sessions.push(...collected.sessions);
         scanned = collected.scanned;
         recycles = collected.recycles;
         cursor = page.nextCursor ?? null;
+        if (collected.recycled) {
+          // The page came from a probe that has been replaced, so its cursor
+          // says nothing about the new one. Read the list again from the
+          // start; the sessions already seen are skipped.
+          cursor = null;
+          continue;
+        }
         if (!cursor) break;
         if (scanned >= scanLimit || sessions.length >= resultLimit) break;
       }
 
+      if (abort.triggered()) {
+        throw new Error("ACP import session listing was aborted");
+      }
       return sessions;
     } finally {
       abort.dispose();
-      await this.closeProbe(probe);
+      await this.closeProbe(probeState.current);
     }
   }
 
@@ -1307,10 +1328,11 @@ export class ACPAgentClient implements AgentClient {
    * sessions and the next list page are answered by a fresh probe.
    */
   private async collectImportablePage(
-    probe: SpawnedACPProcess,
+    probeState: { current: SpawnedACPProcess },
     history: ACPImportHistoryCollector,
     candidates: ListSessionsResponse["sessions"],
     context: {
+      abort: { triggered: () => boolean };
       canLoadHistory: boolean;
       historyDeadline: number;
       collected: number;
@@ -1318,32 +1340,58 @@ export class ACPAgentClient implements AgentClient {
       scanLimit: number;
       scanned: number;
       recycles: number;
+      seen: Set<string>;
     },
   ): Promise<{
     sessions: ImportableProviderSession[];
-    probe: SpawnedACPProcess;
     scanned: number;
     recycles: number;
+    recycled: boolean;
   }> {
     const sessions: ImportableProviderSession[] = [];
-    let current = probe;
     let scanned = context.scanned;
     let recycles = context.recycles;
+    let recycled = false;
+    let canLoadHistory = context.canLoadHistory;
     for (const session of candidates) {
+      if (context.abort.triggered()) {
+        throw new Error("ACP import session listing was aborted");
+      }
       if (scanned >= context.scanLimit) break;
       if (context.collected + sessions.length >= context.resultLimit) break;
       scanned += 1;
-      const outcome = context.canLoadHistory
-        ? await this.loadImportPromptPreviews(current, history, session, context.historyDeadline)
+      context.seen.add(session.sessionId);
+      const outcome = canLoadHistory
+        ? await this.loadImportPromptPreviews(
+            probeState.current,
+            history,
+            session,
+            context.historyDeadline,
+          )
         : { status: "skipped" as const };
+      if (context.abort.triggered()) {
+        // The caller gave up while the provider was loading. The probe is
+        // already killed, so the listing has to fail instead of returning a
+        // half filled result.
+        throw new Error("ACP import session listing was aborted");
+      }
       if (outcome.status === "slow") {
         // The provider is stuck on this history and answers no later request on
         // this connection. Replace the probe: killing the child also stops the
         // runaway work the provider already started.
         sessions.push(this.toImportableSession(session, null));
+        if (context.abort.triggered()) {
+          throw new Error("ACP import session listing was aborted");
+        }
         if (recycles < ACP_IMPORT_MAX_PROBE_RECYCLES) {
           recycles += 1;
-          current = await this.recycleImportProbe(current, history);
+          recycled = true;
+          probeState.current = await this.recycleImportProbe(probeState.current, history);
+        } else {
+          // The probe is known to be stuck and may not be replaced any more.
+          // Stop asking it for previews instead of waiting for every remaining
+          // session to time out.
+          canLoadHistory = false;
         }
         continue;
       }
@@ -1354,7 +1402,7 @@ export class ACPAgentClient implements AgentClient {
       if (outcome.previews.hasConversation === false) continue;
       sessions.push(this.toImportableSession(session, outcome.previews));
     }
-    return { sessions, probe: current, scanned, recycles };
+    return { sessions, scanned, recycles, recycled };
   }
 
   /** Spawns a probe that feeds its session updates into the history collector. */
@@ -1394,16 +1442,25 @@ export class ACPAgentClient implements AgentClient {
   /**
    * Terminates the probe process when the caller gives up on the listing, so
    * an abandoned request cannot leave the provider working in the background.
+   * The probe is replaced while the listing runs, so the live one is read from
+   * the shared holder instead of a captured value.
    */
   private bindImportAbort(
     signal: AbortSignal | undefined,
-    getProbe: () => SpawnedACPProcess,
+    probeState: { current: SpawnedACPProcess },
   ): { triggered: () => boolean; dispose: () => void } {
     let aborted = false;
     const handleAbort = (): void => {
+      if (aborted) return;
       aborted = true;
-      void terminateChildProcess(getProbe().child, 2_000, this.terminateProcess);
+      void terminateChildProcess(probeState.current.child, 2_000, this.terminateProcess).catch(
+        () => undefined,
+      );
     };
+    if (signal?.aborted) {
+      // An already aborted signal never fires the listener.
+      handleAbort();
+    }
     signal?.addEventListener("abort", handleAbort, { once: true });
     return {
       triggered: () => aborted,
@@ -1500,18 +1557,14 @@ export class ACPAgentClient implements AgentClient {
       () => "loaded" as const,
       () => "failed" as const,
     );
-    const timed = withTimeout(
-      loadPromise,
-      timeoutMs,
-      `ACP import history load timed out after ${timeoutMs}ms`,
-    ).then(
-      () => "loaded" as const,
-      () => "failed" as const,
-    );
-    if (ACP_IMPORT_HISTORY_SLOW_LOAD_MS >= timeoutMs) {
-      return await Promise.race([loaded, timed]);
-    }
     let slowTimer: ReturnType<typeof setTimeout> | undefined;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    // Both timers are cleared when the race is over: the slow guard wins long
+    // before the load timeout, and an armed timer would keep the provider
+    // request alive for the rest of its budget.
+    const timed = new Promise<"failed">((resolve) => {
+      timeoutTimer = setTimeout(() => resolve("failed"), timeoutMs);
+    });
     const slow = new Promise<"slow">((resolve) => {
       slowTimer = setTimeout(() => resolve("slow"), ACP_IMPORT_HISTORY_SLOW_LOAD_MS);
     });
@@ -1519,6 +1572,7 @@ export class ACPAgentClient implements AgentClient {
       return await Promise.race([loaded, timed, slow]);
     } finally {
       if (slowTimer) clearTimeout(slowTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
     }
   }
 
