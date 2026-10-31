@@ -2902,6 +2902,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (!this.supportsVendorSteer()) {
       return { status: "unavailable" };
     }
+    // The steer extension carries text only. A prompt with attachments would
+    // lose them on the way, so such a prompt is not steered at all: the
+    // manager falls back to the interrupt-and-replace path, which delivers the
+    // whole prompt.
+    const blocks = typeof prompt === "string" ? [{ type: "text" as const, text: prompt }] : prompt;
+    if (blocks.some((block) => block.type !== "text")) {
+      return { status: "unavailable" };
+    }
     const text = extractPromptText(prompt);
     if (!text.trim()) {
       return { status: "unavailable" };
@@ -2917,14 +2925,20 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       if (mode === "activated") {
         throw new Error("ACP provider activated a new turn instead of steering the running one");
       }
+      // `steered` means the message joined the running turn, `duplicate` means
+      // the same client request id was already accepted, and `merged` means
+      // the provider folded the message into the current one. All three are a
+      // delivery. Anything else is unknown and must not be reported as one.
       if (mode !== "steered" && mode !== "merged" && mode !== "duplicate") {
         throw new Error(`ACP provider returned an unknown steer disposition: ${mode ?? "none"}`);
       }
       if (options.clearPendingPermissions) {
         this.cancelPendingPermissions();
       }
+      // The provider answers with its own turn id, which is not the Paseo turn
+      // id and cannot be compared with it. It is logged for diagnostics only.
       this.logger.info(
-        { mode, turnId: activeTurnId },
+        { mode, turnId: activeTurnId, providerTurnId: response.turnId },
         "ACP provider accepted the steer for the running turn",
       );
       return { status: "accepted" };

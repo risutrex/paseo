@@ -3572,6 +3572,66 @@ describe("ACPAgentSession", () => {
     expect(extMethod).toHaveBeenCalledOnce();
   });
 
+  test("does not steer a prompt with attachments, because the extension carries text only", async () => {
+    const session = createSession();
+    const extMethod = vi.fn();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+    const result = await session.steerActiveTurn!(
+      [
+        { type: "text", text: "look at this" },
+        { type: "image", data: "AAAA", mimeType: "image/png" },
+      ],
+      { expectedTurnId: turnId },
+    );
+
+    expect(result).toEqual({ status: "unavailable" });
+    expect(extMethod).not.toHaveBeenCalled();
+  });
+
+  test("rejects a steer that the provider turned into a new turn", async () => {
+    const session = createSession();
+    const extMethod = vi.fn().mockResolvedValue({ turnId: "native-turn-2", mode: "activated" });
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+
+    await expect(session.steerActiveTurn!("follow up", { expectedTurnId: turnId })).rejects.toThrow(
+      "activated a new turn",
+    );
+  });
+
+  test("rejects a steer with an unknown disposition", async () => {
+    const session = createSession();
+    const extMethod = vi.fn().mockResolvedValue({ turnId: "native-turn-1", mode: "queued" });
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+
+    await expect(session.steerActiveTurn!("follow up", { expectedTurnId: turnId })).rejects.toThrow(
+      "unknown steer disposition",
+    );
+  });
+
   test("does not steer a turn that is no longer the active one", async () => {
     const session = createSession();
     const extMethod = vi.fn();
