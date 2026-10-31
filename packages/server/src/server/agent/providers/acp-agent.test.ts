@@ -3301,6 +3301,22 @@ describe("ACP providers advertise session listing", () => {
     const client = new CopilotACPAgentClient({ logger: createTestLogger() });
     expect(client.capabilities.importSessionPreviewsAreCheap).toBe(false);
   });
+
+  test("asks the provider for its extension notifications", () => {
+    // A provider that runs its own sub-agents sends their tree only when the
+    // client asked for extension notifications in the handshake. Without the
+    // request the background work of a session stays invisible.
+    const client = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: ["minimax-code", "acp"],
+    });
+    const meta = asInternals<{ clientCapabilityMeta: Record<string, unknown> }>(
+      client,
+    ).clientCapabilityMeta;
+    expect(meta).toMatchObject({
+      "minimax-code/extensions": { version: 1, notifications: true },
+    });
+  });
 });
 
 describe("transformPiModels", () => {
@@ -3893,6 +3909,120 @@ describe("ACPAgentSession", () => {
     });
     expect(events.some((event) => event.type === "turn_failed")).toBe(false);
     expect(events.some((event) => event.type === "turn_queued")).toBe(true);
+  });
+
+  test("publishes the provider's delegation tree as sub-agent rows", async () => {
+    // A provider that runs its own sub-agents keeps them out of the session
+    // list. The delegation tree is the only place they exist, and without it
+    // the background work of a session stays invisible.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: {
+        schemaVersion: 1,
+        rootSessionId: "session-1",
+        members: [
+          {
+            sessionId: "child-1",
+            parentSessionId: "session-1",
+            agentName: "explore",
+            task: "List files in the project",
+            status: "running",
+            createdAtMs: 1_700_000_000_000,
+            updatedAtMs: 1_700_000_001_000,
+          },
+        ],
+      },
+    });
+
+    expect(events).toEqual([
+      {
+        type: "provider_subagent",
+        provider: "claude-acp",
+        event: {
+          type: "upsert",
+          id: "child-1",
+          title: "List files in the project",
+          description: "explore",
+          status: "running",
+          // The parent is the session itself, not another sub-agent.
+          parentSubagentId: null,
+          timestamp: new Date(1_700_000_001_000).toISOString(),
+        },
+      },
+    ]);
+  });
+
+  test("does not republish an unchanged delegation tree", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    const snapshot = {
+      schemaVersion: 1,
+      rootSessionId: "session-1",
+      members: [
+        {
+          sessionId: "child-1",
+          parentSessionId: "session-1",
+          agentName: "explore",
+          task: "List files",
+          status: "completed",
+          updatedAtMs: 1_700_000_001_000,
+        },
+      ],
+    };
+
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot,
+    });
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot,
+    });
+
+    expect(events).toHaveLength(1);
+  });
+
+  test("maps a stopped delegation to a cancelled sub-agent", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: {
+        schemaVersion: 1,
+        rootSessionId: "session-1",
+        members: [
+          {
+            sessionId: "child-1",
+            parentSessionId: "session-1",
+            agentName: "worker",
+            task: "Background sleep",
+            status: "stopped",
+            updatedAtMs: 1_700_000_001_000,
+          },
+        ],
+      },
+    });
+
+    expect(events[0]).toMatchObject({
+      type: "provider_subagent",
+      event: { type: "upsert", id: "child-1", status: "canceled" },
+    });
   });
 
   test("fails the turn when the provider is busy and offers no queue", async () => {

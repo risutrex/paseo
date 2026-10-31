@@ -352,6 +352,15 @@ const ACP_BUSY_PROMPT_RETRY_LIMIT = 2;
 // and answers with the turn it steered plus the disposition of the message.
 const MCODE_EXTENSIONS_META_KEY = "minimax-code/extensions";
 const MCODE_STEER_METHOD = "mcode/session/steer";
+// MiniMax Code sends its extension notifications only when the client asks for
+// them in the handshake. Without this the provider keeps its background work
+// to itself: no delegation updates, no queue updates, no goal updates and no
+// notice that another client owns the session.
+const DEFAULT_ACP_CLIENT_CAPABILITY_META: ACPClientCapabilityMeta = {
+  [MCODE_EXTENSIONS_META_KEY]: { version: 1, notifications: true },
+};
+const MCODE_DELEGATION_GET_METHOD = "mcode/session/delegation/get";
+const MCODE_DELEGATION_UPDATE_NOTIFICATION = "mcode/session/delegation_update";
 // A provider that still owns its previous turn refuses a new prompt and tells
 // the client to use its queue instead. MiniMax Code answers such a refusal
 // with "Session already has an active Turn. Use queue send to deliver the
@@ -1055,7 +1064,7 @@ export class ACPAgentClient implements AgentClient {
     this.configOptionsTransformer = options.configOptionsTransformer;
     this.configFeatureOptions = options.configFeatureOptions ?? [];
     this.clientCapabilities = options.clientCapabilities;
-    this.clientCapabilityMeta = options.clientCapabilityMeta;
+    this.clientCapabilityMeta = options.clientCapabilityMeta ?? DEFAULT_ACP_CLIENT_CAPABILITY_META;
     this.modeIdTransformer = options.modeIdTransformer;
     this.toolSnapshotTransformer = options.toolSnapshotTransformer;
     this.providerModeWriter = options.providerModeWriter;
@@ -2126,6 +2135,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private pendingUserMessage: PendingUserMessage | null = null;
   private submittedUserMessageTurnId: string | null = null;
   private readonly toolCalls = new Map<string, ACPToolSnapshot>();
+  // The last delegation tree the provider published, so a repeated snapshot
+  // does not redraw the same rows.
+  private delegationSignature: string | null = null;
   private readonly terminalEntries = new Map<string, TerminalEntry>();
   private readonly persistedHistory: AgentTimelineItem[] = [];
   private readonly initialHandle?: AgentPersistenceHandle;
@@ -2202,7 +2214,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.configFeatureOptions = options.configFeatureOptions ?? [];
     this.configuredModelIds = new Set(options.configuredModelIds);
     this.clientCapabilities = options.clientCapabilities;
-    this.clientCapabilityMeta = options.clientCapabilityMeta;
+    this.clientCapabilityMeta = options.clientCapabilityMeta ?? DEFAULT_ACP_CLIENT_CAPABILITY_META;
     this.modeIdTransformer = options.modeIdTransformer;
     this.toolSnapshotTransformer = options.toolSnapshotTransformer;
     this.providerModeWriter = options.providerModeWriter;
@@ -2263,6 +2275,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         await this.sessionUpdate(update);
       }
       await this.applyConfiguredOverrides();
+      await this.refreshDelegationSnapshot();
     } catch (error) {
       await this.closeAfterInitializationFailure(error);
     }
@@ -2318,6 +2331,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       }
 
       await this.applyConfiguredOverrides();
+      await this.refreshDelegationSnapshot();
 
       if (this.resumePurpose === "history") {
         await this.releaseHistoryRuntime();
@@ -3144,6 +3158,92 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   /**
+   * Reports whether the provider advertised a delegation extension.
+   */
+  private supportsVendorDelegation(): boolean {
+    const extensions = this.agentMeta?.[MCODE_EXTENSIONS_META_KEY];
+    if (!extensions || typeof extensions !== "object") {
+      return false;
+    }
+    const methods = (extensions as { methods?: unknown }).methods;
+    return Array.isArray(methods) && methods.includes(MCODE_DELEGATION_GET_METHOD);
+  }
+
+  /**
+   * Publishes the provider's delegation tree as sub-agent rows.
+   *
+   * A provider that runs its own sub-agents keeps them out of the session
+   * list: their sessions cannot be opened, and they never appear as agents of
+   * their own. Without this the background work of a session is invisible -
+   * the user sees the parent turn and nothing about what it delegated.
+   *
+   * The provider sends the whole tree, so the rows replace the previous state
+   * instead of accumulating.
+   */
+  private applyDelegationSnapshot(snapshot: unknown): void {
+    const members = readDelegationMembers(snapshot);
+    if (!members) {
+      return;
+    }
+    const signature = members
+      .map((member) => `${member.sessionId}:${member.status}:${member.updatedAtMs ?? ""}`)
+      .join("|");
+    if (signature === this.delegationSignature) {
+      // The provider repeats a snapshot it already sent. Republishing it would
+      // only redraw the same rows.
+      return;
+    }
+    this.delegationSignature = signature;
+    const memberIds = new Set(members.map((member) => member.sessionId));
+    for (const member of members) {
+      const parentSubagentId =
+        member.parentSessionId && memberIds.has(member.parentSessionId)
+          ? member.parentSessionId
+          : null;
+      this.pushEvent({
+        type: "provider_subagent",
+        provider: this.provider,
+        event: {
+          type: "upsert",
+          id: member.sessionId,
+          title: member.task,
+          description: member.agentName,
+          status: member.status,
+          parentSubagentId,
+          ...(member.updatedAtMs !== null
+            ? { timestamp: new Date(member.updatedAtMs).toISOString() }
+            : {}),
+        },
+      });
+    }
+  }
+
+  /**
+   * Reads the delegation tree once, so a session that already had sub-agents
+   * shows them before the next update arrives.
+   */
+  private async refreshDelegationSnapshot(): Promise<void> {
+    const connection = this.connection;
+    if (!connection || !this.sessionId || !this.supportsVendorDelegation()) {
+      return;
+    }
+    try {
+      const response = await connection.extMethod(MCODE_DELEGATION_GET_METHOD, {
+        sessionId: this.sessionId,
+      });
+      const snapshot = isRecord(response) ? response.snapshot : undefined;
+      if (snapshot !== undefined) {
+        this.applyDelegationSnapshot(snapshot);
+      }
+    } catch (error) {
+      // A provider without a delegation tree, or one that is not attached to
+      // this process, answers with an error. That is not a failure of the
+      // session: the tree is an extra, not a requirement.
+      this.logger.debug({ err: error }, "ACP provider did not report a delegation tree");
+    }
+  }
+
+  /**
    * Hands the message to the provider's queue instead of losing it.
    *
    * A provider that still owns its previous turn refuses a new prompt. That
@@ -3512,6 +3612,18 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       },
       "provider.acp.extension_notification",
     );
+
+    if (method === MCODE_DELEGATION_UPDATE_NOTIFICATION) {
+      // The provider publishes the whole delegation tree whenever it changes.
+      // This is the only way to see the work a session delegated.
+      const sessionId = typeof params.sessionId === "string" ? params.sessionId : null;
+      const snapshot = isRecord(params) ? params.snapshot : undefined;
+      // A provider may publish the tree of another session to the same client.
+      // Only the tree of this session belongs to it.
+      if (snapshot !== undefined && (sessionId === null || sessionId === this.sessionId)) {
+        this.applyDelegationSnapshot(snapshot);
+      }
+    }
 
     const parsedCommands = this.extensionCommandsParser?.(method, params);
     if (parsedCommands) {
@@ -4505,6 +4617,77 @@ function isTextOnlyPrompt(prompt: AgentPromptInput): boolean {
     return true;
   }
   return prompt.every((block) => block.type === "text");
+}
+
+/**
+ * One member of a provider's delegation tree.
+ *
+ * The shape is a provider's own: the session id of the child, the session id
+ * of its parent, the name of the agent that runs it, the task it was given and
+ * where it stands.
+ */
+interface ProviderDelegationMember {
+  sessionId: string;
+  parentSessionId: string | null;
+  agentName: string | null;
+  task: string | null;
+  status: "running" | "completed" | "failed" | "canceled";
+  updatedAtMs: number | null;
+}
+
+function readDelegationMemberStatus(value: unknown): ProviderDelegationMember["status"] {
+  switch (value) {
+    case "completed":
+    case "done":
+    case "finished":
+      return "completed";
+    case "failed":
+    case "error":
+      return "failed";
+    case "stopped":
+    case "cancelled":
+    case "canceled":
+      return "canceled";
+    default:
+      // An unknown status is not a finished one. Reporting it as running keeps
+      // the child visible instead of claiming work that may still be going.
+      return "running";
+  }
+}
+
+/**
+ * Reads the members of a delegation snapshot.
+ *
+ * The provider sends the whole tree, not a diff, so the members replace the
+ * previous state. A member without a session id cannot be addressed and is
+ * skipped.
+ */
+function readDelegationMembers(snapshot: unknown): ProviderDelegationMember[] | null {
+  if (!isRecord(snapshot)) {
+    return null;
+  }
+  const members = snapshot.members;
+  if (!Array.isArray(members)) {
+    return null;
+  }
+  const parsed: ProviderDelegationMember[] = [];
+  for (const entry of members) {
+    if (!isRecord(entry) || typeof entry.sessionId !== "string" || !entry.sessionId) {
+      continue;
+    }
+    parsed.push({
+      sessionId: entry.sessionId,
+      parentSessionId:
+        typeof entry.parentSessionId === "string" && entry.parentSessionId
+          ? entry.parentSessionId
+          : null,
+      agentName: typeof entry.agentName === "string" && entry.agentName ? entry.agentName : null,
+      task: typeof entry.task === "string" && entry.task ? entry.task : null,
+      status: readDelegationMemberStatus(entry.status),
+      updatedAtMs: typeof entry.updatedAtMs === "number" ? entry.updatedAtMs : null,
+    });
+  }
+  return parsed;
 }
 
 function contentBlockToText(content: ContentBlock): string {
