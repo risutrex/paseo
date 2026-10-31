@@ -38,8 +38,8 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.TRINITY_API_KEY }}
           # LiteLLM appends /v1/messages unless it is already present.
           ANTHROPIC_API_BASE: https://gate.trinity.guru/omni/v1
-          CONFIG__MODEL: trinity-omni/deepseek-v4.1-flash
-          CONFIG__MODEL_WEAK: trinity-omni/deepseek-v4.1-flash
+          CONFIG__MODEL: anthropic/deepseek-v4.1-flash
+          CONFIG__MODEL_WEAK: anthropic/deepseek-v4.1-flash
           CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: '32000'
           CONFIG__MAX_MODEL_TOKENS: '32000'
