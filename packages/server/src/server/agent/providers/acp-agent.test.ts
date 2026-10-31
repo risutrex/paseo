@@ -3475,6 +3475,34 @@ describe("ACPAgentSession", () => {
     expect(turnIdDuringRetry).toEqual([turnId]);
   });
 
+  test("does not deliver the prompt again after the turn was interrupted", async () => {
+    const session = createSession();
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+
+    // The user stops the turn while the busy retry waits for its pause.
+    const interruption = session.interrupt();
+    await interruption.catch(() => undefined);
+
+    // Give the retry its full pause, then let the interruption settle.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledWith({ sessionId: "session-1" });
+  });
+
   test("does not retry a prompt that failed for another reason", async () => {
     const session = createSession();
     const prompt = vi.fn().mockRejectedValue(new Error("Internal error: something else"));

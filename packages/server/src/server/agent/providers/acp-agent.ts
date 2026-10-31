@@ -2031,6 +2031,12 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private currentTurnUsage: AgentUsage | undefined;
   private activeForegroundTurnId: string | null = null;
   /**
+   * The foreground turn whose interruption is in flight. A retry that waits
+   * for the provider must not deliver the prompt again once the user stopped
+   * that turn.
+   */
+  private interruptingForegroundTurnId: string | null = null;
+  /**
    * Tracks the foreground `session/prompt` requests so an interruption can
    * wait for the provider to confirm that the turn ended. An ACP
    * `session/cancel` is a notification without a response, so the cancellation
@@ -2304,6 +2310,16 @@ export class ACPAgentSession implements AgentSession, ACPClient {
             "ACP provider still owns the previous turn; retrying the prompt",
           );
           await new Promise((resolve) => setTimeout(resolve, ACP_BUSY_PROMPT_RETRY_DELAY_MS));
+          // The user may have stopped the turn while the retry waited. The
+          // interruption owns the outcome now, and delivering the prompt again
+          // would resurrect the turn the user just stopped.
+          if (
+            this.interruptingForegroundTurnId === turnId ||
+            this.activeForegroundTurnId !== turnId
+          ) {
+            settleForegroundPrompt("released");
+            return;
+          }
           try {
             const retried = await connection.prompt(promptParams);
             this.handlePromptResponse(retried, turnId);
@@ -2985,6 +3001,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     // flight, and waiting for that other turn would report a release that
     // never happened.
     const pending = this.foregroundPrompts.get(activeTurnId) ?? null;
+    this.interruptingForegroundTurnId = activeTurnId;
 
     try {
       await withTimeout(
@@ -3951,6 +3968,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
     const finishedTurnId = event.turnId ?? this.activeForegroundTurnId;
     this.activeForegroundTurnId = null;
+    if (this.interruptingForegroundTurnId === finishedTurnId) {
+      this.interruptingForegroundTurnId = null;
+    }
     if (finishedTurnId) {
       this.foregroundPrompts.delete(finishedTurnId);
     }
