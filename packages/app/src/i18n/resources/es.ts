@@ -413,6 +413,8 @@ export const es: TranslationResources = {
     scope: {
       host: "Sesiones en {{host}}",
       workspace: "Este espacio de trabajo",
+      widenedBySearch:
+        "Buscando en todos los directorios para encontrar una sesión de otro proyecto.",
     },
     filters: {
       all: "Todo",
@@ -429,6 +431,11 @@ export const es: TranslationResources = {
       refresh: "Actualizar sesiones",
       showAll: "Mostrar todo",
       loadMore: "Cargar más",
+      scopeToWorkspace: "Este espacio de trabajo",
+    },
+    previews: {
+      unavailable:
+        "Algunos proveedores se buscaron solo por título y carpeta: no se cargó el texto de sus mensajes.",
     },
     preview: {
       untitledSession: "Sesión sin título",

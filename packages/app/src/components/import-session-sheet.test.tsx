@@ -555,13 +555,8 @@ describe("ImportSessionSheet", () => {
 
   it("imports a selected session by provider handle and reports the imported agent", async () => {
     const events: string[] = [];
-    let fetchCount = 0;
     const fetchRecentProviderSessions = vi.fn(async () => {
-      fetchCount += 1;
       events.push("fetch");
-      if (fetchCount > 1) {
-        return await new Promise<never>(() => {});
-      }
       return {
         requestId: "recent-provider-sessions",
         entries: [
@@ -944,7 +939,7 @@ describe("ImportSessionSheet", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("names the scope after the host when unscoped and after the workspace when scoped", async () => {
+  it("names the scope after the workspace by default and after the host once widened", async () => {
     const fetchRecentProviderSessions = vi.fn(async () => ({
       requestId: "recent-provider-sessions",
       entries: [],
@@ -957,7 +952,9 @@ describe("ImportSessionSheet", () => {
       snapshot: { supportsSnapshot: true, entries: [createSnapshotEntry("claude")] },
     });
     await screen.findByText("Sessions on workbench");
+    // Without a workspace directory there is nothing to narrow the list to.
     expect(screen.queryByTestId("import-session-show-all")).toBeNull();
+    expect(screen.queryByTestId("import-session-scope-workspace")).toBeNull();
     cleanup();
 
     renderSheet(client, {
@@ -966,6 +963,12 @@ describe("ImportSessionSheet", () => {
     });
     await screen.findByText("This workspace");
     screen.getByTestId("import-session-show-all");
+
+    fireEvent.click(screen.getByTestId("import-session-show-all"));
+    await screen.findByText("Sessions on workbench");
+    // A widening the user asked for needs no explanation; the search-driven one
+    // does, and that is covered by the search test.
+    expect(screen.queryByTestId("import-session-scope-reason")).toBeNull();
   });
 
   it("lists unscoped rows newest first and names each row's folder", async () => {
@@ -1227,7 +1230,74 @@ describe("ImportSessionSheet", () => {
     await screen.findByText("Could not load Codex sessions");
   });
 
-  it("imports a foreign-directory row without the current workspace once Show all is on", async () => {
+  it("starts on the workspace, widens while searching, and narrows back on request", async () => {
+    const fetchRecentProviderSessions = vi.fn(async (options: { cwd?: string } | undefined) => ({
+      requestId: "recent-provider-sessions",
+      entries: [
+        createProviderSessionEntry({
+          providerId: "claude",
+          providerHandleId: options?.cwd ? "scoped-thread" : "foreign-thread",
+          cwd: options?.cwd ?? "/home/me/work/other-project",
+          title: options?.cwd ? "Scoped session" : "Foreign session",
+        }),
+      ],
+    }));
+    const importAgent = vi.fn();
+
+    renderSheet(
+      { fetchRecentProviderSessions, importAgent } as Pick<
+        DaemonClient,
+        "fetchRecentProviderSessions" | "importAgent"
+      >,
+      {
+        workspaceId: "ws-current",
+        snapshot: { supportsSnapshot: true, entries: [createSnapshotEntry("claude")] },
+      },
+    );
+
+    // Nothing typed yet: the cheap listing of this workspace, whose rows the
+    // daemon matched with realpaths resolved.
+    await screen.findByText("Scoped session");
+    expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
+      cwd: "/repo/paseo",
+      providers: ["claude"],
+      limit: 15,
+    });
+    await screen.findByText("This workspace");
+    expect(screen.queryByTestId("import-session-scope-reason")).toBeNull();
+
+    // A query is the case where the wanted session lives in another project, so
+    // the list widens by itself and says why.
+    fireEvent.change(screen.getByTestId("import-session-search"), {
+      target: { value: "foreign" },
+    });
+
+    await waitFor(() => {
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
+        providers: ["claude"],
+        limit: 15,
+        query: "foreign",
+      });
+    });
+    await screen.findByText("Foreign session");
+    await screen.findByText("Sessions on workbench");
+    screen.getByTestId("import-session-scope-reason");
+
+    // Narrowing by hand keeps the query but goes back to the workspace rows.
+    fireEvent.click(screen.getByTestId("import-session-scope-workspace"));
+
+    await waitFor(() => {
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
+        cwd: "/repo/paseo",
+        providers: ["claude"],
+        limit: 15,
+        query: "foreign",
+      });
+    });
+    expect(screen.queryByTestId("import-session-scope-reason")).toBeNull();
+  });
+
+  it("imports a cross-project row without the current workspace once the list is widened", async () => {
     const fetchRecentProviderSessions = vi.fn(async (options: { cwd?: string } | undefined) => ({
       requestId: "recent-provider-sessions",
       entries: [
@@ -1276,6 +1346,57 @@ describe("ImportSessionSheet", () => {
     });
     expect(onImported).toHaveBeenCalledWith(expect.objectContaining({ id: "agent-imported" }));
     expect(onImportedAgent).not.toHaveBeenCalled();
+  });
+
+  it("says that only titles and folders were searched when previews are unavailable", async () => {
+    const fetchRecentProviderSessions = vi.fn(async () => ({
+      requestId: "recent-provider-sessions",
+      entries: [createProviderSessionEntry({ providerId: "claude", providerLabel: "Claude Code" })],
+      previewsUnavailable: true,
+    }));
+    const importAgent = vi.fn();
+
+    renderSheet(
+      { fetchRecentProviderSessions, importAgent } as Pick<
+        DaemonClient,
+        "fetchRecentProviderSessions" | "importAgent"
+      >,
+      {
+        snapshot: { supportsSnapshot: true, entries: [createSnapshotEntry("claude")] },
+      },
+    );
+
+    await screen.findByText("Import me");
+    // Without a query there is no search to explain, so the note stays hidden.
+    expect(screen.queryByTestId("import-session-previews-unavailable")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("import-session-search"), {
+      target: { value: "invoice" },
+    });
+
+    const note = await screen.findByTestId("import-session-previews-unavailable");
+    expect(note.textContent).toContain("title and folder only");
+  });
+
+  it("shows no previews note when the host loaded prompt text", async () => {
+    const fetchRecentProviderSessions = vi.fn(async () => ({
+      requestId: "recent-provider-sessions",
+      entries: [createProviderSessionEntry({ providerId: "claude", providerLabel: "Claude Code" })],
+    }));
+    const importAgent = vi.fn();
+
+    renderSheet(
+      { fetchRecentProviderSessions, importAgent } as Pick<
+        DaemonClient,
+        "fetchRecentProviderSessions" | "importAgent"
+      >,
+      {
+        snapshot: { supportsSnapshot: true, entries: [createSnapshotEntry("claude")] },
+      },
+    );
+
+    await screen.findByText("Import me");
+    expect(screen.queryByTestId("import-session-previews-unavailable")).toBeNull();
   });
 
   it("refetches sessions when the refresh button is clicked", async () => {

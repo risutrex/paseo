@@ -405,6 +405,7 @@ export const en = {
     scope: {
       host: "Sessions on {{host}}",
       workspace: "This workspace",
+      widenedBySearch: "Searching all directories to find a session from another project.",
     },
     filters: {
       all: "All",
@@ -421,6 +422,10 @@ export const en = {
       refresh: "Refresh sessions",
       showAll: "Show all",
       loadMore: "Load more",
+      scopeToWorkspace: "This workspace",
+    },
+    previews: {
+      unavailable: "Some providers were searched by title and folder only — their prompt text was not loaded.",
     },
     preview: {
       untitledSession: "Untitled session",

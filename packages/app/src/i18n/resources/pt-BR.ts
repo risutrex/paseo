@@ -412,6 +412,8 @@ export const ptBR: TranslationResources = {
     scope: {
       host: "Sessões em {{host}}",
       workspace: "Este workspace",
+      widenedBySearch:
+        "Buscando em todos os diretórios para encontrar uma sessão de outro projeto.",
     },
     filters: {
       all: "Tudo",
@@ -428,6 +430,11 @@ export const ptBR: TranslationResources = {
       refresh: "Atualizar sessões",
       showAll: "Mostrar tudo",
       loadMore: "Carregar mais",
+      scopeToWorkspace: "Este workspace",
+    },
+    previews: {
+      unavailable:
+        "Alguns provedores foram pesquisados apenas por título e pasta — o texto das prompts não foi carregado.",
     },
     preview: {
       untitledSession: "Sessão sem título",

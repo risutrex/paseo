@@ -33,6 +33,7 @@ import {
   getPromptPreview,
   getSessionTitle,
   hasMoreSessions,
+  hasUnavailablePreviews,
   resolveDirectoryLabel,
   nextPageLimit,
   PER_PROVIDER_LIMIT,
@@ -47,6 +48,13 @@ const IMPORT_SHEET_SNAP_POINTS = ["70%", "92%"];
 const DISABLED_ACCESSIBILITY_STATE = { disabled: true };
 /** Long enough that a typed word is one request, short enough to feel live. */
 const SEARCH_DEBOUNCE_MS = 200;
+
+/**
+ * A scope the user picked by hand. `null` leaves the choice to the sheet, which
+ * follows the search: the current workspace while nothing is typed, every
+ * directory once the user searches.
+ */
+type ScopePreference = "workspace" | "all";
 
 type RecentProviderSessionsClient = Pick<
   DaemonClient,
@@ -276,35 +284,72 @@ function RefreshAction({ isRefreshing, onPress }: { isRefreshing: boolean; onPre
   );
 }
 
+/**
+ * Why the sheet widened the list without being asked: the query is what makes
+ * a session from another project likely, and a silently wider list would read
+ * as a bug.
+ */
 function ScopeSubtitle({
   hostLabel,
   isScoped,
+  canScope,
+  isWidenedBySearch,
   onShowAll,
+  onScopeToWorkspace,
 }: {
   hostLabel: string;
   isScoped: boolean;
+  /** Without a workspace directory there is nothing to narrow the list to. */
+  canScope: boolean;
+  /** The query, not the user, widened the scope. */
+  isWidenedBySearch: boolean;
   onShowAll: () => void;
+  onScopeToWorkspace: () => void;
 }) {
   const { t } = useTranslation();
   return (
-    <View style={styles.subtitleRow}>
-      <Text style={styles.subtitleText} numberOfLines={1} testID="import-session-scope">
-        {isScoped
-          ? t("importSession.scope.workspace")
-          : t("importSession.scope.host", { host: hostLabel })}
-      </Text>
-      {isScoped ? (
-        <Button
-          variant="ghost"
-          size="xs"
-          onPress={onShowAll}
-          testID="import-session-show-all"
-          style={styles.subtitleAction}
-        >
-          {t("importSession.actions.showAll")}
-        </Button>
+    <View style={styles.subtitleColumn}>
+      <View style={styles.subtitleRow}>
+        <Text style={styles.subtitleText} numberOfLines={1} testID="import-session-scope">
+          {isScoped
+            ? t("importSession.scope.workspace")
+            : t("importSession.scope.host", { host: hostLabel })}
+        </Text>
+        {canScope ? (
+          <Button
+            variant="ghost"
+            size="xs"
+            onPress={isScoped ? onShowAll : onScopeToWorkspace}
+            testID={isScoped ? "import-session-show-all" : "import-session-scope-workspace"}
+            style={styles.subtitleAction}
+          >
+            {isScoped
+              ? t("importSession.actions.showAll")
+              : t("importSession.actions.scopeToWorkspace")}
+          </Button>
+        ) : null}
+      </View>
+      {isWidenedBySearch ? (
+        <Text style={styles.subtitleHint} numberOfLines={2} testID="import-session-scope-reason">
+          {t("importSession.scope.widenedBySearch")}
+        </Text>
       ) : null}
     </View>
+  );
+}
+
+/**
+ * The host answered from an index that holds names and folders but no prompt
+ * text (generic ACP providers such as minimax-code or cursor load previews
+ * lazily). The search therefore never looked inside prompts, and a session the
+ * user knows by its wording can legitimately be missing from the list.
+ */
+function PreviewsUnavailableNote() {
+  const { t } = useTranslation();
+  return (
+    <Text style={styles.previewsNote} testID="import-session-previews-unavailable">
+      {t("importSession.previews.unavailable")}
+    </Text>
   );
 }
 
@@ -410,6 +455,7 @@ function hasListHeader(
   input: SheetStatusMessagesProps & {
     showFilter: boolean;
     hasProviderErrors: boolean;
+    hasPreviewsUnavailable: boolean;
   },
 ): boolean {
   return (
@@ -419,7 +465,8 @@ function hasListHeader(
     input.hasNoImportableProviders ||
     (input.isLoadingSessions && !input.hasRows) ||
     input.importErrored ||
-    input.hasProviderErrors
+    input.hasProviderErrors ||
+    input.hasPreviewsUnavailable
   );
 }
 
@@ -528,21 +575,33 @@ export function ImportSessionSheet({
   const queryClient = useQueryClient();
   const { theme } = useUnistyles();
 
-  // "Show all" widens a workspace-scoped sheet to the whole host. The sheet's own
-  // `cwd` stays the scope it was opened with, because that is what decides where
-  // an imported agent lands.
-  const [isShowingAllDirectories, setIsShowingAllDirectories] = useState(false);
+  // The list starts on the sheet's own workspace: a listing scoped to it is the
+  // only one the daemon matched with realpaths resolved, so it is the only one
+  // where "this row is ours" can be answered exactly. A typed query is the one
+  // case that needs other projects, and it widens the list by itself.
+  const [scopePreference, setScopePreference] = useState<ScopePreference | null>(null);
   const [searchInput, setSearchInput] = useState("");
   const [pageLimit, setPageLimit] = useState(PER_PROVIDER_LIMIT);
   const [selectedProvider, setSelectedProvider] = useState<string>(ALL_FILTER_VALUE);
 
-  const scopeCwd = isShowingAllDirectories ? null : (cwd ?? null);
   const supportsSearch = useHostFeature(serverId, "importSessionSearch");
   const query = useDebouncedValue(supportsSearch ? searchInput : "", SEARCH_DEBOUNCE_MS).trim();
 
+  // The debounced query decides, so typing a word produces one widened request
+  // instead of a scoped one followed by a host-wide one.
+  const isSearchActive = query.length > 0;
+  const isShowingAllDirectories =
+    scopePreference === null ? isSearchActive : scopePreference === "all";
+  // The sheet's own `cwd` still decides where an imported agent lands; the
+  // scope only changes which sessions are listed.
+  const scopeCwd = isShowingAllDirectories ? null : (cwd ?? null);
+  // Only the automatic widening is worth explaining; a manual "show all" is the
+  // user's own doing and needs no reason.
+  const isWidenedBySearch = isSearchActive && scopePreference === null && Boolean(cwd);
+
   useEffect(() => {
     if (visible) return;
-    setIsShowingAllDirectories(false);
+    setScopePreference(null);
     setSearchInput("");
   }, [visible]);
 
@@ -596,6 +655,13 @@ export function ImportSessionSheet({
   const queries = useQueries({ queries: queriesConfig });
 
   const aggregatedEntries = useMemo(() => aggregateSessionEntries(queries), [queries]);
+  // Any provider answering without prompt previews makes that provider's rows
+  // a names-and-folders match, so the note is a property of the whole list.
+  // Without a search there is nothing to explain: no prompt was looked for.
+  const previewsUnavailable = useMemo(
+    () => isSearchActive && hasUnavailablePreviews(queries),
+    [isSearchActive, queries],
+  );
   const totalAlreadyImportedCount = useMemo(
     () => sumFilteredAlreadyImportedCount(queries),
     [queries],
@@ -784,7 +850,8 @@ export function ImportSessionSheet({
     [pageLimit, query, queryClient, scopeCwd, serverId],
   );
 
-  const handleShowAll = useCallback(() => setIsShowingAllDirectories(true), []);
+  const handleShowAll = useCallback(() => setScopePreference("all"), []);
+  const handleScopeToWorkspace = useCallback(() => setScopePreference("workspace"), []);
   const handleLoadMore = useCallback(() => setPageLimit(nextPageLimit), []);
 
   const hosts = useHosts();
@@ -800,7 +867,10 @@ export function ImportSessionSheet({
         <ScopeSubtitle
           hostLabel={hostLabel}
           isScoped={scopeCwd !== null}
+          canScope={Boolean(cwd)}
+          isWidenedBySearch={isWidenedBySearch}
           onShowAll={handleShowAll}
+          onScopeToWorkspace={handleScopeToWorkspace}
         />
       ),
       ...(supportsSearch
@@ -817,7 +887,19 @@ export function ImportSessionSheet({
         : {}),
       actions: <RefreshAction isRefreshing={isRefreshing} onPress={handleRefresh} />,
     }),
-    [handleRefresh, handleShowAll, hostLabel, isRefreshing, scopeCwd, supportsSearch, t, visible],
+    [
+      handleRefresh,
+      handleShowAll,
+      handleScopeToWorkspace,
+      cwd,
+      hostLabel,
+      isRefreshing,
+      isWidenedBySearch,
+      scopeCwd,
+      supportsSearch,
+      t,
+      visible,
+    ],
   );
 
   const isSnapshotUnsupported = requiresHostUpgrade;
@@ -856,6 +938,7 @@ export function ImportSessionSheet({
     hasRows: visibleEntries.length > 0,
     importErrored: importMutation.isError,
     hasProviderErrors: providerErrorRows.length > 0,
+    hasPreviewsUnavailable: previewsUnavailable,
   });
   const listHeader = useMemo(
     () =>
@@ -906,6 +989,7 @@ export function ImportSessionSheet({
           {providerErrorRows.length > 0 ? (
             <ProviderErrorBanner rows={providerErrorRows} onRetry={handleRetryProvider} />
           ) : null}
+          {previewsUnavailable ? <PreviewsUnavailableNote /> : null}
         </View>
       ) : null,
     [
@@ -929,6 +1013,7 @@ export function ImportSessionSheet({
       importMutation.isError,
       providerErrorRows,
       handleRetryProvider,
+      previewsUnavailable,
     ],
   );
   const listFooter = useMemo(
@@ -969,6 +1054,10 @@ export function ImportSessionSheet({
 }
 
 const styles = StyleSheet.create((theme) => ({
+  subtitleColumn: {
+    gap: 2,
+    minWidth: 0,
+  },
   subtitleRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -983,6 +1072,10 @@ const styles = StyleSheet.create((theme) => ({
   },
   subtitleAction: {
     marginHorizontal: -theme.spacing[2],
+  },
+  subtitleHint: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
   },
   filterTriggerWrap: {
     paddingBottom: theme.spacing[2],
@@ -1102,6 +1195,10 @@ const styles = StyleSheet.create((theme) => ({
   statusText: {
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.base,
+  },
+  previewsNote: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
   },
   errorBanner: {
     marginBottom: theme.spacing[2],
