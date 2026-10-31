@@ -1,5 +1,7 @@
 name: PR-Agent (Trinity)
 
+# Issues were enabled in this fork on 2026-10-31: GitHub does not deliver
+# issue_comment events while the repository has Issues turned off.
 # This workflow is intentionally limited to Lucian's fork and account.
 # Comment /review or /ask <question> in a PR's Conversation tab.
 on:
