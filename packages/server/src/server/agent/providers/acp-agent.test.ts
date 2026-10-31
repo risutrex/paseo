@@ -25,13 +25,16 @@ import {
 import {
   ACPAgentClient,
   ACPAgentSession,
+  MCODE_CLIENT_CAPABILITY_META,
   type SpawnedACPProcess,
   type SessionStateResponse,
   buildACPClientCapabilities,
   createLoggedNdJsonStream,
   deriveModelDefinitionsFromACP,
   deriveModesFromACP,
+  isMiniMaxCodeProvider,
   mapACPUsage,
+  mergeACPClientCapabilityMeta,
   resolveACPModeSelection,
   resolveACPModelSelection,
   summarizeACPRequestError,
@@ -603,6 +606,40 @@ describe("createLoggedNdJsonStream", () => {
 
     await writer.close();
     reader.releaseLock();
+  });
+});
+
+describe("isMiniMaxCodeProvider", () => {
+  test("recognizes the provider's own executable, not a path that mentions it", () => {
+    expect(isMiniMaxCodeProvider("minimax-code", ["minimax-code", "acp"])).toBe(true);
+    expect(isMiniMaxCodeProvider(undefined, ["/opt/tools/mcode", "acp"])).toBe(true);
+
+    // A custom ACP agent that merely lives under a directory called
+    // "minimax-experiments" is not MiniMax Code: sending it the vendor
+    // handshake announces extensions it does not understand.
+    expect(isMiniMaxCodeProvider("custom-acp", ["/Users/x/minimax-experiments/agent", "acp"])).toBe(
+      false,
+    );
+  });
+});
+
+describe("mergeACPClientCapabilityMeta", () => {
+  test("adds the vendor handshake to the user's own client metadata", () => {
+    // The provider answers its extension notifications only when the
+    // handshake carries the vendor key, while a user-supplied metadata object
+    // may still be needed. One must not replace the other.
+    expect(mergeACPClientCapabilityMeta(MCODE_CLIENT_CAPABILITY_META, { source: "user" })).toEqual({
+      "minimax-code/extensions": { version: 1, notifications: true },
+      source: "user",
+    });
+
+    // For the same key the user's fields win, and the rest of the vendor
+    // request survives.
+    expect(
+      mergeACPClientCapabilityMeta(MCODE_CLIENT_CAPABILITY_META, {
+        "minimax-code/extensions": { notifications: false },
+      }),
+    ).toEqual({ "minimax-code/extensions": { version: 1, notifications: false } });
   });
 });
 
@@ -3871,7 +3908,7 @@ describe("ACPAgentSession", () => {
           "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
         ),
       );
-    const extMethod = vi.fn().mockResolvedValue({});
+    const extMethod = vi.fn().mockResolvedValue({ status: "queued", itemId: "item-1" });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
     asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
@@ -3906,7 +3943,7 @@ describe("ACPAgentSession", () => {
       code: -32602,
       message: "Invalid params: A prompt is already active for this session.",
     });
-    const extMethod = vi.fn().mockResolvedValue({});
+    const extMethod = vi.fn().mockResolvedValue({ status: "queued", itemId: "item-1" });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
     asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
@@ -3923,6 +3960,201 @@ describe("ACPAgentSession", () => {
     });
     expect(events.some((event) => event.type === "turn_failed")).toBe(false);
     expect(events.some((event) => event.type === "turn_queued")).toBe(true);
+  });
+
+  test("does not report a queued turn when the provider answer carries no item id", async () => {
+    // The provider's status alone is not delivery: without an item id the message
+    // cannot be taken back, and no later stop could find it. Saying "queued" would
+    // promise a run that nothing on our side can point at.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string) =>
+      method === "mcode/session/queue/enqueue" ? { status: "queued" } : {},
+    );
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    const hasTurnFailed = (): boolean => events.some((event) => event.type === "turn_failed");
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(hasTurnFailed()).toBe(true));
+
+    expect(events.some((event) => event.type === "turn_queued")).toBe(false);
+    const failed = events.find(
+      (event): event is Extract<AgentStreamEvent, { type: "turn_failed" }> =>
+        event.type === "turn_failed",
+    );
+    expect(failed?.code).toBe("queue_unconfirmed");
+    expect(failed?.error).toMatch(/may still run it in a later turn/);
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    expect(
+      notifications.some(
+        (item) => item.level === "warning" && /did not confirm/.test(item.message),
+      ),
+    ).toBe(true);
+    // One request only: the provider does not deduplicate clientRequestId.
+    expect(
+      extMethod.mock.calls.filter(([method]) => method === "mcode/session/queue/enqueue"),
+    ).toHaveLength(1);
+  });
+
+  test("reports the queue acceptance as unknown when the provider never answers", async () => {
+    // An enqueue that fails on the way back may still have landed. Repeating it could
+    // duplicate the message and calling it queued would invent a run, so the turn says
+    // exactly what is known.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async () => {
+      throw new Error("ACP extension request timed out");
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    const hasTurnFailed = (): boolean => events.some((event) => event.type === "turn_failed");
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(hasTurnFailed()).toBe(true));
+
+    expect(events.some((event) => event.type === "turn_queued")).toBe(false);
+    const failed = events.find(
+      (event): event is Extract<AgentStreamEvent, { type: "turn_failed" }> =>
+        event.type === "turn_failed",
+    );
+    expect(failed?.code).toBe("queue_unconfirmed");
+    expect(extMethod).toHaveBeenCalledTimes(1);
+  });
+
+  test("withdraws a message that lands in the queue after the stop", async () => {
+    // The stop arrives while queue/enqueue is still in flight, so there is no item id to
+    // delete yet. The answer has to take the item back itself: otherwise a message the
+    // user stopped waits in the provider's queue with nobody able to find it.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const enqueueStarted = Promise.withResolvers<void>();
+    const enqueueAnswer = Promise.withResolvers<unknown>();
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        enqueueStarted.resolve();
+        return enqueueAnswer.promise;
+      }
+      return { item: { itemId: "item-1", status: "cancelled" } };
+    });
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod, cancel };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    await session.startTurn("hello");
+    await enqueueStarted.promise;
+
+    const deleteRequests = (): number =>
+      extMethod.mock.calls.filter(([method]) => method === "mcode/session/queue/delete").length;
+    // The stop finds nothing queued yet: the item only exists once the provider answers.
+    const stopping = session.interrupt();
+    await vi.waitFor(() => expect(deleteRequests()).toBe(0));
+    enqueueAnswer.resolve({ status: "queued", itemId: "item-1" });
+    await stopping;
+
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/delete", {
+      sessionId: "session-1",
+      itemId: "item-1",
+    });
+    // The turn is not reported as queued: its message no longer exists.
+    expect(events.some((event) => event.type === "turn_queued")).toBe(false);
+    expect(events.some((event) => event.type === "turn_canceled")).toBe(true);
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(true);
+    expect(notifications.some((item) => item.level === "warning")).toBe(false);
+  });
+
+  test("keeps a delegation snapshot that arrived before the manager subscribed", async () => {
+    // A session reads its delegation tree while it initializes, and the agent
+    // manager subscribes only afterwards. A child that already finished never
+    // publishes again, so a dropped first snapshot hides the delegated work of
+    // a reopened session for good.
+    const session = createSession();
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: {
+        schemaVersion: 1,
+        rootSessionId: "session-1",
+        members: [
+          {
+            sessionId: "child-1",
+            parentSessionId: "session-1",
+            agentName: "explore",
+            task: "List files",
+            status: "completed",
+            createdAtMs: 1_700_000_000_000,
+            updatedAtMs: 1_700_000_001_000,
+          },
+          {
+            sessionId: "child-2",
+            parentSessionId: "session-1",
+            agentName: "worker",
+            task: "Run the tests",
+            status: "completed",
+            createdAtMs: 1_700_000_000_000,
+            updatedAtMs: 1_700_000_002_000,
+          },
+        ],
+      },
+    });
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const publishedIds = events.map((event) =>
+      event.type === "provider_subagent" ? event.event.id : null,
+    );
+    expect(publishedIds.filter((id) => id !== null)).toEqual(["child-1", "child-2"]);
+
+    // The rows belong to the timeline once: a later subscriber does not get
+    // them a second time.
+    const laterEvents: AgentStreamEvent[] = [];
+    session.subscribe((event) => laterEvents.push(event));
+    expect(laterEvents.some((event) => event.type === "provider_subagent")).toBe(false);
   });
 
   test("publishes the provider's delegation tree as sub-agent rows", async () => {
@@ -4084,6 +4316,98 @@ describe("ACPAgentSession", () => {
     });
   });
 
+  test("takes the queued message back when the user stops after queueing it", async () => {
+    // The message lives in the provider's queue, not in the turn that queued
+    // it, so a Stop that only cancels the running turn still lets it run.
+    // The provider removes a queued item on request, so the stop has to ask.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      return { item: { itemId: "item-1", status: "cancelled" } };
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    await session.interrupt();
+
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/delete", {
+      sessionId: "session-1",
+      itemId: "item-1",
+    });
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    // The message was withdrawn, so nothing warns that it will still run.
+    expect(notifications.some((item) => item.level === "warning")).toBe(false);
+    expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(true);
+  });
+
+  test("says the queued message stays when the provider already claimed it", async () => {
+    // Once the provider takes the item for a turn, the removal is refused. A
+    // Stop cannot undo that, and telling the user otherwise is a lie.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      throw new Error("Queue item is not editable: session-1/item-1");
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    await session.interrupt();
+
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    const warning = notifications.find((item) => item.level === "warning");
+    expect(warning?.message).toMatch(/cannot be withdrawn/);
+    // The stop is not reported as a withdrawal that did not happen.
+    expect(notifications.some((item) => /will not run/.test(item.message))).toBe(false);
+  });
+
   test("fails the turn when the provider is busy and offers no queue", async () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];
@@ -4113,6 +4437,42 @@ describe("ACPAgentSession", () => {
     // failure instead of a promise the provider will not keep.
     expect(extMethod).not.toHaveBeenCalled();
     expect(events.some((event) => event.type === "turn_queued")).toBe(false);
+  });
+
+  test("closes the turn when the user stops it while the busy retry waits", async () => {
+    // The retry pause is a window where the turn has no provider answer yet.
+    // A Stop in that window has to end the turn itself: a turn left open keeps
+    // the session busy for good, refusing every later prompt.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      )
+      .mockResolvedValue({ stopReason: "end_turn" });
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+
+    const { turnId } = await session.startTurn("hello");
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+
+    await session.interrupt().catch(() => undefined);
+
+    const canceledTurnIds = events.flatMap((event) =>
+      event.type === "turn_canceled" ? [event.turnId] : [],
+    );
+    expect(canceledTurnIds).toEqual([turnId]);
+
+    // The stopped session takes the next prompt instead of reporting a
+    // foreground turn that no longer exists.
+    await expect(session.startTurn("again")).resolves.toEqual({ turnId: expect.any(String) });
+    expect(asInternals<ACPSessionInternals>(session).activeForegroundTurnId).toBeNull();
   });
 
   test("does not deliver the prompt again after the turn was interrupted", async () => {

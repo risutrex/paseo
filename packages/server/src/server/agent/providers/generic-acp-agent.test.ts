@@ -31,6 +31,10 @@ vi.mock("./acp-agent.js", () => ({
   MCODE_CLIENT_CAPABILITY_META: {
     "minimax-code/extensions": { version: 1, notifications: true },
   },
+  mergeACPClientCapabilityMeta: (
+    base: Record<string, unknown> | undefined,
+    override: Record<string, unknown> | undefined,
+  ) => (base ? { ...base, ...override } : override),
 }));
 
 import { GenericACPAgentClient } from "./generic-acp-agent.js";
@@ -70,5 +74,26 @@ describe("GenericACPAgentClient", () => {
         waitForInitialCommands: true,
       },
     ]);
+  });
+  test("keeps the vendor extension request next to the user's own metadata", () => {
+    // The vendor request asks MiniMax Code for its extension notifications.
+    // A user's own metadata must travel beside it, not replace it: replacing
+    // it would turn the extensions off without a word.
+    mockState.superConstructorOptions.length = 0;
+    const _client = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: ["minimax-code", "acp"],
+      providerId: "minimax-code",
+      clientCapabilityMeta: { "user/key": { enabled: true } },
+    });
+    void _client;
+
+    const options = mockState.superConstructorOptions[0] as {
+      clientCapabilityMeta?: Record<string, unknown>;
+    };
+    expect(options.clientCapabilityMeta).toEqual({
+      "minimax-code/extensions": { version: 1, notifications: true },
+      "user/key": { enabled: true },
+    });
   });
 });

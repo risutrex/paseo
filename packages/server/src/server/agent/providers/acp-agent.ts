@@ -362,24 +362,98 @@ export const MCODE_CLIENT_CAPABILITY_META: ACPClientCapabilityMeta = {
   [MCODE_EXTENSIONS_META_KEY]: { version: 1, notifications: true },
 };
 
+const MCODE_PROVIDER_ID = "minimax-code";
+// The names MiniMax Code installs its entry point under.
+const MCODE_EXECUTABLE_NAMES = new Set(["mcode", "minimax-code", "minimax"]);
+
 /**
  * Reports whether a provider is MiniMax Code.
  *
  * The provider id is the usual answer, but a user may register the same
- * command under a name of their own, so the command is checked as well.
+ * command under a name of their own, so the executable is checked as well.
+ * Only the executable counts: an ACP agent that merely lives under a path
+ * containing "minimax" is another provider, and sending it MiniMax Code's
+ * handshake meta would announce extensions it does not understand.
  */
 export function isMiniMaxCodeProvider(
   providerId: string | undefined,
   command: readonly string[] | undefined,
 ): boolean {
-  if (providerId === "minimax-code") {
+  if (providerId === MCODE_PROVIDER_ID) {
     return true;
   }
-  return (command ?? []).some((part) => {
-    const lowered = part.toLowerCase();
-    return lowered.includes("mcode") || lowered.includes("minimax");
-  });
+  const executable = command?.[0];
+  if (!executable) {
+    return false;
+  }
+  const name = path
+    .basename(executable)
+    .replace(/\.(exe|cmd|bat|ps1)$/i, "")
+    .toLowerCase();
+  return MCODE_EXECUTABLE_NAMES.has(name);
 }
+
+/**
+ * Combines client capability metadata so the vendor handshake and the user's
+ * own metadata can travel together.
+ *
+ * MiniMax Code answers its extension notifications only when the handshake
+ * carries the vendor key, while the user may still need their own keys. One
+ * object cannot replace the other, so keys are merged and, for the same key,
+ * the later object wins field by field.
+ */
+export function mergeACPClientCapabilityMeta(
+  base: ACPClientCapabilityMeta | undefined,
+  override: ACPClientCapabilityMeta | undefined,
+): ACPClientCapabilityMeta | undefined {
+  if (!base) {
+    return override;
+  }
+  if (!override) {
+    return base;
+  }
+  const merged: ACPClientCapabilityMeta = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    const existing: unknown = merged[key];
+    merged[key] = isRecord(existing) && isRecord(value) ? { ...existing, ...value } : value;
+  }
+  return merged;
+}
+
+/**
+ * Reads the queue id the provider assigned to a message it queued.
+ *
+ * Both halves of the answer matter: `status` is the provider's own word that it
+ * took the message, and the id is the only handle that can take it back. An
+ * answer missing either one is no confirmation at all, and treating it as one
+ * would promise a withdrawal the next Stop could not perform.
+ */
+function readQueuedItemId(response: unknown): string | null {
+  if (!isRecord(response)) {
+    return null;
+  }
+  const item = isRecord(response.item) ? response.item : null;
+  const status = typeof response.status === "string" ? response.status : item?.status;
+  if (status !== "queued") {
+    return null;
+  }
+  if (typeof response.itemId === "string" && response.itemId.length > 0) {
+    return response.itemId;
+  }
+  if (item && typeof item.itemId === "string" && item.itemId.length > 0) {
+    return item.itemId;
+  }
+  return null;
+}
+
+/**
+ * What became of a message the busy provider refused.
+ *
+ * `skipped` never reached the queue; `queued` was confirmed with an item id;
+ * `withdrawn` was queued after the user stopped and taken back again;
+ * `unconfirmed` may or may not be in the provider's queue.
+ */
+type QueuePromptOutcome = "queued" | "withdrawn" | "unconfirmed" | "skipped";
 const MCODE_DELEGATION_GET_METHOD = "mcode/session/delegation/get";
 const MCODE_DELEGATION_UPDATE_NOTIFICATION = "mcode/session/delegation_update";
 // A provider that still owns its previous turn refuses a new prompt and tells
@@ -389,6 +463,19 @@ const MCODE_DELEGATION_UPDATE_NOTIFICATION = "mcode/session/delegation_update";
 // Without it the message is not delivered at all: the client only sees an
 // error, and the text the user typed is gone.
 const MCODE_QUEUE_ENQUEUE_METHOD = "mcode/session/queue/enqueue";
+// A queued message is not a promise to stop: the provider runs it after the
+// current turn. `mcode/session/queue/delete` cancels a queued item, and the
+// provider refuses (`not_editable`) once it has claimed the item for a turn.
+const MCODE_QUEUE_DELETE_METHOD = "mcode/session/queue/delete";
+// The provider answers `queue/enqueue` with the item it created. A Stop cannot
+// withdraw an item whose id has not arrived yet, so it waits for that answer
+// instead of guessing whether a message is about to appear in the queue.
+const ACP_QUEUE_ACK_WAIT_MS = 5_000;
+// An enqueue that failed, or answered without a status and an item id, may still
+// have landed, and the provider does not deduplicate `clientRequestId`. Calling
+// the acceptance unconfirmed is the only report that stays true either way.
+const ACP_QUEUE_UNCONFIRMED_MESSAGE =
+  "The provider did not confirm that the message was taken into its queue. It may still run it in a later turn; check the session before sending it again.";
 // `session/cancel` is a notification, so the write itself can block on a
 // stuck provider. Bound it instead of letting the interruption hang.
 const ACP_CANCEL_NOTIFICATION_TIMEOUT_MS = 500;
@@ -2224,6 +2311,31 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private historyRuntimeReleased = false;
   private replayingHistory = false;
   private bootstrapThreadEventPending = false;
+  /**
+   * Sub-agent rows published before anyone listened. A session initializes and
+   * reads its delegation tree before the agent manager subscribes, and a child
+   * that already finished never publishes again: without this the rows of a
+   * reopened session are lost and the background work stays invisible.
+   */
+  private readonly pendingDelegationEvents: AgentStreamEvent[] = [];
+  private delegationBacklogDelivered = false;
+  /**
+   * Messages handed to the provider's queue, by the turn that queued them. The
+   * queue outlives that turn, so a Stop has to find the item to take it back -
+   * otherwise the message still runs after a stop that said it stopped.
+   */
+  private readonly queuedProviderItems = new Map<string, string>();
+  /**
+   * Enqueues that are still in flight, by the turn that asked for them. A Stop that
+   * arrives before the provider answers has no item id to withdraw, so it waits for
+   * that answer instead of closing the turn on a guess.
+   */
+  private readonly pendingQueueEnqueues = new Map<string, Promise<void>>();
+  /**
+   * Turns whose stop arrived while their enqueue was in flight. Their answer takes
+   * the item back the moment its id exists, because the user already said no.
+   */
+  private readonly stoppedWhileQueueing = new Set<string>();
   private readonly terminateProcess: ProcessTerminator;
 
   constructor(config: AgentSessionConfig, options: ACPAgentSessionOptions) {
@@ -2487,6 +2599,19 @@ export class ACPAgentSession implements AgentSession, ACPClient {
             this.activeForegroundTurnId !== turnId
           ) {
             settleForegroundPrompt("released");
+            // The interruption resolves the release above, so nothing else
+            // closes this turn. Leaving it open would keep the session busy
+            // for good: the next prompt is refused and Stop never reports the
+            // session as stoppable. A turn the other side already closed keeps
+            // its single terminal event.
+            if (this.activeForegroundTurnId === turnId) {
+              this.finishTurn({
+                type: "turn_canceled",
+                provider: this.provider,
+                reason: "interrupted",
+                turnId,
+              });
+            }
             return;
           }
           try {
@@ -2501,7 +2626,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
               turnId,
               ...(options?.clientMessageId ? { clientMessageId: options.clientMessageId } : {}),
             });
-            if (queued) {
+            if (queued === "queued") {
               // The message is safe in the provider's queue, and the provider is
               // still busy: the session may not take another prompt yet.
               settleForegroundPrompt("unconfirmed");
@@ -2509,6 +2634,34 @@ export class ACPAgentSession implements AgentSession, ACPClient {
                 type: "turn_queued",
                 provider: this.provider,
                 reason: "The provider took the message into its queue while it was busy",
+                turnId,
+              });
+              return;
+            }
+            if (queued === "withdrawn") {
+              // The user stopped while the queue request was in flight, so the item
+              // was taken back the moment its id arrived. Nothing of ours is queued,
+              // and this turn ends canceled instead of claiming a queued message.
+              settleForegroundPrompt("released");
+              this.finishTurn({
+                type: "turn_canceled",
+                provider: this.provider,
+                reason: "interrupted",
+                turnId,
+              });
+              return;
+            }
+            if (queued === "unconfirmed") {
+              // The enqueue may have landed without a confirmation. Sending it again
+              // would duplicate the message, and turn_queued would promise a run nobody
+              // can point at, so the turn fails and says exactly what is unknown.
+              settleForegroundPrompt("unconfirmed");
+              this.finishTurn({
+                type: "turn_failed",
+                provider: this.provider,
+                error: ACP_QUEUE_UNCONFIRMED_MESSAGE,
+                code: "queue_unconfirmed",
+                diagnostic: this.collectDiagnostic(ACP_QUEUE_UNCONFIRMED_MESSAGE),
                 turnId,
               });
               return;
@@ -2550,9 +2703,25 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         sessionId: this.sessionId,
       });
     }
+    this.deliverDelegationBacklog(callback);
     return () => {
       this.subscribers.delete(callback);
     };
+  }
+
+  /**
+   * Hands the rows published before the first subscriber to that subscriber,
+   * in the order the provider published them. Later events are delivered live,
+   * so a row is never reported twice.
+   */
+  private deliverDelegationBacklog(callback: (event: AgentStreamEvent) => void): void {
+    if (this.delegationBacklogDelivered) {
+      return;
+    }
+    this.delegationBacklogDelivered = true;
+    for (const event of this.pendingDelegationEvents.splice(0)) {
+      callback(event);
+    }
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
@@ -3184,6 +3353,20 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   /**
+   * Reports whether the provider advertised the queue removal method. A
+   * provider that only enqueues keeps the previous behaviour: the message
+   * stays in its queue and the user is not promised otherwise.
+   */
+  private supportsVendorQueueDelete(): boolean {
+    const extensions = this.agentMeta?.[MCODE_EXTENSIONS_META_KEY];
+    if (!extensions || typeof extensions !== "object") {
+      return false;
+    }
+    const methods = (extensions as { methods?: unknown }).methods;
+    return Array.isArray(methods) && methods.includes(MCODE_QUEUE_DELETE_METHOD);
+  }
+
+  /**
    * Reports whether the provider advertised a delegation extension.
    */
   private supportsVendorDelegation(): boolean {
@@ -3310,58 +3493,236 @@ export class ACPAgentSession implements AgentSession, ACPClient {
    * it) can take the message for a later turn, so the agent picks it up once
    * it is done with the current one.
    *
-   * Returns false when the message could not be queued, and the caller reports
-   * the original failure.
+   * The outcome is reported instead of assumed: only a confirmed `queued` answer
+   * ends the turn as queued, and `skipped` lets the caller report the original
+   * failure.
    */
   private async queuePromptForLaterTurn(args: {
     error: unknown;
     prompt: AgentPromptInput;
     turnId: string;
     clientMessageId?: string;
-  }): Promise<boolean> {
+  }): Promise<QueuePromptOutcome> {
     const { error, prompt, turnId, clientMessageId } = args;
     if (!this.isProviderBusyError(error)) {
-      return false;
+      return "skipped";
     }
     if (!this.supportsVendorQueue()) {
-      return false;
+      return "skipped";
     }
-    const connection = this.connection;
-    if (!connection || !this.sessionId) {
-      return false;
+    if (!this.connection || !this.sessionId) {
+      return "skipped";
     }
     const text = extractPromptText(prompt);
     if (!text.trim()) {
-      return false;
+      return "skipped";
     }
     if (!isTextOnlyPrompt(prompt)) {
       // The queue carries text. A prompt with an attachment would lose it, so
       // it has to fail loudly instead of half-delivering.
-      return false;
+      return "skipped";
+    }
+    const enqueue = this.enqueuePromptForLaterTurn({
+      text,
+      turnId,
+      ...(clientMessageId ? { clientMessageId } : {}),
+    });
+    // A Stop that arrives now finds no item to withdraw yet. Publishing the request
+    // lets the interruption wait for the answer - and withdraw the item the moment
+    // its id exists - instead of closing a turn that may leave a message behind.
+    this.pendingQueueEnqueues.set(
+      turnId,
+      enqueue.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    try {
+      return await enqueue;
+    } finally {
+      this.pendingQueueEnqueues.delete(turnId);
+      this.stoppedWhileQueueing.delete(turnId);
+    }
+  }
+
+  /**
+   * Sends the message to the provider's queue and reports what the answer really
+   * proves.
+   *
+   * Only a `queued` status with an item id is a delivery: anything else leaves the
+   * message in an unknown state. Resending would duplicate it (the provider does not
+   * deduplicate `clientRequestId`), and calling it queued would promise a run nobody
+   * can point at or take back.
+   */
+  private async enqueuePromptForLaterTurn(args: {
+    text: string;
+    turnId: string;
+    clientMessageId?: string;
+  }): Promise<QueuePromptOutcome> {
+    const { text, turnId, clientMessageId } = args;
+    const connection = this.connection;
+    const sessionId = this.sessionId;
+    if (!connection || !sessionId) {
+      return "skipped";
     }
     try {
-      await connection.extMethod(MCODE_QUEUE_ENQUEUE_METHOD, {
-        sessionId: this.sessionId,
+      const response = await connection.extMethod(MCODE_QUEUE_ENQUEUE_METHOD, {
+        sessionId,
         text,
         ...(clientMessageId ? { clientRequestId: clientMessageId } : {}),
       });
+      const itemId = readQueuedItemId(response);
+      if (!itemId) {
+        this.logger.warn({ turnId }, "ACP provider did not acknowledge the queued prompt");
+        this.reportQueueAcceptanceUnknown();
+        return "unconfirmed";
+      }
+      if (this.stoppedWhileQueueing.delete(turnId)) {
+        // The user stopped before the answer arrived. The item exists now, so take it
+        // back instead of letting it run behind a stop that promised it would not.
+        await this.withdrawQueuedPrompt(turnId, itemId);
+        return "withdrawn";
+      }
+      this.queuedProviderItems.set(turnId, itemId);
+      this.pushEvent(
+        this.wrapTimeline({
+          type: "notification",
+          level: "info",
+          message:
+            "Message accepted into the provider's queue: the agent picks it up after the current turn.",
+        }),
+      );
+      this.logger.info({ turnId }, "ACP provider took the prompt into its queue while it was busy");
+      return "queued";
     } catch (queueError) {
       this.logger.warn(
-        { err: queueError },
-        "ACP provider refused to queue the prompt for a later turn",
+        { err: queueError, turnId },
+        "ACP provider did not answer the queue request for a later turn",
       );
-      return false;
+      this.reportQueueAcceptanceUnknown();
+      return "unconfirmed";
     }
+  }
+
+  /**
+   * Reports a message the provider never confirmed taking. It may still run later,
+   * and it cannot be pointed at or withdrawn from here.
+   */
+  private reportQueueAcceptanceUnknown(): void {
     this.pushEvent(
       this.wrapTimeline({
         type: "notification",
-        level: "info",
+        level: "warning",
         message:
-          "Message accepted into the provider's queue: the agent picks it up after the current turn.",
+          "The provider did not confirm taking the message into its queue: it may still run it in a later turn.",
       }),
     );
-    this.logger.info({ turnId }, "ACP provider took the prompt into its queue while it was busy");
-    return true;
+  }
+
+  /**
+   * Reports a message whose queue id is unknown, so the stop cannot take it back.
+   */
+  private reportQueuedMessageUnknown(): void {
+    this.pushEvent(
+      this.wrapTimeline({
+        type: "notification",
+        level: "warning",
+        message:
+          "A message handed to the provider's queue was not confirmed: it may still be in the queue and cannot be withdrawn.",
+      }),
+    );
+  }
+
+  /**
+   * Takes back the messages the provider queued for a later turn.
+   *
+   * The provider cancels a queued item on request and refuses once it has
+   * claimed that item for a turn. A refused removal is reported as it is: the
+   * message will run, and telling the user it stopped would be a lie.
+   */
+  private async withdrawQueuedPrompts(): Promise<void> {
+    if (this.queuedProviderItems.size === 0 && this.pendingQueueEnqueues.size === 0) {
+      return;
+    }
+    const connection = this.connection;
+    if (!connection || !this.sessionId || !this.supportsVendorQueueDelete()) {
+      // Without a queue deletion there is no way to take anything back, and a message
+      // may be on its way in. Saying so is the only honest report.
+      this.reportQueuedMessageUnknown();
+      return;
+    }
+    // An enqueue still in flight has no item id to delete yet. Wait for the answer: it
+    // either makes the item withdrawable or ends the turn as unconfirmed.
+    const inFlight = [...this.pendingQueueEnqueues.values()];
+    if (inFlight.length > 0) {
+      try {
+        await withTimeout(
+          Promise.all(inFlight),
+          ACP_QUEUE_ACK_WAIT_MS,
+          `ACP queue enqueue did not answer within ${ACP_QUEUE_ACK_WAIT_MS}ms`,
+        );
+      } catch (error) {
+        this.logger.warn(
+          { err: error },
+          "ACP provider did not answer the queue request before the stop",
+        );
+        this.reportQueuedMessageUnknown();
+      }
+    }
+    const pending = [...this.queuedProviderItems];
+    this.queuedProviderItems.clear();
+    for (const [turnId, itemId] of pending) {
+      await this.withdrawQueuedPrompt(turnId, itemId);
+    }
+  }
+
+  /**
+   * Asks the provider to drop one queued item and reports the answer as it is.
+   */
+  private async withdrawQueuedPrompt(turnId: string, itemId: string): Promise<void> {
+    const connection = this.connection;
+    const sessionId = this.sessionId;
+    if (!connection || !sessionId) {
+      this.reportQueuedMessageUnknown();
+      return;
+    }
+    try {
+      const response = await connection.extMethod(MCODE_QUEUE_DELETE_METHOD, {
+        sessionId,
+        itemId,
+      });
+      if (isRecord(response) && "item" in response && response.item === null) {
+        this.reportQueuedMessageStuck(turnId, itemId);
+        return;
+      }
+      this.pushEvent(
+        this.wrapTimeline({
+          type: "notification",
+          level: "info",
+          message: "The queued message was withdrawn from the provider and will not run.",
+        }),
+      );
+    } catch (error) {
+      this.logger.warn(
+        { err: error, turnId, itemId },
+        "ACP provider refused to withdraw the queued prompt",
+      );
+      this.reportQueuedMessageStuck(turnId, itemId);
+    }
+  }
+
+  private reportQueuedMessageStuck(turnId: string, itemId: string): void {
+    this.logger.warn({ turnId, itemId }, "ACP provider did not withdraw the queued prompt");
+    // The provider refuses the removal once it claimed the item, so the
+    // message is either running or already past the queue. Saying which one
+    // would be a guess; saying that it will not run would be a lie.
+    this.pushEvent(
+      this.wrapTimeline({
+        type: "notification",
+        level: "warning",
+        message: "The queued message cannot be withdrawn; the provider may already be running it.",
+      }),
+    );
   }
 
   async interrupt(): Promise<void> {
@@ -3370,6 +3731,13 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
 
     this.cancelPendingPermissions();
+    // A Stop stops the session, not only the turn that happens to be running:
+    // a message already waiting in the provider's queue would otherwise run
+    // right after the stop the user was promised.
+    // An enqueue still in flight is marked first: nobody could withdraw an item whose
+    // id had not arrived, so its answer withdraws what it just created.
+    for (const turnId of this.pendingQueueEnqueues.keys()) this.stoppedWhileQueueing.add(turnId);
+    await this.withdrawQueuedPrompts();
 
     const activeTurnId = this.activeForegroundTurnId;
     if (!activeTurnId) {
@@ -3887,7 +4255,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         connection.initialize({
           protocolVersion: PROTOCOL_VERSION,
           clientCapabilities: buildACPClientCapabilities(
-            this.clientCapabilityMeta,
+            this.handshakeClientCapabilityMeta(),
             this.clientCapabilities,
           ),
           clientInfo: { name: "Paseo", version: "dev" },
@@ -3897,6 +4265,19 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     );
 
     return { child, connection, initialize };
+  }
+
+  /**
+   * Client capability metadata for the handshake with this provider.
+   *
+   * A user-supplied metadata object must not silence the vendor handshake:
+   * without it MiniMax Code keeps its delegations and its queue to itself.
+   */
+  private handshakeClientCapabilityMeta(): ACPClientCapabilityMeta | undefined {
+    if (!isMiniMaxCodeProvider(this.provider, this.defaultCommand)) {
+      return this.clientCapabilityMeta;
+    }
+    return mergeACPClientCapabilityMeta(MCODE_CLIENT_CAPABILITY_META, this.clientCapabilityMeta);
   }
 
   private async runACPRequest<T>(request: () => Promise<T>): Promise<T> {
@@ -4314,6 +4695,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       },
       "provider.acp.event_emit",
     );
+    if (
+      event.type === "provider_subagent" &&
+      this.subscribers.size === 0 &&
+      !this.delegationBacklogDelivered
+    ) {
+      this.pendingDelegationEvents.push(event);
+      return;
+    }
     for (const subscriber of this.subscribers) {
       subscriber(event);
     }
