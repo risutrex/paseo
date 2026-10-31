@@ -41,9 +41,9 @@ jobs:
           CONFIG__MODEL: anthropic/deepseek-v4.1-flash
           CONFIG__MODEL_WEAK: anthropic/deepseek-v4.1-flash
           CONFIG__FALLBACK_MODELS: '[]'
-          CONFIG__CUSTOM_MODEL_MAX_TOKENS: '32000'
-          CONFIG__MAX_MODEL_TOKENS: '32000'
-          CONFIG__MAX_OUTPUT_TOKENS: '4096'
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: '128000'
+          CONFIG__MAX_MODEL_TOKENS: '128000'
+          CONFIG__MAX_OUTPUT_TOKENS: '32000'
           CONFIG__USE_REPO_SETTINGS_FILE: 'false'
           CONFIG__USE_GLOBAL_SETTINGS_FILE: 'false'
           CONFIG__ENABLE_PER_DIRECTORY_SETTINGS: 'false'
