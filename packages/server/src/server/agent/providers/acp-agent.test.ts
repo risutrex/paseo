@@ -2838,6 +2838,58 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
     }
   });
 
+  test("skips the previews of the later pages once the probe is known to be stuck", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      const firstPage = Array.from({ length: 5 }, (_value, index) => ({
+        sessionId: `s${index + 1}`,
+        cwd: "/Users/moonshot",
+        title: `session ${index + 1}`,
+        updatedAt: "2026-06-13T00:00:00.000Z",
+      }));
+      const secondPage = Array.from({ length: 3 }, (_value, index) => ({
+        sessionId: `s${index + 6}`,
+        cwd: "/Users/moonshot",
+        title: `session ${index + 6}`,
+        updatedAt: "2026-06-14T00:00:00.000Z",
+      }));
+      const listSessions = vi.fn(async (params?: { cursor?: string }) =>
+        params?.cursor
+          ? { sessions: secondPage, nextCursor: null }
+          : { sessions: firstPage, nextCursor: "cursor-2" },
+      );
+      const loadSession = vi.fn(async () => await new Promise<never>(() => {}));
+
+      const { client } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      await vi.advanceTimersByTimeAsync(20_000);
+      const result = await listing;
+
+      // The probe is replaced a bounded number of times and then left alone,
+      // so the sessions of the later page are listed without previews.
+      expect(loadSession).toHaveBeenCalledTimes(4);
+      expect(result.map((session) => session.providerHandleId)).toEqual([
+        "s1",
+        "s2",
+        "s3",
+        "s4",
+        "s5",
+        "s6",
+        "s7",
+        "s8",
+      ]);
+      expect(result.slice(5).every((session) => session.firstPromptPreview === null)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("aborts immediately when the signal is already aborted", async () => {
     const terminateProcess = vi.fn(async () => {});
     const listSessions = vi.fn(async () => ({

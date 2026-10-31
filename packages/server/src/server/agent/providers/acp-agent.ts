@@ -1280,6 +1280,9 @@ export class ACPAgentClient implements AgentClient {
       let scanned = 0;
       let recycles = 0;
       let cursor: string | null | undefined;
+      // A probe that is known to be stuck stays known to be stuck: the rest of
+      // the scan asks it for no more previews.
+      let historiesAvailable = canLoadHistory;
       for (;;) {
         if (abort.triggered()) {
           throw new Error("ACP import session listing was aborted");
@@ -1288,7 +1291,7 @@ export class ACPAgentClient implements AgentClient {
         const candidates = page.sessions.filter((session) => !seen.has(session.sessionId));
         const collected = await this.collectImportablePage(probeState, history, candidates, {
           abort,
-          canLoadHistory,
+          canLoadHistory: historiesAvailable,
           historyDeadline,
           collected: sessions.length,
           resultLimit,
@@ -1300,6 +1303,7 @@ export class ACPAgentClient implements AgentClient {
         sessions.push(...collected.sessions);
         scanned = collected.scanned;
         recycles = collected.recycles;
+        historiesAvailable = collected.canLoadHistory;
         cursor = page.nextCursor ?? null;
         if (collected.recycled) {
           // The page came from a probe that has been replaced, so its cursor
@@ -1347,6 +1351,7 @@ export class ACPAgentClient implements AgentClient {
     scanned: number;
     recycles: number;
     recycled: boolean;
+    canLoadHistory: boolean;
   }> {
     const sessions: ImportableProviderSession[] = [];
     let scanned = context.scanned;
@@ -1402,7 +1407,7 @@ export class ACPAgentClient implements AgentClient {
       if (outcome.previews.hasConversation === false) continue;
       sessions.push(this.toImportableSession(session, outcome.previews));
     }
-    return { sessions, scanned, recycles, recycled };
+    return { sessions, scanned, recycles, recycled, canLoadHistory };
   }
 
   /** Spawns a probe that feeds its session updates into the history collector. */
