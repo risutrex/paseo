@@ -41,6 +41,11 @@ tsconfig.tsbuildinfo
 
 # Testing
 coverage/
+# Artifacts a test run drops inside a package; never part of a commit.
+.vitest-attachments/
+**/.vitest-attachments/
+playwright-report/
+**/playwright-report/
 
 # Playwright
 test-results/

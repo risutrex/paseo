@@ -427,7 +427,8 @@ export const ar: TranslationResources = {
       scopeToWorkspace: "مساحة العمل هذه",
     },
     previews: {
-      unavailable: "تم البحث في بعض المزوّدين حسب العنوان والمجلد فقط — لم يتم تحميل نص الطلبات الخاصة بها.",
+      unavailable:
+        "تم البحث في بعض المزوّدين حسب العنوان والمجلد فقط — لم يتم تحميل نص الطلبات الخاصة بها.",
     },
     preview: {
       untitledSession: "جلسة بلا عنوان",

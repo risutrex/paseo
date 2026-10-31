@@ -2236,7 +2236,16 @@ export class DaemonClient {
     timeout?: number;
     select: (msg: SessionOutboundMessage) => T | null;
     options?: { skipQueue?: boolean };
+    /**
+     * A caller that stops waiting releases this waiter with it. Without it the
+     * predicate keeps running on every inbound message until the RPC timeout,
+     * for an answer nobody is left to read.
+     */
+    signal?: AbortSignal;
   }): Promise<T> {
+    if (params.signal?.aborted) {
+      throw createAbortedError();
+    }
     const wire = this.owned.prepareRequest(params.message);
     const timeout = params.timeout ?? DEFAULT_SESSION_RPC_TIMEOUT_MS;
     const { promise, cancel } = this.waitForWithCancel<RpcWaitResult<T>>(
@@ -2263,9 +2272,14 @@ export class DaemonClient {
       { ...params.options, requestId: params.requestId },
     );
 
+    const abortWaiter = () => cancel(createAbortedError());
+    params.signal?.addEventListener("abort", abortWaiter, { once: true });
+    const removeAbortListener = () => params.signal?.removeEventListener("abort", abortWaiter);
+
     try {
       await this.sendSessionMessageOrThrow(wire.message);
     } catch (error) {
+      removeAbortListener();
       const err = error instanceof Error ? error : new Error(String(error));
       cancel(err);
       void promise.catch(() => undefined);
@@ -2277,6 +2291,7 @@ export class DaemonClient {
       if (result.kind === "error") throw result.error;
       return result.value;
     } finally {
+      removeAbortListener();
       await wire.finish();
     }
   }
@@ -2808,21 +2823,15 @@ export class DaemonClient {
         }),
       ).catch(() => undefined);
     };
-    const abortPromise = new Promise<never>((_resolve, reject) => {
-      signal?.addEventListener(
-        "abort",
-        () => {
-          cancelListing();
-          reject(createAbortedError());
-        },
-        { once: true },
-      );
-    });
-    return await Promise.race([
-      this.sendRequest({
+    signal?.addEventListener("abort", cancelListing, { once: true });
+    try {
+      // The signal reaches the request too, so the abandoned waiter is released
+      // now instead of running its predicate until the session RPC timeout.
+      return await this.sendRequest({
         requestId: resolvedRequestId,
         message,
         options: { skipQueue: true },
+        signal,
         select: (msg) => {
           if (msg.type !== "fetch_recent_provider_sessions_response") {
             return null;
@@ -2832,9 +2841,10 @@ export class DaemonClient {
           }
           return msg.payload;
         },
-      }),
-      abortPromise,
-    ]);
+      });
+    } finally {
+      signal?.removeEventListener("abort", cancelListing);
+    }
   }
 
   fetchWorkspaces(

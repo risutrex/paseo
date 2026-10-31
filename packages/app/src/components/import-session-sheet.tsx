@@ -1,6 +1,12 @@
 import React, { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, type PressableStateCallbackType, Text, View } from "react-native";
-import { CancelledError, keepPreviousData, useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
+import {
+  CancelledError,
+  keepPreviousData,
+  useMutation,
+  useQueries,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import type {
   DaemonClient,
@@ -328,7 +334,9 @@ function ScopeSubtitle({
           testID={isScoped ? "import-session-show-all" : "import-session-scope-workspace"}
           style={styles.subtitleAction}
         >
-          {isScoped ? t("importSession.actions.showAll") : t("importSession.actions.scopeToWorkspace")}
+          {isScoped
+            ? t("importSession.actions.showAll")
+            : t("importSession.actions.scopeToWorkspace")}
         </Button>
       ) : null}
     </View>
@@ -628,6 +636,15 @@ export function ImportSessionSheet({
     () => ["recent-provider-sessions", serverId, scopeCwd] as const,
     [serverId, scopeCwd],
   );
+
+  // Hiding the sheet keeps its observers mounted, and turning `enabled` off does
+  // not stop a fetch already in flight (TanStack Query v5). Cancelling aborts
+  // the query's signal, which is what tells the daemon to stop walking
+  // directories for a list nobody is looking at any more.
+  useEffect(() => {
+    if (visible) return;
+    void queryClient.cancelQueries({ queryKey: sessionsQueryRoot, exact: false });
+  }, [visible, queryClient, sessionsQueryRoot]);
 
   const queriesConfig = useMemo(
     () =>

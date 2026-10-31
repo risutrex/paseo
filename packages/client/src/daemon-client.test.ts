@@ -5800,6 +5800,38 @@ test("cancels a recent provider sessions listing the caller stopped waiting for"
   });
 });
 
+test("releases the waiter of a recent provider sessions listing its caller abandoned", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const controller = new AbortController();
+  const promise = client.fetchRecentProviderSessions({ cwd: "/tmp/repo" }, controller.signal);
+  expect(mock.sent).toHaveLength(1);
+
+  controller.abort();
+
+  await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+
+  // The daemon never answers a cancelled listing (it returns early on purpose),
+  // so the waiter must be gone instead of matching every inbound message until
+  // the sixty-second session RPC timeout.
+  const internal = client as unknown as { waiters: Set<unknown> };
+  expect(internal.waiters.size).toBe(0);
+});
+
 test("imports an agent by provider handle id", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

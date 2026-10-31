@@ -432,7 +432,8 @@ export const ja: TranslationResources = {
       scopeToWorkspace: "このワークスペース",
     },
     previews: {
-      unavailable: "一部のプロバイダーはタイトルとフォルダのみで検索されました。プロンプト本文は読み込まれていません。",
+      unavailable:
+        "一部のプロバイダーはタイトルとフォルダのみで検索されました。プロンプト本文は読み込まれていません。",
     },
     preview: {
       untitledSession: "無題のセッション",

@@ -428,7 +428,8 @@ export const ko: TranslationResources = {
       scopeToWorkspace: "이 워크스페이스",
     },
     previews: {
-      unavailable: "일부 프로바이더는 제목과 폴더만으로 검색되었습니다. 프롬프트 본문은 불러오지 않았습니다.",
+      unavailable:
+        "일부 프로바이더는 제목과 폴더만으로 검색되었습니다. 프롬프트 본문은 불러오지 않았습니다.",
     },
     preview: {
       untitledSession: "제목 없는 세션",
