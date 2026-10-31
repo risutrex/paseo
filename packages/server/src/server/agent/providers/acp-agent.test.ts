@@ -103,7 +103,12 @@ interface ACPSessionInternals {
   connection: {
     prompt: (...args: unknown[]) => Promise<PromptResponse>;
     cancel?: (...args: unknown[]) => Promise<void>;
+    extMethod?: (
+      method: string,
+      params: Record<string, unknown>,
+    ) => Promise<Record<string, unknown>>;
   };
+  agentMeta: Record<string, unknown> | null;
   activeForegroundTurnId: string | null;
   configOptions: SessionConfigOption[];
   translateSessionUpdate(update: SessionUpdate): AgentStreamEvent[];
@@ -3481,6 +3486,108 @@ describe("ACPAgentSession", () => {
     await vi.waitFor(() => expect(prompt).toHaveBeenCalled());
 
     expect(prompt).toHaveBeenCalledTimes(1);
+  });
+
+  test("steers the running turn through the provider extension", async () => {
+    const session = createSession();
+    const extMethod = vi.fn().mockResolvedValue({ turnId: "native-turn-1", mode: "steered" });
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        version: 1,
+        methods: ["mcode/session/steer"],
+      },
+    };
+
+    const { turnId } = await session.startTurn("work");
+    const result = await session.steerActiveTurn!("answer with one word", {
+      expectedTurnId: turnId,
+      clientMessageId: "steer-1",
+    });
+
+    expect(result).toEqual({ status: "accepted" });
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/steer", {
+      sessionId: "session-1",
+      text: "answer with one word",
+      clientRequestId: "steer-1",
+    });
+  });
+
+  test("reports steering as unavailable when the provider never advertised the extension", async () => {
+    const session = createSession();
+    const extMethod = vi.fn();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+    const result = await session.steerActiveTurn!("follow up", { expectedTurnId: turnId });
+
+    expect(result).toEqual({ status: "unavailable" });
+    expect(extMethod).not.toHaveBeenCalled();
+  });
+
+  test("reports steering as unavailable when the provider does not implement the method", async () => {
+    const session = createSession();
+    const extMethod = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error("Method not found"), { code: -32601 }));
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+    const result = await session.steerActiveTurn!("follow up", { expectedTurnId: turnId });
+
+    expect(result).toEqual({ status: "unavailable" });
+  });
+
+  test("surfaces an ambiguous steer failure instead of retrying it", async () => {
+    const session = createSession();
+    const extMethod = vi.fn().mockRejectedValue(new Error("steer transport failed"));
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+
+    await expect(session.steerActiveTurn!("follow up", { expectedTurnId: turnId })).rejects.toThrow(
+      "steer transport failed",
+    );
+    expect(extMethod).toHaveBeenCalledOnce();
+  });
+
+  test("does not steer a turn that is no longer the active one", async () => {
+    const session = createSession();
+    const extMethod = vi.fn();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    await session.startTurn("work");
+    const result = await session.steerActiveTurn!("follow up", { expectedTurnId: "other-turn" });
+
+    expect(result).toEqual({ status: "unavailable" });
+    expect(extMethod).not.toHaveBeenCalled();
   });
 
   test("startTurn returns before the ACP prompt settles and completes later via subscribers", async () => {

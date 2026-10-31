@@ -89,6 +89,8 @@ import {
   type AgentTimelineItem,
   type AgentUsage,
   type AgentUsageSession,
+  type SteerActiveTurnOptions,
+  type SteerResult,
   type FetchCatalogOptions,
   type ProviderRefreshContext,
   type ImportableProviderSession,
@@ -336,6 +338,14 @@ const ACP_TURN_RELEASE_TIMEOUT_MS = 1_200;
 // short pause instead of failing the run.
 const ACP_BUSY_PROMPT_RETRY_DELAY_MS = 250;
 const ACP_BUSY_PROMPT_RETRY_LIMIT = 2;
+// ACP itself has no mid-turn steering method: the protocol only knows
+// `session/prompt`, `session/cancel` and the session lifecycle. Providers
+// expose steering as a namespaced extension instead. MiniMax Code advertises
+// its extensions in `initialize` under `_meta["minimax-code/extensions"]` and
+// accepts a steer as `mcode/session/steer`, which keeps the running turn alive
+// and answers with the turn it steered plus the disposition of the message.
+const MCODE_EXTENSIONS_META_KEY = "minimax-code/extensions";
+const MCODE_STEER_METHOD = "mcode/session/steer";
 // `session/cancel` is a notification, so the write itself can block on a
 // stuck provider. Bound it instead of letting the interruption hang.
 const ACP_CANCEL_NOTIFICATION_TIMEOUT_MS = 500;
@@ -1996,6 +2006,12 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private child: ChildProcessWithoutNullStreams | null = null;
   private connection: ClientSideConnection | null = null;
   private agentCapabilities: ACPAgentCapabilities | null = null;
+  /**
+   * The `initialize` response of the provider. Its `_meta` carries the
+   * namespaced extensions the provider offers, which is how a client learns
+   * that steering is available.
+   */
+  private agentMeta: Record<string, unknown> | null = null;
   private sessionId: string | null = null;
   private readonly earlySessionUpdates: SessionNotification[] = [];
   private currentMode: string | null = null;
@@ -2097,6 +2113,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.child = spawned.child;
       this.connection = spawned.connection;
       this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
+      this.agentMeta = spawned.initialize._meta ?? null;
 
       const response = await this.runACPRequest(() =>
         this.connection!.newSession({
@@ -2134,6 +2151,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.child = spawned.child;
       this.connection = spawned.connection;
       this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
+      this.agentMeta = spawned.initialize._meta ?? null;
       this.sessionId = handle.sessionId;
       this.bootstrapThreadEventPending = true;
 
@@ -2855,6 +2873,85 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         title: this.currentTitle,
       },
     };
+  }
+
+  /**
+   * Steers the running foreground turn instead of replacing it.
+   *
+   * ACP has no core steering method, so a provider has to offer one as a
+   * namespaced extension. MiniMax Code advertises `mcode/session/steer` in the
+   * `initialize` metadata and keeps the running turn alive: the provider
+   * answers with the turn it steered and the disposition of the message, and
+   * the agent keeps working on the same turn with the new guidance.
+   */
+  async steerActiveTurn(
+    prompt: AgentPromptInput,
+    options: SteerActiveTurnOptions,
+  ): Promise<SteerResult> {
+    const connection = this.connection;
+    const sessionId = this.sessionId;
+    const activeTurnId = this.activeForegroundTurnId;
+    if (!connection || !sessionId) {
+      return { status: "unavailable" };
+    }
+    // The steer has to land in the turn the caller admitted. A turn that moved
+    // on since then would steer the wrong run.
+    if (!activeTurnId || activeTurnId !== options.expectedTurnId) {
+      return { status: "unavailable" };
+    }
+    if (!this.supportsVendorSteer()) {
+      return { status: "unavailable" };
+    }
+    const text = extractPromptText(prompt);
+    if (!text.trim()) {
+      return { status: "unavailable" };
+    }
+
+    try {
+      const response = await connection.extMethod(MCODE_STEER_METHOD, {
+        sessionId,
+        text,
+        ...(options.clientMessageId ? { clientRequestId: options.clientMessageId } : {}),
+      });
+      const mode = typeof response.mode === "string" ? response.mode : null;
+      if (mode === "activated") {
+        throw new Error("ACP provider activated a new turn instead of steering the running one");
+      }
+      if (mode !== "steered" && mode !== "merged" && mode !== "duplicate") {
+        throw new Error(`ACP provider returned an unknown steer disposition: ${mode ?? "none"}`);
+      }
+      if (options.clearPendingPermissions) {
+        this.cancelPendingPermissions();
+      }
+      this.logger.info(
+        { mode, turnId: activeTurnId },
+        "ACP provider accepted the steer for the running turn",
+      );
+      return { status: "accepted" };
+    } catch (error) {
+      // A provider without the extension answers "method not found". That is a
+      // definitive "no steering here", so the manager may fall back to the
+      // interrupt-and-replace path. Any other failure leaves the fate of the
+      // message unknown and must surface instead of being retried.
+      if (isMethodNotFoundError(error)) {
+        return { status: "unavailable" };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Reports whether the provider advertised a steering extension. The
+   * advertisement lives in the `initialize` metadata, so a provider that
+   * never offered steering is reported as unavailable instead of failing.
+   */
+  private supportsVendorSteer(): boolean {
+    const extensions = this.agentMeta?.[MCODE_EXTENSIONS_META_KEY];
+    if (!extensions || typeof extensions !== "object") {
+      return false;
+    }
+    const methods = (extensions as { methods?: unknown }).methods;
+    return Array.isArray(methods) && methods.includes(MCODE_STEER_METHOD);
   }
 
   async interrupt(): Promise<void> {
@@ -4101,6 +4198,19 @@ function toACPContentBlocks(prompt: AgentPromptInput): ContentBlock[] {
     }
   }
   return contentBlocks;
+}
+
+/**
+ * Reports whether an extension request failed because the provider does not
+ * implement that method.
+ */
+function isMethodNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === -32601
+  );
 }
 
 function extractPromptText(prompt: AgentPromptInput): string {
