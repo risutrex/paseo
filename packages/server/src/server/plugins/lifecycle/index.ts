@@ -194,6 +194,9 @@ export function publishAgentStream(
       timeline: [],
       outcome: { kind: "failed", error: { message: event.error, code: event.code } },
     });
+  } else if (event.type === "turn_queued") {
+    // Deliberately no "agent.turn.after": the hook contract reports completed, failed or
+    // canceled, and a queued turn is none of them - the message runs later.
   } else if (event.type === "turn_canceled") {
     lifecycle.emit("agent.turn.after", {
       agent,

@@ -231,6 +231,8 @@ export function registerAgentAutoArchive(input: {
   unsubscribe = input.agentManager.subscribe(
     (event) => {
       if (event.type !== "agent_stream") return;
+      // A queued turn is not a finished one: the message still runs later, so archiving
+      // now would hide the agent before its work produced anything.
       if (
         event.event.type !== "turn_completed" &&
         event.event.type !== "turn_failed" &&

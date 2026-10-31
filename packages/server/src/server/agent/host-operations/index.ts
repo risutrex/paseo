@@ -422,6 +422,9 @@ function remoteObservation(client: DaemonClient): HostObservation {
             event.type === "turn_started" ||
             event.type === "turn_completed" ||
             event.type === "turn_canceled" ||
+            // A queued turn ends the run on our side too, so observers must re-read
+            // the snapshot instead of waiting for a terminal event that never comes.
+            event.type === "turn_queued" ||
             event.type === "turn_failed"
           )
             updates = updates.then(() => refresh(event)).catch(onError);

@@ -8,6 +8,7 @@ import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-clien
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
 import { buildStoredAgentPayload } from "../agent-projections.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
+import type { FinishObservationResult } from "./internal/observation-buffer.js";
 import {
   createFinishSubscriptions,
   createJsonFinishSubscriptionStore,
@@ -25,8 +26,10 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 class Observation implements FinishObservation {
-  waits: Array<{ signal: AbortSignal; result: ReturnType<typeof deferred<WaitForFinishResult>> }> =
-    [];
+  waits: Array<{
+    signal: AbortSignal;
+    result: ReturnType<typeof deferred<FinishObservationResult>>;
+  }> = [];
   permission = deferred<void>();
   opening: Promise<void> = Promise.resolve();
   openedSignals: AbortSignal[] = [];
@@ -35,9 +38,9 @@ class Observation implements FinishObservation {
     await this.opening;
     return { next: () => this.wait(signal), close: async () => {} };
   }
-  async wait(signal: AbortSignal) {
+  async wait(signal: AbortSignal): Promise<FinishObservationResult> {
     signal.throwIfAborted();
-    const result = deferred<WaitForFinishResult>();
+    const result = deferred<FinishObservationResult>();
     signal.addEventListener("abort", () => result.reject(new Error("Stopped")), { once: true });
     this.waits.push({ signal, result });
     return result.promise;
@@ -311,6 +314,28 @@ test("error and missing-child notifications never claim successful completion", 
   await until(() => state.delivery.prompts.length === 2);
   expect(state.delivery.prompts[1]).toContain("is unavailable");
   expect(state.delivery.prompts[1]).not.toContain("finished");
+});
+
+test("a queued handoff notifies the parent that the result is unknown", async () => {
+  const state = await scenario();
+  await state.service.register(intent);
+  await until(() => state.observation.waits.length === 1);
+  const queued: FinishObservationResult = {
+    status: "queued",
+    final: outcome("idle").final,
+    lastMessage: null,
+    error: null,
+  };
+  state.observation.waits[0]!.result.resolve(queued);
+  await until(() => state.delivery.prompts.length === 1);
+  expect(state.delivery.prompts[0]).toContain("result is unknown");
+  expect(state.delivery.prompts[0]).toContain("no response is available yet");
+  // The turn that queued the message produced nothing: the previous answer must not be
+  // handed over as its result, and the notification must not read as a finish.
+  expect(state.delivery.prompts[0]).not.toContain("Partial work saved");
+  expect(state.delivery.prompts[0]).not.toContain("finished.");
+  state.delivery.acknowledgments[0]!.resolve("steered");
+  await expect.poll(async () => (await state.store.list()).length).toBe(0);
 });
 
 test("finish notification limits a long last response and points to activity for the remainder", async () => {

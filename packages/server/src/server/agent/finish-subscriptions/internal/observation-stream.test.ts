@@ -14,7 +14,7 @@ class Host implements HostObservation {
   handler?: Parameters<HostObservation["observe"]>[1];
   released = false;
   failure?: (error: unknown) => void;
-  baseline = Promise.withResolvers<WaitForFinishResult>();
+  baseline = Promise.withResolvers<WaitForFinishResult & { queued?: boolean }>();
   async wait() {
     return this.baseline.promise;
   }
@@ -169,6 +169,44 @@ test("a terminal event observed after newer work starts waits for that running w
     expect(settled).toBe(false);
     host.emit("idle", { type: "turn_completed", provider: "codex" });
     expect((await next).status).toBe("idle");
+  } finally {
+    await observation.close();
+  }
+});
+
+test("a queued handoff reports an unknown result instead of the previous answer", async () => {
+  const { host, observation } = await scenario();
+  try {
+    host.emit("idle", { type: "turn_queued", provider: "codex" });
+    const result = await observation.next();
+    // The provider took the message for a later turn: nothing ran for this one, and the
+    // agent's last message belongs to the turn before it.
+    expect(result).toMatchObject({ status: "queued", lastMessage: null });
+    expect(result.final).not.toBeNull();
+  } finally {
+    await observation.close();
+  }
+});
+
+test("a queued baseline that arrives before the stream event still reports no result", async () => {
+  const { host, observation } = await scenario();
+  try {
+    const final = buildStoredAgentPayload(
+      {
+        id: "child",
+        cwd: "/tmp",
+        provider: "codex",
+        labels: {},
+        lastStatus: "idle",
+        createdAt: "2026-01-01",
+        updatedAt: "2026-01-01",
+      },
+      ["codex"],
+    );
+    // The ordinary wait settles on the same handoff; whichever path lands first, the
+    // observer must not be handed the agent's previous answer.
+    host.baseline.resolve({ status: "idle", final, lastMessage: null, error: null, queued: true });
+    expect(await observation.next()).toMatchObject({ status: "queued", lastMessage: null });
   } finally {
     await observation.close();
   }

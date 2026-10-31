@@ -12779,3 +12779,191 @@ test("an out-of-band command racing idle cleanup waits for the resumed runtime",
   expect(h.commands).toEqual(["/maintenance"]);
   expect(h.prompts).toEqual([]);
 });
+
+test("a queued turn reports an unknown result instead of the previous answer", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-queued-wait-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const releaseQueuedEvent = Promise.withResolvers<void>();
+
+  // The first turn answers normally, the second ends in the provider's queue. A waiter
+  // that treats that handoff as a finish would hand the first answer over as the result
+  // of a request the provider has not even started.
+  class QueuedHandoffSession extends TestAgentSession {
+    startCount = 0;
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      const index = ++this.startCount;
+      const turnId = `queued-handoff-${index}`;
+      void (async () => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        if (index === 1) {
+          this.pushEvent({
+            type: "timeline",
+            provider: this.provider,
+            turnId,
+            item: { type: "assistant_message", text: "Previous answer" },
+          });
+          this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+          return;
+        }
+        await releaseQueuedEvent.promise;
+        this.pushEvent({
+          type: "turn_queued",
+          provider: this.provider,
+          turnId,
+          reason: "The provider took the message into its queue while it was busy",
+        });
+      })();
+      return { turnId };
+    }
+  }
+
+  class QueuedHandoffClient extends TestAgentClient {
+    session: QueuedHandoffSession | null = null;
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.session = new QueuedHandoffSession(config);
+      return this.session;
+    }
+  }
+
+  const client = new QueuedHandoffClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000902",
+  });
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    const firstEvents: AgentStreamEvent[] = [];
+    for await (const event of manager.streamAgent(snapshot.id, "first prompt")) {
+      firstEvents.push(event);
+    }
+    expect(firstEvents.map((event) => event.type)).toEqual([
+      "turn_started",
+      "timeline",
+      "turn_completed",
+    ]);
+    expect(await manager.getLastAssistantMessage(snapshot.id)).toBe("Previous answer");
+
+    const secondRun = (async () => {
+      for await (const _event of manager.streamAgent(snapshot.id, "second prompt")) {
+        // Drain the run so the manager applies its lifecycle.
+      }
+    })();
+    await manager.waitForAgentRunStart(snapshot.id);
+    const waiting = manager.waitForAgentEvent(snapshot.id, { waitForActive: true });
+
+    releaseQueuedEvent.resolve();
+    const result = await waiting;
+    expect(result).toMatchObject({ status: "idle", queued: true, lastMessage: null });
+    await secondRun;
+
+    // A waiter that arrives after the handoff gets the same honest answer.
+    const late = await manager.waitForAgentEvent(snapshot.id, { waitForActive: true });
+    expect(late).toMatchObject({ status: "idle", queued: true, lastMessage: null });
+  } finally {
+    await manager.closeAgent(manager.listAgents()[0]!.id).catch(() => undefined);
+    await manager.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("turn_queued ends the foreground run and frees the agent for the next prompt", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-queued-turn-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class QueuedTurnSession extends TestAgentSession {
+    startCount = 0;
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = `queued-turn-${++this.startCount}`;
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_queued",
+          provider: this.provider,
+          turnId,
+          reason: "The provider took the message into its queue while it was busy",
+        });
+      }, 0);
+      return { turnId };
+    }
+  }
+
+  class QueuedTurnClient extends TestAgentClient {
+    session: QueuedTurnSession | null = null;
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.session = new QueuedTurnSession(config);
+      return this.session;
+    }
+  }
+
+  const client = new QueuedTurnClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000901",
+  });
+  const states: Array<{ lifecycle: string; activeForegroundTurnId: string | null }> = [];
+  manager.subscribe(
+    (event) => {
+      if (event.type === "agent_state") {
+        states.push({
+          lifecycle: event.agent.lifecycle,
+          activeForegroundTurnId: event.agent.activeForegroundTurnId,
+        });
+      }
+    },
+    { replayState: false },
+  );
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    const firstEvents: AgentStreamEvent[] = [];
+    // A queued turn is terminal for the run: the busy provider will never send a
+    // turn_completed for it, so draining must finish on turn_queued itself.
+    const firstRun = (async () => {
+      for await (const event of manager.streamAgent(snapshot.id, "first prompt")) {
+        firstEvents.push(event);
+      }
+    })();
+    await Promise.race([
+      firstRun,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("streamAgent hung on a queued turn")), 1_000),
+      ),
+    ]);
+
+    expect(firstEvents.map((event) => event.type)).toEqual(["turn_started", "turn_queued"]);
+    expect(manager.getAgent(snapshot.id)?.activeForegroundTurnId).toBeNull();
+    expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("idle");
+    expect(states.at(-1)).toEqual({ lifecycle: "idle", activeForegroundTurnId: null });
+    // Queued is neither a failure nor a cancellation, so nothing is reported as one.
+    expect(manager.getAgent(snapshot.id)?.lastError).toBeUndefined();
+    expect(firstEvents.some((event) => event.type === "turn_canceled")).toBe(false);
+
+    // The provider still owns its own turn, so the next prompt has to go back into its
+    // queue instead of failing with "already has an active run".
+    const secondEvents: AgentStreamEvent[] = [];
+    for await (const event of manager.streamAgent(snapshot.id, "second prompt")) {
+      secondEvents.push(event);
+    }
+    expect(secondEvents.map((event) => event.type)).toEqual(["turn_started", "turn_queued"]);
+    expect(client.session?.startCount).toBe(2);
+  } finally {
+    await manager.closeAgent(manager.listAgents()[0]!.id);
+    await manager.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
