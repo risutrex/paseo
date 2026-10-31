@@ -413,8 +413,6 @@ export const fr: TranslationResources = {
     scope: {
       host: "Sessions sur {{host}}",
       workspace: "Cet espace de travail",
-      widenedBySearch:
-        "Recherche dans tous les répertoires pour trouver une session d’un autre projet.",
     },
     filters: {
       all: "Tous",

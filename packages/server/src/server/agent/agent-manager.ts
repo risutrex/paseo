@@ -1122,6 +1122,16 @@ export class AgentManager {
     );
     const providerResults = await Promise.all(
       providerEntries.map(async ([provider, client]) => {
+        if (options?.signal?.aborted) {
+          // The caller stopped waiting before this provider was reached. There
+          // is nothing to list, and starting the provider now would only make
+          // it work for an answer nobody reads.
+          return {
+            sessions: [],
+            error: null,
+            previewsUnavailable: false,
+          };
+        }
         // A preview is only "cheap" when the provider can read it out of a
         // descriptor or a transcript. ACP agents have to session/load, which
         // makes the provider rebuild the whole conversation in memory (2.7 GB
@@ -1133,6 +1143,16 @@ export class AgentManager {
           // histories). Give it an abort signal so an abandoned listing stops
           // the provider instead of leaving it running in the background.
           const controller = new AbortController();
+          // The caller's signal says the client stopped waiting. The provider
+          // must stop as well, or every abandoned request leaves work running.
+          const abortFromCaller = () => controller.abort();
+          if (options?.signal) {
+            if (options.signal.aborted) {
+              controller.abort();
+            } else {
+              options.signal.addEventListener("abort", abortFromCaller, { once: true });
+            }
+          }
           const sessions = await withTimeout(
             client.listImportableSessions!({
               limit: options?.limit,
@@ -1146,6 +1166,7 @@ export class AgentManager {
             `Timed out listing importable sessions for provider '${provider}' after ${IMPORTABLE_SESSION_LIST_TIMEOUT_MS}ms`,
           ).finally(() => {
             controller.abort();
+            options?.signal?.removeEventListener("abort", abortFromCaller);
           });
           return {
             sessions: sessions

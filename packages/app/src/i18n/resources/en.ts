@@ -405,7 +405,6 @@ export const en = {
     scope: {
       host: "Sessions on {{host}}",
       workspace: "This workspace",
-      widenedBySearch: "Searching all directories to find a session from another project.",
     },
     filters: {
       all: "All",

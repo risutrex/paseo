@@ -1,6 +1,6 @@
 import React, { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, type PressableStateCallbackType, Text, View } from "react-native";
-import { keepPreviousData, useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
+import { CancelledError, keepPreviousData, useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import type {
   DaemonClient,
@@ -50,9 +50,8 @@ const DISABLED_ACCESSIBILITY_STATE = { disabled: true };
 const SEARCH_DEBOUNCE_MS = 200;
 
 /**
- * A scope the user picked by hand. `null` leaves the choice to the sheet, which
- * follows the search: the current workspace while nothing is typed, every
- * directory once the user searches.
+ * A scope the user picked by hand: the current workspace or every directory on
+ * the host.
  */
 type ScopePreference = "workspace" | "all";
 
@@ -116,7 +115,7 @@ interface SessionsQueryConfig {
   staleTime: number;
   refetchOnMount: boolean | "always";
   placeholderData: typeof keepPreviousData;
-  queryFn: () => Promise<RecentSessionsResponse>;
+  queryFn: (context: { signal?: AbortSignal }) => Promise<RecentSessionsResponse>;
 }
 
 /**
@@ -155,16 +154,31 @@ function buildSessionsQueriesConfig(args: {
     staleTime: IMPORT_SESSIONS_STALE_TIME_MS,
     refetchOnMount: "always",
     placeholderData: keepPreviousData,
-    queryFn: async () => {
+    queryFn: async ({ signal }: { signal?: AbortSignal }) => {
       if (!client) {
         throw new Error(hostDisconnectedMessage ?? i18n.t("workspace.terminal.hostDisconnected"));
       }
-      return await client.fetchRecentProviderSessions({
-        ...(cwd ? { cwd } : {}),
-        providers: [provider],
-        limit,
-        ...(query ? { query } : {}),
-      });
+      try {
+        return await client.fetchRecentProviderSessions(
+          {
+            ...(cwd ? { cwd } : {}),
+            providers: [provider],
+            limit,
+            ...(query ? { query } : {}),
+          },
+          // A newer request replaces this one. Handing the signal over tells the
+          // daemon to stop the listing, so an abandoned search leaves no
+          // provider process behind.
+          signal,
+        );
+      } catch (error) {
+        if (signal?.aborted) {
+          // The request was replaced, not failed. Reporting it as an error
+          // would show the user a failure for a search they did not wait for.
+          throw new CancelledError();
+        }
+        throw error;
+      }
     },
   }));
 }
@@ -284,16 +298,10 @@ function RefreshAction({ isRefreshing, onPress }: { isRefreshing: boolean; onPre
   );
 }
 
-/**
- * Why the sheet widened the list without being asked: the query is what makes
- * a session from another project likely, and a silently wider list would read
- * as a bug.
- */
 function ScopeSubtitle({
   hostLabel,
   isScoped,
   canScope,
-  isWidenedBySearch,
   onShowAll,
   onScopeToWorkspace,
 }: {
@@ -301,38 +309,27 @@ function ScopeSubtitle({
   isScoped: boolean;
   /** Without a workspace directory there is nothing to narrow the list to. */
   canScope: boolean;
-  /** The query, not the user, widened the scope. */
-  isWidenedBySearch: boolean;
   onShowAll: () => void;
   onScopeToWorkspace: () => void;
 }) {
   const { t } = useTranslation();
   return (
-    <View style={styles.subtitleColumn}>
-      <View style={styles.subtitleRow}>
-        <Text style={styles.subtitleText} numberOfLines={1} testID="import-session-scope">
-          {isScoped
-            ? t("importSession.scope.workspace")
-            : t("importSession.scope.host", { host: hostLabel })}
-        </Text>
-        {canScope ? (
-          <Button
-            variant="ghost"
-            size="xs"
-            onPress={isScoped ? onShowAll : onScopeToWorkspace}
-            testID={isScoped ? "import-session-show-all" : "import-session-scope-workspace"}
-            style={styles.subtitleAction}
-          >
-            {isScoped
-              ? t("importSession.actions.showAll")
-              : t("importSession.actions.scopeToWorkspace")}
-          </Button>
-        ) : null}
-      </View>
-      {isWidenedBySearch ? (
-        <Text style={styles.subtitleHint} numberOfLines={2} testID="import-session-scope-reason">
-          {t("importSession.scope.widenedBySearch")}
-        </Text>
+    <View style={styles.subtitleRow}>
+      <Text style={styles.subtitleText} numberOfLines={1} testID="import-session-scope">
+        {isScoped
+          ? t("importSession.scope.workspace")
+          : t("importSession.scope.host", { host: hostLabel })}
+      </Text>
+      {canScope ? (
+        <Button
+          variant="ghost"
+          size="xs"
+          onPress={isScoped ? onShowAll : onScopeToWorkspace}
+          testID={isScoped ? "import-session-show-all" : "import-session-scope-workspace"}
+          style={styles.subtitleAction}
+        >
+          {isScoped ? t("importSession.actions.showAll") : t("importSession.actions.scopeToWorkspace")}
+        </Button>
       ) : null}
     </View>
   );
@@ -577,8 +574,9 @@ export function ImportSessionSheet({
 
   // The list starts on the sheet's own workspace: a listing scoped to it is the
   // only one the daemon matched with realpaths resolved, so it is the only one
-  // where "this row is ours" can be answered exactly. A typed query is the one
-  // case that needs other projects, and it widens the list by itself.
+  // where "this row is ours" can be answered exactly. Widening to every
+  // directory is the user's own choice, and the sheet keeps it until they
+  // narrow it back.
   const [scopePreference, setScopePreference] = useState<ScopePreference | null>(null);
   const [searchInput, setSearchInput] = useState("");
   const [pageLimit, setPageLimit] = useState(PER_PROVIDER_LIMIT);
@@ -587,17 +585,11 @@ export function ImportSessionSheet({
   const supportsSearch = useHostFeature(serverId, "importSessionSearch");
   const query = useDebouncedValue(supportsSearch ? searchInput : "", SEARCH_DEBOUNCE_MS).trim();
 
-  // The debounced query decides, so typing a word produces one widened request
-  // instead of a scoped one followed by a host-wide one.
   const isSearchActive = query.length > 0;
-  const isShowingAllDirectories =
-    scopePreference === null ? isSearchActive : scopePreference === "all";
+  const isShowingAllDirectories = scopePreference === "all";
   // The sheet's own `cwd` still decides where an imported agent lands; the
   // scope only changes which sessions are listed.
   const scopeCwd = isShowingAllDirectories ? null : (cwd ?? null);
-  // Only the automatic widening is worth explaining; a manual "show all" is the
-  // user's own doing and needs no reason.
-  const isWidenedBySearch = isSearchActive && scopePreference === null && Boolean(cwd);
 
   useEffect(() => {
     if (visible) return;
@@ -868,7 +860,6 @@ export function ImportSessionSheet({
           hostLabel={hostLabel}
           isScoped={scopeCwd !== null}
           canScope={Boolean(cwd)}
-          isWidenedBySearch={isWidenedBySearch}
           onShowAll={handleShowAll}
           onScopeToWorkspace={handleScopeToWorkspace}
         />
@@ -894,7 +885,6 @@ export function ImportSessionSheet({
       cwd,
       hostLabel,
       isRefreshing,
-      isWidenedBySearch,
       scopeCwd,
       supportsSearch,
       t,
@@ -1054,10 +1044,6 @@ export function ImportSessionSheet({
 }
 
 const styles = StyleSheet.create((theme) => ({
-  subtitleColumn: {
-    gap: 2,
-    minWidth: 0,
-  },
   subtitleRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -1072,10 +1058,6 @@ const styles = StyleSheet.create((theme) => ({
   },
   subtitleAction: {
     marginHorizontal: -theme.spacing[2],
-  },
-  subtitleHint: {
-    color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.sm,
   },
   filterTriggerWrap: {
     paddingBottom: theme.spacing[2],

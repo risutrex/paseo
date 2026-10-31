@@ -91,6 +91,8 @@ const INBOUND_PERMISSION = {
   fetch_agent_timeline_request: ["workspace.read", "hub.execute"],
   fetch_agents_request: ["workspace.read", "hub.execute"],
   fetch_recent_provider_sessions_request: "workspace.read",
+  // Cancelling a listing needs no more authority than asking for one.
+  cancel_recent_provider_sessions_request: "workspace.read",
   fetch_workspaces_request: ["workspace.read", "hub.execute"],
   "file.upload.request": "workspace.write",
   file_download_token_request: "workspace.read",

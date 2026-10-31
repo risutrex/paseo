@@ -1405,6 +1405,15 @@ export const FetchRecentProviderSessionsRequestMessageSchema = z.object({
   query: z.string().optional(),
 });
 
+// A client that no longer wants the answer (the user typed another character, or
+// the sheet was closed) tells the daemon to stop the listing. Without it the
+// provider keeps working on a request nobody reads, and every keystroke in the
+// import search leaves another provider process behind.
+export const CancelRecentProviderSessionsRequestMessageSchema = z.object({
+  type: z.literal("cancel_recent_provider_sessions_request"),
+  requestId: z.string(),
+});
+
 export const FetchAgentRequestMessageSchema = z.object({
   type: z.literal("fetch_agent_request"),
   requestId: z.string(),
@@ -3296,6 +3305,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   FetchAgentsRequestMessageSchema,
   FetchAgentHistoryRequestMessageSchema,
   FetchRecentProviderSessionsRequestMessageSchema,
+  CancelRecentProviderSessionsRequestMessageSchema,
   FetchWorkspacesRequestMessageSchema,
   ProjectListRequestMessageSchema,
   FetchAgentRequestMessageSchema,

@@ -408,7 +408,6 @@ export const zhCN: TranslationResources = {
     scope: {
       host: "{{host}} 上的会话",
       workspace: "此 workspace",
-      widenedBySearch: "正在所有目录中搜索，以查找来自其他项目的会话。",
     },
     filters: {
       all: "全部",

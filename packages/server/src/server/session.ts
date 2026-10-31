@@ -797,6 +797,10 @@ export class Session {
     { owner: OwnedSubscription; events: Set<SessionEventSubscription>; notifications: boolean }
   >();
   private readonly workspaceUpdateTails = new Map<string, Promise<void>>();
+  // Listings the client has not abandoned yet, by request id. A client that
+  // moves on (another keystroke, a closed sheet) cancels the listing, so the
+  // provider stops working on an answer nobody reads.
+  private readonly recentProviderSessionListings = new Map<string, AbortController>();
   private readonly terminalManager: TerminalManager | null;
   private readonly providerSnapshotManager: ProviderSnapshotManager;
   private readonly serviceProxy: ServiceProxySubsystem | null;
@@ -2898,6 +2902,9 @@ export class Session {
         return this.handleFetchAgentHistory(msg);
       case "fetch_recent_provider_sessions_request":
         return this.handleFetchRecentProviderSessions(msg);
+      case "cancel_recent_provider_sessions_request":
+        this.handleCancelRecentProviderSessions(msg);
+        return undefined;
       case "fetch_agent_request":
         return this.handleFetchAgent(msg.agentId, msg.requestId);
       case "delete_agent_request":
@@ -6383,13 +6390,24 @@ export class Session {
   private async handleFetchRecentProviderSessions(
     request: Extract<SessionInboundMessage, { type: "fetch_recent_provider_sessions_request" }>,
   ): Promise<void> {
+    // The client can cancel this listing while it runs. The provider stops as
+    // soon as the signal fires, which is what keeps every keystroke in the
+    // import search from leaving another provider process behind.
+    const controller = new AbortController();
+    this.recentProviderSessionListings.set(request.requestId, controller);
     try {
       const result = await listImportableProviderSessions({
         request,
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         providerSnapshotManager: this.providerSnapshotManager,
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) {
+        // The client asked for the answer to be dropped. Answering anyway would
+        // put a stale listing back into the client's cache.
+        return;
+      }
       this.emit({
         type: "fetch_recent_provider_sessions_response",
         payload: {
@@ -6405,6 +6423,10 @@ export class Session {
         },
       });
     } catch (error) {
+      if (controller.signal.aborted) {
+        // A cancelled listing is not a failure: the provider was told to stop.
+        return;
+      }
       const code =
         error instanceof ImportSessionsRequestError
           ? error.code
@@ -6424,7 +6446,25 @@ export class Session {
           code,
         },
       });
+    } finally {
+      this.recentProviderSessionListings.delete(request.requestId);
     }
+  }
+
+  /**
+   * Stops a listing the client no longer waits for. The provider aborts its
+   * work, so an abandoned search leaves no probe behind.
+   */
+  private handleCancelRecentProviderSessions(
+    request: Extract<SessionInboundMessage, { type: "cancel_recent_provider_sessions_request" }>,
+  ): void {
+    const controller = this.recentProviderSessionListings.get(request.requestId);
+    if (!controller) {
+      // The listing already finished. Nothing to stop.
+      return;
+    }
+    this.recentProviderSessionListings.delete(request.requestId);
+    controller.abort();
   }
 
   private async handleFetchWorkspacesRequest(

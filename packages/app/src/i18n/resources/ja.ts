@@ -413,8 +413,6 @@ export const ja: TranslationResources = {
     scope: {
       host: "{{host}} のセッション",
       workspace: "このワークスペース",
-      widenedBySearch:
-        "別のプロジェクトのセッションを探すため、すべてのディレクトリを検索しています。",
     },
     filters: {
       all: "すべて",

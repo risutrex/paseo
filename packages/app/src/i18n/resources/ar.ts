@@ -408,7 +408,6 @@ export const ar: TranslationResources = {
     scope: {
       host: "الجلسات على {{host}}",
       workspace: "مساحة العمل هذه",
-      widenedBySearch: "جارٍ البحث في كل المجلدات للعثور على جلسة من مشروع آخر.",
     },
     filters: {
       all: "الجميع",

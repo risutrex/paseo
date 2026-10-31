@@ -5759,6 +5759,47 @@ test("fetches scoped recent provider sessions", async () => {
   });
 });
 
+test("cancels a recent provider sessions listing the caller stopped waiting for", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const controller = new AbortController();
+  const promise = client.fetchRecentProviderSessions({ cwd: "/tmp/repo" }, controller.signal);
+
+  expect(mock.sent).toHaveLength(1);
+  const request = JSON.parse(String(mock.sent[0])) as {
+    message: { type: string; requestId: string };
+  };
+  expect(request.message.type).toBe("fetch_recent_provider_sessions_request");
+
+  // The caller moved on: the daemon must stop the listing, otherwise the
+  // provider keeps a process alive for an answer nobody reads.
+  controller.abort();
+
+  await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+  expect(mock.sent).toHaveLength(2);
+  const cancel = JSON.parse(String(mock.sent[1])) as {
+    message: { type: string; requestId: string };
+  };
+  expect(cancel.message).toMatchObject({
+    type: "cancel_recent_provider_sessions_request",
+    requestId: request.message.requestId,
+  });
+});
+
 test("imports an agent by provider handle id", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

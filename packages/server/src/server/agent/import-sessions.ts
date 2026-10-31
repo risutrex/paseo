@@ -66,6 +66,11 @@ export interface ListImportableProviderSessionsInput {
   agentManager: Pick<AgentManager, "listAgents" | "listImportableSessions">;
   agentStorage: Pick<AgentStorage, "list">;
   providerSnapshotManager: Pick<ProviderSnapshotManager, "getProviderLabel">;
+  /**
+   * Aborts the listing when the client stopped waiting for it. The provider
+   * stops its work, so an abandoned search leaves no probe behind.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ListImportableProviderSessionsResult {
@@ -140,6 +145,7 @@ export async function listImportableProviderSessions(
     ...(query ? { scanLimit: IMPORT_SESSION_SEARCH_SCAN_LIMIT } : {}),
     providerFilter,
     cwd: request.cwd,
+    ...(input.signal ? { signal: input.signal } : {}),
   });
   let filteredAlreadyImportedCount = 0;
   const candidates: ManagedImportableProviderSession[] = [];

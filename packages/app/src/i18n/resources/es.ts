@@ -413,8 +413,6 @@ export const es: TranslationResources = {
     scope: {
       host: "Sesiones en {{host}}",
       workspace: "Este espacio de trabajo",
-      widenedBySearch:
-        "Buscando en todos los directorios para encontrar una sesión de otro proyecto.",
     },
     filters: {
       all: "Todo",

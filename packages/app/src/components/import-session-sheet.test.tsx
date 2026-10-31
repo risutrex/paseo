@@ -487,7 +487,9 @@ describe("ImportSessionSheet", () => {
         cwd: "/repo/paseo",
         providers: ["claude"],
         limit: 15,
-      });
+      },
+      expect.anything(),
+    );
     });
 
     await screen.findByText("Implement the importer sheet");
@@ -549,7 +551,9 @@ describe("ImportSessionSheet", () => {
         cwd: "/repo/paseo",
         providers: ["claude"],
         limit: 15,
-      });
+      },
+      expect.anything(),
+    );
     });
   });
 
@@ -688,13 +692,17 @@ describe("ImportSessionSheet", () => {
         cwd: "/repo/paseo",
         providers: ["claude"],
         limit: 15,
-      });
+      },
+      expect.anything(),
+    );
     });
     expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
       cwd: "/repo/paseo",
       providers: ["codex"],
       limit: 15,
-    });
+    },
+      expect.anything(),
+    );
     expect(fetchRecentProviderSessions).not.toHaveBeenCalledWith(
       expect.objectContaining({ providers: ["opencode"] }),
     );
@@ -702,7 +710,9 @@ describe("ImportSessionSheet", () => {
       cwd: "/repo/paseo",
       providers: ["z-ai"],
       limit: 15,
-    });
+    },
+      expect.anything(),
+    );
 
     await screen.findByText("Session claude");
     await screen.findByText("Session codex");
@@ -883,7 +893,9 @@ describe("ImportSessionSheet", () => {
       expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
         providers: ["claude"],
         limit: 15,
-      });
+      },
+      expect.anything(),
+    );
     });
     expect(fetchRecentProviderSessions).not.toHaveBeenCalledWith(
       expect.objectContaining({ cwd: expect.anything() }),
@@ -1096,7 +1108,9 @@ describe("ImportSessionSheet", () => {
         providers: ["claude"],
         limit: 15,
         query: "invoice",
-      });
+      },
+      expect.anything(),
+    );
     });
   });
 
@@ -1149,7 +1163,9 @@ describe("ImportSessionSheet", () => {
       expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
         providers: ["claude"],
         limit: 45,
-      });
+      },
+      expect.anything(),
+    );
     });
     await waitFor(() => {
       expect(screen.queryByTestId("import-session-load-more")).toBeNull();
@@ -1204,7 +1220,9 @@ describe("ImportSessionSheet", () => {
         cwd: "/repo/paseo",
         providers: ["claude"],
         limit: 15,
-      });
+      },
+      expect.anything(),
+    );
     });
     expect(fetchRecentProviderSessions).toHaveBeenCalledTimes(1);
   });
@@ -1230,7 +1248,7 @@ describe("ImportSessionSheet", () => {
     await screen.findByText("Could not load Codex sessions");
   });
 
-  it("starts on the workspace, widens while searching, and narrows back on request", async () => {
+  it("searches within the chosen scope and widens only on request", async () => {
     const fetchRecentProviderSessions = vi.fn(async (options: { cwd?: string } | undefined) => ({
       requestId: "recent-provider-sessions",
       entries: [
@@ -1258,43 +1276,69 @@ describe("ImportSessionSheet", () => {
     // Nothing typed yet: the cheap listing of this workspace, whose rows the
     // daemon matched with realpaths resolved.
     await screen.findByText("Scoped session");
-    expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-      cwd: "/repo/paseo",
-      providers: ["claude"],
-      limit: 15,
-    });
+    expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+      {
+        cwd: "/repo/paseo",
+        providers: ["claude"],
+        limit: 15,
+      },
+      expect.anything(),
+    );
     await screen.findByText("This workspace");
-    expect(screen.queryByTestId("import-session-scope-reason")).toBeNull();
 
-    // A query is the case where the wanted session lives in another project, so
-    // the list widens by itself and says why.
+    // A query searches the scope the user chose. It does not widen the list on
+    // its own: the scope is what says which directories the rows come from.
     fireEvent.change(screen.getByTestId("import-session-search"), {
       target: { value: "foreign" },
     });
 
     await waitFor(() => {
-      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-        providers: ["claude"],
-        limit: 15,
-        query: "foreign",
-      });
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          cwd: "/repo/paseo",
+          providers: ["claude"],
+          limit: 15,
+          query: "foreign",
+        },
+        expect.anything(),
+    );
+    });
+    await screen.findByText("Scoped session");
+    expect(screen.queryByText("Foreign session")).toBeNull();
+    await screen.findByText("This workspace");
+
+    // Widening is the user's own choice, and it keeps the query.
+    fireEvent.click(screen.getByTestId("import-session-show-all"));
+
+    await waitFor(() => {
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          providers: ["claude"],
+          limit: 15,
+          query: "foreign",
+        },
+        expect.anything(),
+    );
     });
     await screen.findByText("Foreign session");
     await screen.findByText("Sessions on workbench");
-    screen.getByTestId("import-session-scope-reason");
 
     // Narrowing by hand keeps the query but goes back to the workspace rows.
     fireEvent.click(screen.getByTestId("import-session-scope-workspace"));
 
     await waitFor(() => {
-      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-        cwd: "/repo/paseo",
-        providers: ["claude"],
-        limit: 15,
-        query: "foreign",
-      });
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          cwd: "/repo/paseo",
+          providers: ["claude"],
+          limit: 15,
+          query: "foreign",
+        },
+        expect.anything(),
+    );
     });
-    expect(screen.queryByTestId("import-session-scope-reason")).toBeNull();
+    await screen.findByText("Scoped session");
+    expect(screen.queryByText("Foreign session")).toBeNull();
   });
 
   it("imports a cross-project row without the current workspace once the list is widened", async () => {
@@ -1333,7 +1377,9 @@ describe("ImportSessionSheet", () => {
     expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
       providers: ["claude"],
       limit: 15,
-    });
+    },
+      expect.anything(),
+    );
 
     fireEvent.click(screen.getByTestId("import-session-session-claude-foreign-thread"));
 

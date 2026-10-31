@@ -1038,6 +1038,16 @@ export type PluginCatalogEntry = Omit<PluginCatalogResponseEntry, "clientBundle"
   clientBundle: string;
 };
 
+/**
+ * The caller stopped waiting for the answer. It carries the `AbortError` name
+ * so callers can tell an abandoned request from a failed one.
+ */
+function createAbortedError(): Error {
+  const error = new Error("The request was aborted");
+  error.name = "AbortError";
+  return error;
+}
+
 export class DaemonConnectionError extends Error {
   readonly serverId?: string;
   readonly outcome?: "unknown";
@@ -2772,6 +2782,7 @@ export class DaemonClient {
 
   async fetchRecentProviderSessions(
     options?: FetchRecentProviderSessionsOptions,
+    signal?: AbortSignal,
   ): Promise<FetchRecentProviderSessionsPayload> {
     const resolvedRequestId = this.createRequestId(options?.requestId);
     const message = SessionInboundMessageSchema.parse({
@@ -2783,20 +2794,47 @@ export class DaemonClient {
       ...(options?.limit ? { limit: options.limit } : {}),
       ...(options?.query !== undefined ? { query: options.query } : {}),
     });
-    return this.sendRequest({
-      requestId: resolvedRequestId,
-      message,
-      options: { skipQueue: true },
-      select: (msg) => {
-        if (msg.type !== "fetch_recent_provider_sessions_response") {
-          return null;
-        }
-        if (msg.payload.requestId !== resolvedRequestId) {
-          return null;
-        }
-        return msg.payload;
-      },
+    if (signal?.aborted) {
+      throw createAbortedError();
+    }
+    // A caller that stops waiting (another keystroke in the search, a closed
+    // sheet) must not leave the daemon working on the listing: the provider
+    // would keep a process alive for an answer nobody reads.
+    const cancelListing = () => {
+      void this.sendSessionMessageOrThrow(
+        SessionInboundMessageSchema.parse({
+          type: "cancel_recent_provider_sessions_request",
+          requestId: resolvedRequestId,
+        }),
+      ).catch(() => undefined);
+    };
+    const abortPromise = new Promise<never>((_resolve, reject) => {
+      signal?.addEventListener(
+        "abort",
+        () => {
+          cancelListing();
+          reject(createAbortedError());
+        },
+        { once: true },
+      );
     });
+    return await Promise.race([
+      this.sendRequest({
+        requestId: resolvedRequestId,
+        message,
+        options: { skipQueue: true },
+        select: (msg) => {
+          if (msg.type !== "fetch_recent_provider_sessions_response") {
+            return null;
+          }
+          if (msg.payload.requestId !== resolvedRequestId) {
+            return null;
+          }
+          return msg.payload;
+        },
+      }),
+      abortPromise,
+    ]);
   }
 
   fetchWorkspaces(

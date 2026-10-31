@@ -412,7 +412,6 @@ export const ru: TranslationResources = {
     scope: {
       host: "Сессии на {{host}}",
       workspace: "Это рабочее пространство",
-      widenedBySearch: "Ищем во всех каталогах, чтобы найти сессию из другого проекта.",
     },
     filters: {
       all: "Все",

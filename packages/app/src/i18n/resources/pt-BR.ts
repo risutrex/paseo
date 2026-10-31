@@ -412,8 +412,6 @@ export const ptBR: TranslationResources = {
     scope: {
       host: "Sessões em {{host}}",
       workspace: "Este workspace",
-      widenedBySearch:
-        "Buscando em todos os diretórios para encontrar uma sessão de outro projeto.",
     },
     filters: {
       all: "Tudo",

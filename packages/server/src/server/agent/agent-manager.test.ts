@@ -11625,6 +11625,32 @@ test("listImportableSessions keeps requesting previews from providers that did n
   expect("previewsUnavailable" in result).toBe(false);
 });
 
+test("listImportableSessions does not start a provider the caller already gave up on", async () => {
+  const client = new RecordingPersistedAgentsClient("claude");
+  let called = false;
+  client.listImportableSessions = async () => {
+    called = true;
+    return [];
+  };
+  const manager = new AgentManager({
+    clients: { claude: client },
+    providerDefinitions: {
+      claude: { enabled: true, derivedFromProviderId: null },
+    },
+    logger,
+  });
+
+  const controller = new AbortController();
+  controller.abort();
+
+  const result = await manager.listImportableSessions({ signal: controller.signal });
+
+  // The client stopped waiting before the provider was reached, so the
+  // provider was never asked to work.
+  expect(called).toBe(false);
+  expect(result.sessions).toEqual([]);
+});
+
 test("listImportableSessions does not blame previews for a provider that failed", async () => {
   const failingClient = new RecordingPersistedAgentsClient("minimax-code");
   Object.defineProperty(failingClient, "capabilities", {

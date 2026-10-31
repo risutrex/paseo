@@ -409,7 +409,6 @@ export const ko: TranslationResources = {
     scope: {
       host: "{{host}}의 세션",
       workspace: "이 워크스페이스",
-      widenedBySearch: "다른 프로젝트의 세션을 찾기 위해 모든 디렉터리에서 검색 중입니다.",
     },
     filters: {
       all: "전체",
