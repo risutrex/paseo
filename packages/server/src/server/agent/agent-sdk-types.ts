@@ -768,6 +768,23 @@ export interface AgentSession {
    * every other provider.
    */
   stopProviderDelegations?(): Promise<ProviderDelegationStopResult>;
+  /**
+   * The messages the provider holds for a later turn, as it reports them now.
+   *
+   * Only a provider that keeps its own queue implements this; the absence of the
+   * method is the answer for every other provider.
+   */
+  getProviderQueue?(): Promise<ProviderQueueItemReport[]>;
+}
+
+/**
+ * One message a provider holds for a later turn, as the provider reports it.
+ */
+export interface ProviderQueueItemReport {
+  itemId: string;
+  text: string;
+  status: string;
+  createdAt: string | null;
 }
 
 /**

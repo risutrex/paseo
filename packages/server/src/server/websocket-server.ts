@@ -2068,6 +2068,8 @@ export class VoiceAssistantWebSocketServer {
         providerDelegationStop: true,
         // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gates after 2027-03-14; retain advertisement.
         projectedSubagentTimeline: true,
+        // COMPAT(providerQueue): added after v0.8.0, remove gates after 2027-06-01; retain advertisement.
+        providerQueue: true,
         wholeTurnTimeline: true,
         // COMPAT(providerSubagentNesting): added in v0.7, remove gate after 2027-03-04.
         providerSubagentNesting: true,

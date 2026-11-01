@@ -8712,3 +8712,74 @@ test("closes before admission when a protected-capable daemon is reached in lega
   expect(daemonReceived).toHaveLength(1);
   expect(JSON.parse(daemonReceived[0] as string)).toMatchObject({ type: "hello" });
 });
+
+test("reads the provider queue the host reports", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen({ features: { providerQueue: true } });
+  await connectPromise;
+
+  const queuePromise = client.getProviderQueue("agent-1", { requestId: "req-queue-1" });
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "agent.provider_queue.get.request",
+    agentId: "agent-1",
+    requestId: "req-queue-1",
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.provider_queue.get.response",
+      payload: {
+        requestId: "req-queue-1",
+        agentId: "agent-1",
+        supported: true,
+        items: [{ itemId: "item-1", text: "second thought", status: "queued", createdAt: null }],
+        error: null,
+      },
+    }),
+  );
+
+  await expect(queuePromise).resolves.toEqual({
+    requestId: "req-queue-1",
+    agentId: "agent-1",
+    supported: true,
+    items: [{ itemId: "item-1", text: "second thought", status: "queued", createdAt: null }],
+    error: null,
+  });
+});
+
+test("refuses a host that cannot report the provider queue", async () => {
+  // Asking an older host would leave the request unanswered; the gate says so
+  // before the app waits on it.
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen({ features: {} });
+  await connectPromise;
+
+  await expect(client.getProviderQueue("agent-1")).rejects.toThrow(
+    "Update the host to show the provider queue.",
+  );
+  expect(mock.sent).toHaveLength(0);
+});

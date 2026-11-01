@@ -58,6 +58,7 @@ import {
   type ImportedTimelineEntry,
   type ImportableProviderSession,
   type ListImportableSessionsOptions,
+  type ProviderQueueItemReport,
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
 import { toStoredAgentRecord } from "./agent-projections.js";
@@ -1384,6 +1385,25 @@ export class AgentManager {
   listProviderSubagents(parentAgentId: string): ProviderSubagentDescriptor[] {
     this.requirePublicAgent(parentAgentId);
     return this.providerSubagents.list(parentAgentId);
+  }
+
+  /**
+   * Reads the queue a provider keeps for later turns.
+   *
+   * The provider answers this on request, which is what makes a queued message
+   * visible after a reconnect: it does not replay its queue notifications.
+   * A provider without a queue reports `supported: false` instead of an empty
+   * list, so "no queue here" is not read as "nothing is waiting".
+   */
+  async fetchProviderQueue(
+    agentId: string,
+  ): Promise<{ supported: boolean; items: ProviderQueueItemReport[] }> {
+    this.requirePublicAgent(agentId);
+    const session = this.agents.get(agentId)?.session;
+    if (!session?.getProviderQueue) {
+      return { supported: false, items: [] };
+    }
+    return { supported: true, items: await session.getProviderQueue() };
   }
 
   listProviderSubagentActivity(): ProviderSubagentDescriptor[] {

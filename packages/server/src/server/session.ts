@@ -2826,6 +2826,8 @@ export class Session {
         return this.handleAgentTimelineListPromptsRequest(msg, source);
       case "agent.provider_subagents.list.request":
         return this.handleProviderSubagentListRequest(msg);
+      case "agent.provider_queue.get.request":
+        return this.handleAgentProviderQueueRequest(msg);
       case "agent.provider_subagents.timeline.get.request":
         return this.handleProviderSubagentTimelineRequest(msg, source);
       case "session.events.set_subscription.request": {
@@ -8240,6 +8242,47 @@ export class Session {
           requestId: msg.requestId,
           parentAgentId: msg.parentAgentId,
           subagents: [],
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  }
+
+  /**
+   * Reports the queue a provider keeps for later turns.
+   *
+   * A queued message produces no answer in the session stream, so this list is
+   * the only account of what is waiting. The provider is asked live: a cached
+   * copy would be the daemon guessing about work it does not own.
+   */
+  private async handleAgentProviderQueueRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.provider_queue.get.request" }>,
+  ): Promise<void> {
+    try {
+      await ensureUnarchivedAgentLoaded(msg.agentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+      });
+      const queue = await this.agentManager.fetchProviderQueue(msg.agentId);
+      this.emit({
+        type: "agent.provider_queue.get.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          supported: queue.supported,
+          items: queue.items,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.emit({
+        type: "agent.provider_queue.get.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          supported: false,
+          items: [],
           error: error instanceof Error ? error.message : String(error),
         },
       });

@@ -1997,6 +1997,25 @@ export const ProviderSubagentListRequestMessageSchema = z.object({
   requestId: z.string(),
 });
 
+// The messages a provider holds for a later turn. A provider that keeps its own
+// queue runs them on its own schedule, so the only honest report is the list it
+// gives on request: it is also the only way to see a position after reconnecting,
+// because the provider does not replay its queue notifications.
+export const ProviderQueueItemPayloadSchema = z.object({
+  itemId: z.string(),
+  // The message itself, not a summary: the composer shows what is waiting.
+  text: z.string(),
+  // The provider's own state name (e.g. "queued"). It is displayed as reported.
+  status: z.string(),
+  createdAt: z.string().nullable(),
+});
+
+export const ProviderQueueRequestMessageSchema = z.object({
+  type: z.literal("agent.provider_queue.get.request"),
+  agentId: z.string(),
+  requestId: z.string(),
+});
+
 export const ProviderSubagentTimelineRequestMessageSchema = z.object({
   type: z.literal("agent.provider_subagents.timeline.get.request"),
   parentAgentId: z.string(),
@@ -3435,6 +3454,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   AgentTimelineSearchRequestMessageSchema,
   AgentTimelineListPromptsRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
+  ProviderQueueRequestMessageSchema,
   ProviderSubagentTimelineRequestMessageSchema,
   SetAgentTimelineSubscriptionRequestMessageSchema,
   AgentForkContextRequestMessageSchema,
@@ -3858,6 +3878,9 @@ export const ServerInfoStatusPayloadSchema = z
         providerDelegationStop: z.boolean().optional(),
         // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gates after 2027-03-14; retain wire field.
         projectedSubagentTimeline: z.boolean().optional(),
+        // COMPAT(providerQueue): added after v0.8.0, remove gates after 2027-06-01; retain wire field.
+        // The daemon can report the queue a provider keeps for later turns.
+        providerQueue: z.boolean().optional(),
         wholeTurnTimeline: z.boolean().optional(),
         // COMPAT(providerSubagentNesting): added in v0.7, remove gate after 2027-03-04.
         providerSubagentNesting: z.boolean().optional(),
@@ -4921,6 +4944,19 @@ export const ProviderSubagentListResponseMessageSchema = z.object({
     requestId: z.string(),
     parentAgentId: z.string(),
     subagents: z.array(ProviderSubagentDescriptorPayloadSchema),
+    error: z.string().nullable(),
+  }),
+});
+
+export const ProviderQueueResponseMessageSchema = z.object({
+  type: z.literal("agent.provider_queue.get.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    // False when the provider has no queue at all, so an empty list is never
+    // mistaken for "nothing is waiting".
+    supported: z.boolean(),
+    items: z.array(ProviderQueueItemPayloadSchema),
     error: z.string().nullable(),
   }),
 });
@@ -7161,6 +7197,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentTimelineSearchResponseMessageSchema,
   AgentTimelineListPromptsResponseMessageSchema,
   ProviderSubagentListResponseMessageSchema,
+  ProviderQueueResponseMessageSchema,
   ProviderSubagentTimelineResponseMessageSchema,
   ProviderSubagentUpdateMessageSchema,
   SetAgentTimelineSubscriptionResponseMessageSchema,

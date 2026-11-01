@@ -4015,6 +4015,107 @@ describe("ACPAgentSession", () => {
     ).toHaveLength(1);
   });
 
+  test("reports the provider queue when the provider advertises one", async () => {
+    // A queued message has no answer in the session stream, so the list is the
+    // only place its position can be seen - including after a reconnect, when the
+    // provider has already sent (and stopped replaying) its queue notifications.
+    const session = createSession();
+    const extMethod = vi.fn(async (method: string) => {
+      if (method !== "mcode/session/queue/list") {
+        throw new Error(`unexpected method ${method}`);
+      }
+      return {
+        items: [
+          {
+            itemId: "item-1",
+            sessionId: "session-1",
+            status: "queued",
+            content: "second thought",
+            createdAt: 1_700_000_000_000,
+          },
+        ],
+      };
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/list"] },
+    };
+
+    await expect(session.getProviderQueue()).resolves.toEqual([
+      {
+        itemId: "item-1",
+        text: "second thought",
+        status: "queued",
+        createdAt: new Date(1_700_000_000_000).toISOString(),
+      },
+    ]);
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/list", { sessionId: "session-1" });
+  });
+
+  test("does not ask a provider that never advertised a queue list", async () => {
+    // Guessing would turn a missing feature into an error the user cannot act on.
+    const session = createSession();
+    const extMethod = vi.fn();
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    await expect(session.getProviderQueue()).resolves.toEqual([]);
+    expect(extMethod).not.toHaveBeenCalled();
+  });
+
+  test("reports a message leaving the provider queue as a result it never gave", async () => {
+    // Measured against MiniMax Code 0.7.3: a queued message produces no
+    // session/update, so its answer never reaches the timeline. The only honest
+    // report is that the position left the queue and nothing came back.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    const notifications = (): string[] =>
+      events.flatMap((event) =>
+        event.type === "timeline" && event.item.type === "notification" ? [event.item.message] : [],
+      );
+
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-1",
+      items: [{ itemId: "item-1", status: "queued", content: "second thought", createdAt: 1 }],
+    });
+    // Seeing a position for the first time is not a departure.
+    expect(notifications()).toEqual([]);
+
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-1",
+      items: [],
+    });
+
+    expect(notifications().some((message) => /left the provider.s queue/.test(message))).toBe(true);
+  });
+
+  test("ignores a queue notification that belongs to another session", async () => {
+    // The provider may publish the queue of another session on the same client.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-2",
+      items: [{ itemId: "item-9", status: "queued", content: "elsewhere", createdAt: 1 }],
+    });
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-2",
+      items: [],
+    });
+
+    expect(events.some((event) => event.type === "timeline")).toBe(false);
+  });
+
   test("reports the queue acceptance as unknown when the provider never answers", async () => {
     // An enqueue that fails on the way back may still have landed. Repeating it could
     // duplicate the message and calling it queued would invent a run, so the turn says

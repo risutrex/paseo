@@ -423,6 +423,57 @@ export function mergeACPClientCapabilityMeta(
 }
 
 /**
+ * One message the provider holds for a later turn.
+ *
+ * text and status are the provider's own report; nothing here is inferred.
+ */
+export interface ProviderQueueItemSnapshot {
+  itemId: string;
+  text: string;
+  status: string;
+  createdAt: string | null;
+}
+
+/**
+ * Reads the queue the provider reports, from either queue/list or a
+ * queue_update notification.
+ *
+ * Both carry the items under `items`, so one reader serves the request and the
+ * notification. A malformed entry is dropped instead of failing the whole list:
+ * one unreadable item must not hide the others.
+ */
+function readProviderQueueItems(params: unknown): ProviderQueueItemSnapshot[] | null {
+  if (!isRecord(params)) {
+    return null;
+  }
+  const raw = (params as { items?: unknown }).items;
+  if (!Array.isArray(raw)) {
+    return null;
+  }
+  const items: ProviderQueueItemSnapshot[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const itemId = typeof entry.itemId === "string" ? entry.itemId : null;
+    if (!itemId) {
+      continue;
+    }
+    const createdAtMs =
+      typeof entry.createdAt === "number" && Number.isFinite(entry.createdAt)
+        ? entry.createdAt
+        : null;
+    items.push({
+      itemId,
+      text: typeof entry.content === "string" ? entry.content : "",
+      status: typeof entry.status === "string" ? entry.status : "queued",
+      createdAt: createdAtMs === null ? null : new Date(createdAtMs).toISOString(),
+    });
+  }
+  return items;
+}
+
+/**
  * Reads the queue id the provider assigned to a message it queued.
  *
  * Both halves of the answer matter: `status` is the provider's own word that it
@@ -478,6 +529,17 @@ const MCODE_QUEUE_DELETE_METHOD = "mcode/session/queue/delete";
 // withdraw an item whose id has not arrived yet, so it waits for that answer
 // instead of guessing whether a message is about to appear in the queue.
 const ACP_QUEUE_ACK_WAIT_MS = 5_000;
+// What the provider is holding for later turns. The list is the only report that
+// survives a reconnect: the provider does not replay its queue notifications after
+// a resume, so a client that reconnects has to ask. Bound the call - a provider
+// stuck in a turn would otherwise hold the reply forever.
+const MCODE_QUEUE_LIST_METHOD = "mcode/session/queue/list";
+const ACP_QUEUE_LIST_TIMEOUT_MS = 5_000;
+// The provider publishes the whole queue whenever it changes. This is how a
+// position is seen leaving the queue, which the session stream never reports:
+// measured against MiniMax Code 0.7.3, a queued message produces no
+// session/update, so its answer never arrives through the timeline.
+const MCODE_QUEUE_UPDATE_NOTIFICATION = "mcode/session/queue_update";
 // An enqueue that failed, or answered without a status and an item id, may still
 // have landed, and the provider does not deduplicate `clientRequestId`. Calling
 // the acceptance unconfirmed is the only report that stays true either way.
@@ -2345,6 +2407,18 @@ export class ACPAgentSession implements AgentSession, ACPClient {
    * the item back the moment its id exists, because the user already said no.
    */
   private readonly stoppedWhileQueueing = new Set<string>();
+  /**
+   * The provider's queue as it last reported it.
+   *
+   * This is a copy of a provider report, never a promise: an item can leave the
+   * queue without the session ever receiving a result for it.
+   */
+  private providerQueueItems: ProviderQueueItemSnapshot[] = [];
+  /**
+   * Items this client took back. Their departure from the queue is the client's
+   * own doing, so it must not be reported as a message that ran unobserved.
+   */
+  private readonly withdrawnQueueItemIds = new Set<string>();
   private readonly terminateProcess: ProcessTerminator;
 
   constructor(config: AgentSessionConfig, options: ACPAgentSessionOptions) {
@@ -3443,6 +3517,89 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   /**
+   * Reports whether the provider lets this client read its queue.
+   *
+   * Reading is what makes a queued message visible at all: the provider sends
+   * no answer for a queued message through the session stream, so the list is
+   * the only place its fate can be seen.
+   */
+  private supportsVendorQueueList(): boolean {
+    return this.advertisedProviderMethods().includes(MCODE_QUEUE_LIST_METHOD);
+  }
+
+  /**
+   * Reports the messages the provider is holding for later turns, as it reports
+   * them right now.
+   *
+   * The provider is the owner of its queue: reading it on demand is what lets a
+   * reconnecting client show a position again, because the provider does not
+   * replay its queue notifications after a resume. A failure is thrown rather
+   * than reported as an empty queue - "nothing is waiting" and "the queue could
+   * not be read" are different facts, and only one of them is true.
+   */
+  async getProviderQueue(): Promise<ProviderQueueItemSnapshot[]> {
+    if (!this.supportsVendorQueueList()) {
+      return [];
+    }
+    const connection = this.connection;
+    const sessionId = this.sessionId;
+    if (!connection || !sessionId) {
+      return [];
+    }
+    const response = await withTimeout(
+      connection.extMethod(MCODE_QUEUE_LIST_METHOD, { sessionId }),
+      ACP_QUEUE_LIST_TIMEOUT_MS,
+      `ACP queue list did not answer within ${ACP_QUEUE_LIST_TIMEOUT_MS}ms`,
+    );
+    const items = readProviderQueueItems(response) ?? [];
+    this.applyProviderQueueSnapshot(items);
+    return items;
+  }
+
+  /**
+   * Records the provider queue and reports the items that left it.
+   *
+   * A queued message has no answer in the session stream: measured against
+   * MiniMax Code 0.7.3, the item leaves the queue when the running turn ends and
+   * no `session/update` ever carries its text or its reply. Reporting the
+   * departure is therefore the only honest account of what became of it - and it
+   * says exactly that, instead of promising a result that never arrives.
+   */
+  private applyProviderQueueSnapshot(items: ProviderQueueItemSnapshot[]): void {
+    const previous = this.providerQueueItems;
+    this.providerQueueItems = items;
+    if (previous.length === 0) {
+      return;
+    }
+    const present = new Set(items.map((item) => item.itemId));
+    const leftBehind = previous.filter(
+      (item) => !present.has(item.itemId) && !this.withdrawnQueueItemIds.delete(item.itemId),
+    );
+    if (leftBehind.length === 0) {
+      return;
+    }
+    for (const item of leftBehind) {
+      this.queuedProviderItems.forEach((itemId, turnId) => {
+        if (itemId === item.itemId) {
+          this.queuedProviderItems.delete(turnId);
+        }
+      });
+    }
+    this.pushEvent(
+      this.wrapTimeline({
+        type: "notification",
+        level: "warning",
+        message:
+          "A message left the provider's queue. The provider does not report the result of a queued message, so whether it ran is unknown.",
+      }),
+    );
+    this.logger.info(
+      { items: leftBehind.map((item) => item.itemId) },
+      "ACP provider drained queued messages without reporting their result",
+    );
+  }
+
+  /**
    * Reports whether the provider advertised a delegation extension.
    */
   private supportsVendorDelegation(): boolean {
@@ -3830,6 +3987,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         this.reportQueuedMessageStuck(turnId, itemId);
         return;
       }
+      // The item left the queue because this client took it back, so its
+      // departure is not a message that ran unobserved.
+      this.withdrawnQueueItemIds.add(itemId);
       this.pushEvent(
         this.wrapTimeline({
           type: "notification",
@@ -4182,6 +4342,16 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       // Only the tree of this session belongs to it.
       if (snapshot !== undefined && (sessionId === null || sessionId === this.sessionId)) {
         this.applyDelegationSnapshot(snapshot);
+      }
+    }
+
+    if (method === MCODE_QUEUE_UPDATE_NOTIFICATION) {
+      // The provider publishes the whole queue whenever it changes. Only its own
+      // session queue belongs to this session.
+      const sessionId = typeof params.sessionId === "string" ? params.sessionId : null;
+      const items = readProviderQueueItems(params);
+      if (items && (sessionId === null || sessionId === this.sessionId)) {
+        this.applyProviderQueueSnapshot(items);
       }
     }
 
@@ -4906,6 +5076,24 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.submittedUserMessageTurnId = null;
     }
     this.pushEvent(event);
+    void this.refreshProviderQueueAfterTurn();
+  }
+
+  /**
+   * Re-reads the provider queue when a turn ends.
+   *
+   * The turn that held the queue is over, so this is the moment a position moves.
+   * Reading it here keeps the report in step without polling a busy provider.
+   */
+  private async refreshProviderQueueAfterTurn(): Promise<void> {
+    if (!this.supportsVendorQueueList()) {
+      return;
+    }
+    try {
+      await this.getProviderQueue();
+    } catch (error) {
+      this.logger.warn({ err: error }, "ACP provider did not report its queue after a turn");
+    }
   }
 
   private cancelPendingPermissions(): void {

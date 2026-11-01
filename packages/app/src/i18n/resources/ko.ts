@@ -166,6 +166,8 @@ export const ko: TranslationResources = {
       dropFilesHere: "여기에 파일을 끌어다 놓으세요",
       editQueuedMessage: "대기 중인 메시지 편집",
       sendQueuedMessageNow: "대기 중인 메시지 지금 보내기",
+      providerQueueLabel: "프로바이더 대기열에 있음 - 여기서는 편집할 수 없습니다",
+      providerQueueStatus: "{{status}}",
       openImage: "이미지 첨부 열기",
       removeImage: "이미지 첨부 제거",
       removeFile: "파일 첨부 제거",

@@ -162,6 +162,8 @@ export const en = {
       dropFilesHere: "Drop files here",
       editQueuedMessage: "Edit queued message",
       sendQueuedMessageNow: "Send queued message now",
+      providerQueueLabel: "In the provider's queue - not editable here",
+      providerQueueStatus: "{{status}}",
       openImage: "Open image attachment",
       removeImage: "Remove image attachment",
       removeFile: "Remove file attachment",

@@ -734,6 +734,10 @@ export type ProviderSubagentTimelinePayload = Extract<
   SessionOutboundMessage,
   { type: "agent.provider_subagents.timeline.get.response" }
 >["payload"];
+export type ProviderQueuePayload = Extract<
+  SessionOutboundMessage,
+  { type: "agent.provider_queue.get.response" }
+>["payload"];
 export interface FetchProviderSubagentTimelineOptions {
   direction?: ProviderSubagentTimelinePayload["direction"];
   cursor?: FetchAgentTimelineCursor;
@@ -3819,6 +3823,44 @@ export class DaemonClient {
       options: { skipQueue: true },
       select: (response) =>
         response.type === "agent.provider_subagents.list.response" &&
+        response.payload.requestId === requestId
+          ? response.payload
+          : null,
+    });
+    if (payload.error) {
+      throw new Error(payload.error);
+    }
+    return payload;
+  }
+
+  /**
+   * Reads the messages a provider holds for later turns.
+   *
+   * A queued message has no answer in the session stream, so this request is the
+   * only way to show its position - including after a reconnect, when the
+   * provider has already sent (and stopped replaying) its queue notifications.
+   */
+  async getProviderQueue(
+    agentId: string,
+    options: { requestId?: string; timeout?: number } = {},
+  ): Promise<ProviderQueuePayload> {
+    // COMPAT(providerQueue): added after v0.8.0, remove gate after 2027-06-01.
+    if (this.lastServerInfoMessage?.features?.providerQueue !== true) {
+      throw new Error("Update the host to show the provider queue.");
+    }
+    const requestId = this.createRequestId(options.requestId);
+    const message = SessionInboundMessageSchema.parse({
+      type: "agent.provider_queue.get.request",
+      agentId,
+      requestId,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      timeout: options.timeout,
+      options: { skipQueue: true },
+      select: (response) =>
+        response.type === "agent.provider_queue.get.response" &&
         response.payload.requestId === requestId
           ? response.payload
           : null,

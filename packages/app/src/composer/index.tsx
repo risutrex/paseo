@@ -56,6 +56,7 @@ import {
 import { ContextWindowMeter } from "@/components/context-window-meter";
 import { useImageAttachmentPicker } from "@/hooks/use-image-attachment-picker";
 import {
+  EMPTY_PROVIDER_QUEUE,
   selectAgentSentMessages,
   selectAgentTurnPresentation,
   useSessionStore,
@@ -72,6 +73,7 @@ import {
 import type { ImageAttachment, MessagePayload, TextReplacement } from "./types";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import type { DraftCommandTarget } from "@/hooks/use-agent-commands-query";
+import { ProviderQueueTrack } from "./provider-queue";
 import { encodeImages } from "@/utils/encode-images";
 import { focusWithRetries } from "@/utils/web-focus";
 import {
@@ -1308,6 +1310,28 @@ function ComposerContentImpl({
 
   const setQueuedMessages = useSessionStore((state) => state.setQueuedMessages);
 
+  const providerQueue =
+    useSessionStore((state) => state.sessions[serverId]?.providerQueues?.get(agentId)) ??
+    EMPTY_PROVIDER_QUEUE;
+  const refreshProviderQueue = useSessionStore((state) => state.refreshProviderQueue);
+
+  // The provider does not replay its queue after a reconnect, so the position is
+  // read when this composer opens - that is what brings it back. It is read again
+  // when a turn ends, never on a timer: polling would only disturb a busy provider.
+  useEffect(() => {
+    if (!isConnected) return;
+    void refreshProviderQueue(serverId, agentId);
+  }, [refreshProviderQueue, serverId, agentId, isConnected]);
+
+  const previousAgentStatus = useRef(agentState.status);
+  useEffect(() => {
+    const previous = previousAgentStatus.current;
+    previousAgentStatus.current = agentState.status;
+    if (previous === agentState.status) return;
+    if (agentState.status !== "idle" && agentState.status !== "error") return;
+    void refreshProviderQueue(serverId, agentId);
+  }, [agentState.status, refreshProviderQueue, serverId, agentId]);
+
   const isCompactFormFactor = useIsCompactFormFactor();
   const isCompactLayout = resolveCompactLayout(isCompactLayoutOverride, isCompactFormFactor);
   const isDesktopWebBreakpoint = resolveIsDesktopWebBreakpoint(isCompactFormFactor);
@@ -2362,6 +2386,22 @@ function ComposerContentImpl({
     [handleEditQueuedMessage, handleSendQueuedNow, queuedMessages, t],
   );
 
+  const providerQueueStatusLabel = useCallback(
+    (status: string) => t("composer.attachments.providerQueueStatus", { status }),
+    [t],
+  );
+
+  const providerQueueList = useMemo(
+    () => (
+      <ProviderQueueTrack
+        items={providerQueue.items}
+        label={t("composer.attachments.providerQueueLabel")}
+        statusLabel={providerQueueStatusLabel}
+      />
+    ),
+    [providerQueue.items, providerQueueStatusLabel, t],
+  );
+
   const autocompleteConfiguration = useMemo(
     () => ({
       setUserInput: replaceUserInput,
@@ -2438,6 +2478,7 @@ function ComposerContentImpl({
         {/* Input area */}
         <View style={inputAreaContainerStyle}>
           <View style={inputAreaContentStyle}>
+            {isFullscreen ? null : providerQueueList}
             {isFullscreen ? null : queueList}
             {!isFullscreen && sendErrorNode}
 
@@ -2689,6 +2730,7 @@ const styles = StyleSheet.create((theme: Theme) => ({
   queueSendButton: {
     backgroundColor: theme.colors.accent,
   },
+
   sendErrorText: {
     color: theme.colors.palette.red[500],
     fontSize: theme.fontSize.base,
