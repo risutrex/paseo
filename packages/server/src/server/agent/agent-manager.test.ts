@@ -12967,3 +12967,78 @@ test("turn_queued ends the foreground run and frees the agent for the next promp
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+class ProviderDelegationStopClient extends TestAgentClient {
+  readonly stop = vi.fn(async () => ({ acknowledged: true }));
+  private readonly supportsStop: boolean;
+
+  constructor(provider: AgentProvider = "minimax-code", supportsStop = true) {
+    super(provider);
+    this.supportsStop = supportsStop;
+  }
+
+  override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+    const session = new TestAgentSession(config);
+    if (!this.supportsStop) {
+      return session;
+    }
+    return Object.assign(session, { stopProviderDelegations: this.stop });
+  }
+}
+
+test("stopProviderDelegations asks the session that owns the tree to stop it", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-delegation-stop-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new ProviderDelegationStopClient();
+  const manager = new AgentManager({
+    clients: { "minimax-code": client },
+    registry: storage,
+    logger,
+  });
+
+  try {
+    const agent = await manager.createAgent(
+      { provider: "minimax-code", cwd: workdir, title: "Parent" },
+      undefined,
+      { workspaceId: undefined },
+    );
+
+    await expect(manager.stopProviderDelegations(agent.id)).resolves.toEqual({
+      acknowledged: true,
+    });
+    expect(client.stop).toHaveBeenCalledTimes(1);
+  } finally {
+    await manager.closeAgent(manager.listAgents()[0]!.id);
+    await manager.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("stopProviderDelegations rejects a provider that cannot stop its delegations", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-delegation-stop-unsupported-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new ProviderDelegationStopClient("minimax-code", false);
+  const manager = new AgentManager({
+    clients: { "minimax-code": client },
+    registry: storage,
+    logger,
+  });
+
+  try {
+    const agent = await manager.createAgent(
+      { provider: "minimax-code", cwd: workdir, title: "Parent" },
+      undefined,
+      { workspaceId: undefined },
+    );
+
+    // A plain interruption would leave the provider's children running, so the
+    // request is refused instead of approximated.
+    await expect(manager.stopProviderDelegations(agent.id)).rejects.toThrow(
+      "does not support stopping delegated tasks",
+    );
+  } finally {
+    await manager.closeAgent(manager.listAgents()[0]!.id);
+    await manager.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

@@ -69,6 +69,23 @@ export function providerSubagentLifecycleStatus(
   return "idle";
 }
 
+/**
+ * Provider tasks of one parent that the tree still reports as running.
+ *
+ * This is the only report of what a stop left behind: the provider's receipt
+ * calls the root stopped even for an idle tree.
+ */
+export function countRunningProviderSubagents(serverId: string, parentAgentId: string): number {
+  const prefix = parentPrefix(serverId, parentAgentId);
+  let running = 0;
+  for (const [key, subagent] of useProviderSubagentStore.getState().descriptors) {
+    if (key.startsWith(prefix) && subagent.status === "running") {
+      running += 1;
+    }
+  }
+  return running;
+}
+
 type ProviderSubagentListClient = Pick<DaemonClient, "listProviderSubagents">;
 
 const pendingListRequests = new WeakMap<ProviderSubagentListClient, Map<string, Promise<void>>>();

@@ -1,5 +1,5 @@
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
-import { memo, useCallback, type ReactElement } from "react";
+import { memo, useCallback, useState, type ReactElement } from "react";
 import { WorkspaceDiffStatPill } from "@/composer/diff-stat-pill";
 import { useWorkspaceHasDiffStat } from "@/composer/workspace-diff-stat";
 import { AgentTaskList } from "@/composer/task-list";
@@ -9,6 +9,10 @@ import { usePaneContext } from "@/panels/pane-context";
 import { useSettings } from "@/hooks/use-settings";
 import { PluginComposerPills } from "@/plugins";
 import { useSessionStore } from "@/stores/session-store";
+import { useToast } from "@/contexts/toast-context";
+import { i18n } from "@/i18n/i18next";
+import { confirmDialog } from "@/utils/confirm-dialog";
+import { toErrorMessage } from "@/utils/error-messages";
 import {
   type ArchiveFinishedStatus,
   useArchiveSubagent,
@@ -16,6 +20,13 @@ import {
   useSubagentSheetTab,
   type SubagentRow,
 } from "@/subagents";
+import {
+  IDLE_PROVIDER_DELEGATION_STOP_STATUS,
+  requestStopProviderDelegations,
+  type ProviderDelegationStopStatus,
+} from "@/subagents/provider-delegation-stop";
+import { countRunningProviderSubagents } from "@/subagents/provider-store";
+import { formatProviderName } from "@/subagents/track-presentation";
 import { ParentAgentPill } from "@/subagents/parent";
 import { SubagentsTrack } from "@/subagents/track";
 import type { TodoEntry } from "@/types/stream";
@@ -60,6 +71,18 @@ export const AgentTracks = memo(function AgentTracks({
   const canDetachSubagents = useSessionStore(
     (state) => state.sessions[serverId]?.serverInfo?.features?.agentDetach === true,
   );
+  // Two things have to hold: the daemon accepts the request, and this agent's
+  // provider advertised the stop. Anything less leaves the rows read-only rather
+  // than offering a stop that cannot be carried out.
+  const canStopProviderDelegations = useSessionStore((state) => {
+    const session = state.sessions[serverId];
+    if (session?.serverInfo?.features?.providerDelegationStop !== true) {
+      return false;
+    }
+    const agent = session.agents.get(agentId) ?? session.agentDetails.get(agentId);
+    return agent?.capabilities.supportsProviderDelegationStop === true;
+  });
+  const toast = useToast();
   const archiveSubagent = useArchiveSubagent();
   const detachSubagent = useDetachSubagent();
   const openSubagentTarget = useCallback(
@@ -90,6 +113,42 @@ export const AgentTracks = memo(function AgentTracks({
     },
     [openSubagentTarget, serverId, workspaceId],
   );
+  const [providerDelegationStopStatus, setProviderDelegationStopStatus] =
+    useState<ProviderDelegationStopStatus>(IDLE_PROVIDER_DELEGATION_STOP_STATUS);
+  const handleStopProviderDelegations = useCallback(async () => {
+    const activeTaskCount = subagentRows.reduce(
+      (count, row) => (row.kind === "provider" && row.status === "running" ? count + 1 : count),
+      0,
+    );
+    const provider = subagentRows.find((row) => row.kind === "provider")?.provider ?? agentId;
+    setProviderDelegationStopStatus({ kind: "requesting" });
+    const status = await requestStopProviderDelegations(
+      {
+        serverId,
+        agentId,
+        providerLabel: formatProviderName(provider),
+        activeTaskCount,
+      },
+      {
+        confirm: confirmDialog,
+        t: (key, options) => i18n.t(key, options as never) as unknown as string,
+        stopProviderDelegations: async ({ serverId: targetServerId, agentId: targetAgentId }) => {
+          const client = useSessionStore.getState().sessions[targetServerId]?.client;
+          if (!client) {
+            throw new Error(i18n.t("workspaceSetup.errors.hostDisconnected"));
+          }
+          return client.stopProviderDelegations(targetAgentId);
+        },
+        // Read after the stop: the daemon refreshes the tree before answering, so
+        // the rows already carry the statuses the user is about to see.
+        countActiveTasks: () => countRunningProviderSubagents(serverId, agentId),
+        reportError: (error) => {
+          toast.error(toErrorMessage(error));
+        },
+      },
+    );
+    setProviderDelegationStopStatus(status);
+  }, [agentId, serverId, subagentRows, toast]);
   const handleOpenProviderSubagent = useCallback(
     (ownerAgentId: string, subagentId: string) => {
       openSubagentTarget({
@@ -139,6 +198,10 @@ export const AgentTracks = memo(function AgentTracks({
         onArchiveFinished={onArchiveFinished}
         archiveFinishedStatus={archiveFinishedStatus}
         onDetachSubagent={canDetachSubagents ? detachSubagent : undefined}
+        onStopProviderDelegations={
+          canStopProviderDelegations ? handleStopProviderDelegations : undefined
+        }
+        providerDelegationStopStatus={providerDelegationStopStatus}
       />
       <PluginComposerPills
         serverId={serverId}

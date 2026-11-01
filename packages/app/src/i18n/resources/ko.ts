@@ -1961,6 +1961,19 @@ export const ko: TranslationResources = {
     archiveTooltip: "서브에이전트 보관",
     archiveFinishedAction: "완료된 하위 에이전트 보관",
     archiveFinishedRetry: "다시 시도 ({{failed}}/{{total}})",
+    providerInternalTask: "{{provider}} 내부 작업",
+    providerLogUnavailable: "공급자가 이 작업의 기록을 공유하지 않습니다. 상태만 표시됩니다.",
+    stopProviderDelegationsAction: "부모와 위임된 작업 모두 중지",
+    stopProviderDelegationsRequesting: "중지하는 중...",
+    stopProviderDelegationsDialogTitle: "{{provider}}을(를) 중지할까요?",
+    stopProviderDelegationsDialogMessage:
+      "부모 턴과 {{provider}}이(가) 위임한 모든 작업(실행 중 {{count}}개)을 중지합니다. 공급자가 허용하면 나중에 실행하려고 대기열에 넣은 메시지가 철회되고, 허용하지 않으면 나중에 실행될 수 있습니다.",
+    stopProviderDelegationsConfirm: "모두 중지",
+    stopProviderDelegationsStopped: "중지됨: 실행 중인 위임 작업이 없습니다",
+    stopProviderDelegationsPartial: "위임된 작업 {{count}}개가 아직 실행 중입니다",
+    stopProviderDelegationsUnknown:
+      "중지 결과를 알 수 없습니다: 공급자가 확인하지 않았습니다. 작업 상태를 확인하세요.",
+    stopProviderDelegationsFailed: "위임된 작업을 중지하지 못했습니다: {{message}}",
   },
   panels: {
     draft: {

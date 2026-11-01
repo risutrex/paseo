@@ -1951,6 +1951,19 @@ export const ar: TranslationResources = {
     archiveTooltip: "أرشفة الوكيل الفرعي",
     archiveFinishedAction: "أرشفة الوكلاء الفرعيين المكتملين",
     archiveFinishedRetry: "إعادة المحاولة ({{failed}}/{{total}})",
+    providerInternalTask: "مهمة داخلية لـ {{provider}}",
+    providerLogUnavailable: "لا يشارك المزوّد سجل هذه المهمة. تُعرض الحالة فقط.",
+    stopProviderDelegationsAction: "إيقاف الوكيل الأصلي والمهام المفوّضة",
+    stopProviderDelegationsRequesting: "جارٍ الإيقاف...",
+    stopProviderDelegationsDialogTitle: "إيقاف {{provider}}؟",
+    stopProviderDelegationsDialogMessage:
+      "سيؤدي هذا إلى إيقاف دور الوكيل الأصلي وكل مهمة فوّضها {{provider}} ({{count}} قيد التشغيل). تُسحب الرسائل التي وضعها المزوّد في قائمة الانتظار إذا كان يسمح بذلك، وإلا فقد تُنفَّذ لاحقًا.",
+    stopProviderDelegationsConfirm: "إيقاف الكل",
+    stopProviderDelegationsStopped: "تم الإيقاف: لا توجد مهام مفوّضة قيد التشغيل",
+    stopProviderDelegationsPartial: "ما زالت {{count}} مهام مفوّضة قيد التشغيل",
+    stopProviderDelegationsUnknown:
+      "نتيجة الإيقاف غير معروفة: لم يؤكدها المزوّد. تحقّق من حالات المهام.",
+    stopProviderDelegationsFailed: "تعذّر إيقاف المهام المفوّضة: {{message}}",
   },
   panels: {
     draft: {

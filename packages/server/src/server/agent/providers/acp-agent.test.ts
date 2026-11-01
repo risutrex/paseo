@@ -6703,3 +6703,150 @@ describe("ACP import cancellation", () => {
     });
   });
 });
+
+describe("provider delegation stop", () => {
+  const STOP_METHOD = "mcode/session/delegation/stop";
+  const GET_METHOD = "mcode/session/delegation/get";
+  const EXTENSIONS_KEY = "minimax-code/extensions";
+
+  function stubDelegationConnection(args: { stopResponse?: unknown; snapshot?: unknown }): {
+    connection: ACPSessionInternals["connection"];
+    extMethod: ReturnType<typeof vi.fn>;
+  } {
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === STOP_METHOD) {
+        return args.stopResponse ?? { receipt: {} };
+      }
+      if (method === GET_METHOD) {
+        return args.snapshot ?? { snapshot: { schemaVersion: 1, members: [] } };
+      }
+      return {};
+    });
+    return {
+      extMethod,
+      connection: { prompt: vi.fn(), extMethod } as unknown as ACPSessionInternals["connection"],
+    };
+  }
+
+  test("calls the stop on the root session and reads what actually stopped from the tree", async () => {
+    // A child is not an addressable turn: only the root id stops the tree. The
+    // receipt comes back with an empty stoppedSessionIds and calls the root
+    // stopped either way, so the answer is `acknowledged` and the rows carry the
+    // statuses the user reads.
+    const session = createSession();
+    const internals = asInternals<ACPSessionInternals>(session);
+    internals.sessionId = "root-1";
+    internals.agentMeta = { [EXTENSIONS_KEY]: { methods: [GET_METHOD, STOP_METHOD] } };
+    const stub = stubDelegationConnection({
+      stopResponse: {
+        receipt: {
+          schemaVersion: 1,
+          rootSessionId: "root-1",
+          rootStopped: true,
+          stoppedSessionIds: [],
+          activeSessionIds: [],
+          failedSessionIds: [],
+        },
+      },
+      snapshot: {
+        snapshot: {
+          schemaVersion: 1,
+          rootSessionId: "root-1",
+          members: [
+            {
+              sessionId: "child-1",
+              parentSessionId: "root-1",
+              agentName: "explore",
+              task: "List files",
+              status: "stopped",
+              createdAtMs: 1_700_000_000_000,
+              updatedAtMs: 1_700_000_002_000,
+            },
+          ],
+        },
+      },
+    });
+    internals.connection = stub.connection;
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await expect(session.stopProviderDelegations()).resolves.toEqual({ acknowledged: true });
+
+    expect(stub.extMethod).toHaveBeenCalledWith(STOP_METHOD, { sessionId: "root-1" });
+    // The tree is read again afterwards, so the rows report the real status.
+    expect(stub.extMethod).toHaveBeenCalledWith(GET_METHOD, { sessionId: "root-1" });
+    const rows = events.flatMap((event) =>
+      event.type === "provider_subagent" && event.event.type === "upsert"
+        ? [{ id: event.event.id, status: event.event.status }]
+        : [],
+    );
+    expect(rows).toEqual([{ id: "child-1", status: "canceled" }]);
+  });
+
+  test("refuses to stop when the provider never advertised the stop method", async () => {
+    const session = createSession();
+    const internals = asInternals<ACPSessionInternals>(session);
+    internals.sessionId = "root-1";
+    internals.agentMeta = { [EXTENSIONS_KEY]: { methods: [GET_METHOD] } };
+    const stub = stubDelegationConnection({});
+    internals.connection = stub.connection;
+
+    await expect(session.stopProviderDelegations()).rejects.toThrow(
+      "does not support stopping delegated tasks",
+    );
+    expect(stub.extMethod).not.toHaveBeenCalled();
+  });
+
+  function makeInitSession(methods: string[] | null) {
+    class TestSession extends ACPAgentSession {
+      protected override async spawnProcess(): Promise<SpawnedACPProcess> {
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            prompt: vi.fn(),
+            newSession: vi.fn().mockResolvedValue({
+              sessionId: "root-1",
+              modes: null,
+              models: null,
+              configOptions: [],
+            }),
+            extMethod: vi.fn().mockResolvedValue({ snapshot: { members: [] } }),
+          } as unknown as ClientSideConnection,
+          initialize: {
+            agentCapabilities: {},
+            ...(methods ? { _meta: { [EXTENSIONS_KEY]: { methods } } } : {}),
+          },
+        } as unknown as SpawnedACPProcess;
+      }
+    }
+
+    return new TestSession(
+      { provider: "minimax-code", cwd: "/tmp/paseo-acp-test" },
+      {
+        provider: "minimax-code",
+        logger: createTestLogger(),
+        defaultCommand: ["mcode", "--acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+      },
+    );
+  }
+
+  test("advertises the stop to the app only after the provider names it", async () => {
+    const advertised = makeInitSession([GET_METHOD, STOP_METHOD]);
+    await advertised.initializeNewSession();
+    expect(advertised.capabilities.supportsProviderDelegationStop).toBe(true);
+
+    const silent = makeInitSession([GET_METHOD]);
+    await silent.initializeNewSession();
+    expect(silent.capabilities.supportsProviderDelegationStop).toBe(false);
+  });
+});

@@ -3,7 +3,7 @@ import { useHosts } from "@/runtime/host-runtime";
 import { useCallback, useMemo, type ReactElement, type ReactNode } from "react";
 import { Text, View } from "react-native";
 import { useTranslation } from "react-i18next";
-import { Archive, Unlink } from "lucide-react-native";
+import { Archive, CircleStop, Unlink } from "lucide-react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useProviderIcon } from "@/components/provider-icons";
 import { ComposerTrackActions, ComposerTrackPill, ComposerTrackRow } from "@/composer/tracks";
@@ -23,12 +23,19 @@ import type { SheetTab } from "@/stores/workspace-layout-store";
 import type { SubagentRow } from "./select";
 import type { ArchiveFinishedStatus } from "./use-archive-finished";
 import {
+  buildProviderInternalTaskLabel,
   buildSubagentPillPresentation,
   buildSubagentRowPresentationData,
   countFinishedSubagents,
+  resolveProviderDelegationStopPresentation,
 } from "./track-presentation";
+import {
+  IDLE_PROVIDER_DELEGATION_STOP_STATUS,
+  type ProviderDelegationStopStatus,
+} from "./provider-delegation-stop";
 
 const ThemedArchive = withUnistyles(Archive);
+const ThemedCircleStop = withUnistyles(CircleStop);
 const ThemedUnlink = withUnistyles(Unlink);
 
 const foregroundColorMapping = (theme: Theme) => ({ color: theme.colors.foreground });
@@ -50,6 +57,13 @@ export interface SubagentsTrackProps {
   onArchiveFinished?: () => void;
   archiveFinishedStatus?: ArchiveFinishedStatus;
   onDetachSubagent?: (address: AgentAddress) => void;
+  /**
+   * Stops the turn of a provider that owns its delegation tree, and every task
+   * the provider delegated under it. Absent when the provider cannot do it: a
+   * child has no addressable turn, so there is no per-row stop to offer instead.
+   */
+  onStopProviderDelegations?: () => void;
+  providerDelegationStopStatus?: ProviderDelegationStopStatus;
 }
 
 const IDLE_ARCHIVE_FINISHED_STATUS: ArchiveFinishedStatus = { kind: "idle" };
@@ -78,6 +92,8 @@ export function SubagentsTrack({
   onArchiveFinished,
   archiveFinishedStatus = IDLE_ARCHIVE_FINISHED_STATUS,
   onDetachSubagent,
+  onStopProviderDelegations,
+  providerDelegationStopStatus = IDLE_PROVIDER_DELEGATION_STOP_STATUS,
 }: SubagentsTrackProps): ReactElement | null {
   const { t } = useTranslation();
   const sheetPanePage = useSheetPanePage();
@@ -91,6 +107,19 @@ export function SubagentsTrack({
   const pill = buildSubagentPillPresentation(t, rows);
   const finishedCount = countFinishedSubagents(rows);
   const showArchiveFinished = finishedCount > 0 || isArchivingFinished || isArchiveFinishedFailed;
+  // The stop covers the whole tree, so it belongs to the track and only while the
+  // tree still has work: offering it on an idle session would stop nothing.
+  const stopPresentation = resolveProviderDelegationStopPresentation({
+    rows,
+    canStop: Boolean(onStopProviderDelegations),
+    status: providerDelegationStopStatus,
+  });
+  const showStopProviderDelegations = stopPresentation.showStop;
+  const showStopResult = stopPresentation.showResult;
+  const showActionsRow =
+    (showArchiveFinished && Boolean(onArchiveFinished)) ||
+    showStopProviderDelegations ||
+    showStopResult;
   const sheets = rows.map(sheetTabFor);
   const pages = sheets.flatMap((sheet) => (sheet ? [sheetPanePage(sheet)] : []));
 
@@ -102,13 +131,24 @@ export function SubagentsTrack({
       accessibilityLabel={pill.accessibilityLabel}
       panelTitle={t("subagents.title")}
     >
-      {showArchiveFinished && onArchiveFinished ? (
+      {showActionsRow ? (
         <ComposerTrackActions divided={rows.length > 0}>
-          <ArchiveFinishedRow
-            status={archiveFinishedStatus}
-            disabled={isArchivingFinished}
-            onPress={onArchiveFinished}
-          />
+          {showStopProviderDelegations && onStopProviderDelegations ? (
+            <StopProviderDelegationsRow
+              status={providerDelegationStopStatus}
+              onPress={onStopProviderDelegations}
+            />
+          ) : null}
+          {showStopResult ? (
+            <ProviderDelegationStopResultRow status={providerDelegationStopStatus} />
+          ) : null}
+          {showArchiveFinished && onArchiveFinished ? (
+            <ArchiveFinishedRow
+              status={archiveFinishedStatus}
+              disabled={isArchivingFinished}
+              onPress={onArchiveFinished}
+            />
+          ) : null}
         </ComposerTrackActions>
       ) : null}
       {rows.map((row, index) => (
@@ -185,6 +225,84 @@ function ArchiveFinishedRow({
   );
 }
 
+/**
+ * The stop that covers everything under a provider: the parent turn and every
+ * delegated task. It sits above the rows because it is not a row's action - a
+ * provider sub-agent has no turn of its own to stop.
+ */
+function StopProviderDelegationsRow({
+  status,
+  onPress,
+}: {
+  status: ProviderDelegationStopStatus;
+  onPress: () => void;
+}): ReactElement {
+  const { t } = useTranslation();
+  const isRequesting = status.kind === "requesting";
+
+  const renderRow = useCallback(
+    ({ active }: { active: boolean }) => (
+      <>
+        <ThemedCircleStop
+          size={ROW_ICON_SIZE}
+          uniProps={active ? foregroundColorMapping : foregroundMutedColorMapping}
+        />
+        <Text style={styles.rowLabel} numberOfLines={1}>
+          {t("subagents.stopProviderDelegationsAction")}
+        </Text>
+        {isRequesting ? (
+          <Text style={styles.rowTrailing}>{t("subagents.stopProviderDelegationsRequesting")}</Text>
+        ) : null}
+      </>
+    ),
+    [isRequesting, t],
+  );
+
+  return (
+    <ComposerTrackRow
+      accessibilityLabel={t("subagents.stopProviderDelegationsAction")}
+      testID="subagents-track-stop-provider-delegations"
+      disabled={isRequesting}
+      // The result lands on this panel, so dismissing it would hide what the press
+      // produced.
+      closeOnSelect={false}
+      onPress={onPress}
+    >
+      {renderRow}
+    </ComposerTrackRow>
+  );
+}
+
+/**
+ * What the stop left behind, read from the delegation rows.
+ *
+ * The provider's receipt calls the root stopped even when nothing ran, so the
+ * only honest report is the tasks the tree still shows as running.
+ */
+function ProviderDelegationStopResultRow({
+  status,
+}: {
+  status: ProviderDelegationStopStatus;
+}): ReactElement | null {
+  const { t } = useTranslation();
+  let text: string | null = null;
+  if (status.kind === "stopped") {
+    text = t("subagents.stopProviderDelegationsStopped");
+  } else if (status.kind === "partial") {
+    text = t("subagents.stopProviderDelegationsPartial", { count: status.activeTaskCount });
+  } else if (status.kind === "unknown") {
+    text = t("subagents.stopProviderDelegationsUnknown");
+  } else if (status.kind === "failed") {
+    text = t("subagents.stopProviderDelegationsFailed", { message: status.message });
+  }
+  if (!text) return null;
+  return (
+    <View style={styles.stopResultRow} testID="subagents-track-stop-provider-result">
+      <Text style={styles.rowFacts}>{text}</Text>
+    </View>
+  );
+}
+
 interface SubagentsTrackRowProps {
   serverId: string;
   row: SubagentRow;
@@ -241,7 +359,18 @@ function SubagentsTrackRow({
               <PaseoSubagentFacts serverId={rowServerId} agentId={row.id} />
             </>
           ) : (
-            <SubagentFacts rowId={row.id} text={presentation.subtitle} />
+            <>
+              <SubagentFacts rowId={row.id} text={presentation.subtitle} />
+              {/* A provider sub-agent is a task inside the provider's own run, not an
+                  agent with a session of its own: saying so keeps the row honest. */}
+              <Text
+                style={styles.rowFacts}
+                numberOfLines={1}
+                testID={`subagents-track-row-internal-${row.id}`}
+              >
+                {buildProviderInternalTaskLabel(t, row.provider)}
+              </Text>
+            </>
           )}
         </View>
         {row.kind === "paseo" ? (
@@ -266,6 +395,8 @@ function SubagentsTrackRow({
       presentation,
       row.kind,
       row.id,
+      row.provider,
+      t,
       serverId,
       rowServerId,
       hostLabel,
@@ -408,6 +539,13 @@ const styles = StyleSheet.create((theme) => ({
   },
   // Progress on the archive row. It shrinks twice as fast as the label, so a long retry count
   // gives way first instead of squeezing the thing that names the row.
+  stopResultRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+    paddingVertical: theme.spacing[1],
+    paddingHorizontal: theme.spacing[2],
+  },
   rowTrailing: {
     flexShrink: 2,
     minWidth: 0,

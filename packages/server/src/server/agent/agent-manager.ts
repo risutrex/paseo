@@ -29,6 +29,7 @@ import type { TerminalManager } from "../../terminal/terminal-manager.js";
 import {
   getAgentStreamEventTurnId,
   type AgentCapabilityFlags,
+  type ProviderDelegationStopResult,
   type AgentClient,
   type AgentCreateSessionOptions,
   type AgentResumePurpose,
@@ -3400,6 +3401,25 @@ export class AgentManager {
 
   async cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
     return this.runForegroundMutation(agentId, () => this.cancelAgentRunNow(agentId));
+  }
+
+  /**
+   * Stops the turn that runs a provider's delegation tree, and with it every task
+   * delegated under it.
+   *
+   * The provider owns those children: their sessions cannot be opened and their
+   * ids are not turns, so there is nothing to cancel one by one. A provider that
+   * does not advertise the delegation stop is reported as unsupported instead of
+   * being approximated with a plain interruption that would leave the children
+   * running.
+   */
+  async stopProviderDelegations(agentId: string): Promise<ProviderDelegationStopResult> {
+    const agent = this.requireSessionAgent(agentId);
+    const session = agent.session;
+    if (!session.stopProviderDelegations) {
+      throw new Error(`${agent.provider} does not support stopping delegated tasks`);
+    }
+    return session.stopProviderDelegations();
   }
 
   private async cancelAgentRunNow(agentId: string): Promise<AgentRunCancellationResult> {

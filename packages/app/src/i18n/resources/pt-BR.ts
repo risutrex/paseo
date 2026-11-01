@@ -1984,6 +1984,20 @@ export const ptBR: TranslationResources = {
     archiveTooltip: "Arquivar subagente",
     archiveFinishedAction: "Arquivar subagentes concluídos",
     archiveFinishedRetry: "Tentar novamente ({{failed}}/{{total}})",
+    providerInternalTask: "Tarefa interna do {{provider}}",
+    providerLogUnavailable:
+      "O provedor não compartilha o registro desta tarefa. Apenas o status é exibido.",
+    stopProviderDelegationsAction: "Parar o pai e as tarefas delegadas",
+    stopProviderDelegationsRequesting: "Parando...",
+    stopProviderDelegationsDialogTitle: "Parar {{provider}}?",
+    stopProviderDelegationsDialogMessage:
+      "Isso para o turno do pai e todas as tarefas que o {{provider}} delegou ({{count}} em execução). As mensagens que o provedor enfileirou para depois são retiradas quando ele permite; caso contrário, podem ainda ser executadas.",
+    stopProviderDelegationsConfirm: "Parar tudo",
+    stopProviderDelegationsStopped: "Parado: nenhuma tarefa delegada em execução",
+    stopProviderDelegationsPartial: "{{count}} tarefas delegadas ainda estão em execução",
+    stopProviderDelegationsUnknown:
+      "Resultado da parada desconhecido: o provedor não confirmou. Verifique o status das tarefas.",
+    stopProviderDelegationsFailed: "Não foi possível parar as tarefas delegadas: {{message}}",
   },
   panels: {
     draft: {

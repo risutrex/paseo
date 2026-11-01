@@ -1970,6 +1970,20 @@ export const ja: TranslationResources = {
     archiveTooltip: "サブエージェントをアーカイブ",
     archiveFinishedAction: "完了したサブエージェントをアーカイブ",
     archiveFinishedRetry: "再試行 ({{failed}}/{{total}})",
+    providerInternalTask: "{{provider}} の内部タスク",
+    providerLogUnavailable:
+      "このタスクの記録はプロバイダーから共有されません。状態のみ表示されます。",
+    stopProviderDelegationsAction: "親と委任タスクをすべて停止",
+    stopProviderDelegationsRequesting: "停止中...",
+    stopProviderDelegationsDialogTitle: "{{provider}} を停止しますか？",
+    stopProviderDelegationsDialogMessage:
+      "親のターンと {{provider}} が委任したすべてのタスク（実行中 {{count}} 件）を停止します。プロバイダーが許可する場合、後で実行するためにキューに入れたメッセージは取り消されます。許可しない場合、それらは後で実行される可能性があります。",
+    stopProviderDelegationsConfirm: "すべて停止",
+    stopProviderDelegationsStopped: "停止しました: 実行中の委任タスクはありません",
+    stopProviderDelegationsPartial: "{{count}} 件の委任タスクがまだ実行中です",
+    stopProviderDelegationsUnknown:
+      "停止結果は不明です: プロバイダーが確認しませんでした。タスクの状態を確認してください。",
+    stopProviderDelegationsFailed: "委任タスクを停止できませんでした: {{message}}",
   },
   panels: {
     draft: {

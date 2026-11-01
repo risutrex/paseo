@@ -1999,6 +1999,20 @@ export const es: TranslationResources = {
     archiveTooltip: "Subagente de archivo",
     archiveFinishedAction: "Archivar subagentes finalizados",
     archiveFinishedRetry: "Reintentar ({{failed}}/{{total}})",
+    providerInternalTask: "Tarea interna de {{provider}}",
+    providerLogUnavailable:
+      "El proveedor no comparte el registro de esta tarea. Solo se muestra su estado.",
+    stopProviderDelegationsAction: "Detener al padre y sus tareas delegadas",
+    stopProviderDelegationsRequesting: "Deteniendo...",
+    stopProviderDelegationsDialogTitle: "¿Detener {{provider}}?",
+    stopProviderDelegationsDialogMessage:
+      "Esto detiene el turno del padre y todas las tareas que {{provider}} delegó ({{count}} en ejecución). Los mensajes que el proveedor puso en cola se retiran si lo permite; si no, pueden ejecutarse más tarde.",
+    stopProviderDelegationsConfirm: "Detener todo",
+    stopProviderDelegationsStopped: "Detenido: no hay tareas delegadas en ejecución",
+    stopProviderDelegationsPartial: "{{count}} tareas delegadas siguen en ejecución",
+    stopProviderDelegationsUnknown:
+      "Resultado de la detención desconocido: el proveedor no lo confirmó. Revisa el estado de las tareas.",
+    stopProviderDelegationsFailed: "No se pudieron detener las tareas delegadas: {{message}}",
   },
   panels: {
     draft: {

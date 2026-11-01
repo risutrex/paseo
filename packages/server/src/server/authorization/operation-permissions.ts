@@ -20,6 +20,9 @@ const INBOUND_PERMISSION = {
   "agent.fork_context.request": "workspace.read",
   "agent.provider_subagents.list.request": "workspace.read",
   "agent.provider_subagents.timeline.get.request": "workspace.read",
+  // Stopping a provider's delegation tree stops work the caller is watching, so
+  // it takes the same grant as any other cancellation.
+  "agent.provider_delegations.stop.request": ["workspace.write", "hub.execute"],
   "agent.rewind.request": "workspace.write",
   "agent.skills.get_status.request": "daemon.read",
   "agent.skills.import_legacy_selection.request": "daemon.manage",
@@ -252,6 +255,7 @@ const OUTBOUND_PERMISSION = {
   "agent.provider_subagents.list.response": "workspace.read",
   "agent.provider_subagents.timeline.get.response": "workspace.read",
   "agent.provider_subagents.update": "workspace.read",
+  "agent.provider_delegations.stop.response": ["workspace.write", "hub.execute"],
   "agent.rewind.response": "workspace.write",
   "agent.skills.get_status.response": "daemon.read",
   "agent.skills.import_legacy_selection.response": "daemon.manage",

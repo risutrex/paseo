@@ -1976,6 +1976,20 @@ export const en = {
     archiveTooltip: "Archive subagent",
     archiveFinishedAction: "Archive finished subagents",
     archiveFinishedRetry: "Retry ({{failed}}/{{total}})",
+    providerInternalTask: "Internal {{provider}} task",
+    providerLogUnavailable:
+      "The provider does not share this task's journal. Only its status is shown.",
+    stopProviderDelegationsAction: "Stop parent and delegated tasks",
+    stopProviderDelegationsRequesting: "Stopping...",
+    stopProviderDelegationsDialogTitle: "Stop {{provider}}?",
+    stopProviderDelegationsDialogMessage:
+      "This stops the parent turn and every task {{provider}} delegated ({{count}} running). Messages the provider queued for later are withdrawn when it allows it; otherwise they may still run.",
+    stopProviderDelegationsConfirm: "Stop everything",
+    stopProviderDelegationsStopped: "Stopped: no delegated task is running",
+    stopProviderDelegationsPartial: "{{count}} delegated tasks are still running",
+    stopProviderDelegationsUnknown:
+      "Stop result unknown: the provider did not confirm it. Check the task statuses.",
+    stopProviderDelegationsFailed: "Could not stop the delegated tasks: {{message}}",
   },
   panels: {
     draft: {

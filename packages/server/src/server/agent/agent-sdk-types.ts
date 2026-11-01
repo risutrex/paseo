@@ -185,6 +185,12 @@ export interface AgentCapabilityFlags {
   supportsRewindConversation?: boolean;
   supportsRewindFiles?: boolean;
   supportsRewindBoth?: boolean;
+  /**
+   * Whether the provider can stop its own delegation tree - the parent turn and
+   * every task delegated under it. Undefined means it cannot: only a provider
+   * that advertises the stop method accepts one.
+   */
+  supportsProviderDelegationStop?: boolean;
 }
 
 export interface AgentPersistenceHandle {
@@ -753,6 +759,27 @@ export interface AgentSession {
   tryHandleOutOfBand?(prompt: AgentPromptInput): {
     run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
   } | null;
+  /**
+   * Stops the parent turn and every task the provider delegated under it.
+   *
+   * A provider that keeps its own delegation tree has no addressable turn per
+   * child, so a stop is a root-session operation. Only providers that advertise
+   * the extension implement this; the absence of the method is the answer for
+   * every other provider.
+   */
+  stopProviderDelegations?(): Promise<ProviderDelegationStopResult>;
+}
+
+/**
+ * What a provider's delegation stop reported back.
+ *
+ * `acknowledged` says the provider answered the request, nothing more: its
+ * receipt calls the root stopped even for an idle tree and can leave a child it
+ * really stopped out of the list. The delegation tree is the only report of what
+ * actually stopped, so callers read the rows instead of the receipt.
+ */
+export interface ProviderDelegationStopResult {
+  acknowledged: boolean;
 }
 
 export type FetchCatalogOptions = { providerOptions?: ProviderOptions } & (

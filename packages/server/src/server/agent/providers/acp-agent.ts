@@ -99,6 +99,7 @@ import {
   type ListImportableSessionsOptions,
   type McpServerConfig,
   type ProviderCatalog,
+  type ProviderDelegationStopResult,
   type ResolveAgentCreateConfigInput,
   type ResolveAgentCreateConfigResult,
   type ToolCallDetail,
@@ -457,6 +458,11 @@ function readQueuedItemId(response: unknown): string | null {
 type QueuePromptOutcome = "queued" | "withdrawn" | "unconfirmed" | "skipped";
 const MCODE_DELEGATION_GET_METHOD = "mcode/session/delegation/get";
 const MCODE_DELEGATION_UPDATE_NOTIFICATION = "mcode/session/delegation_update";
+// A provider that keeps its own delegation tree decides which tasks run under it.
+// A child is not addressable as a turn (the provider answers -32002 for its id),
+// so the only stop that exists is the root: the provider aborts the turn that
+// runs the tree and every task delegated under it.
+const MCODE_DELEGATION_STOP_METHOD = "mcode/session/delegation/stop";
 // A provider that still owns its previous turn refuses a new prompt and tells
 // the client to use its queue instead. MiniMax Code answers such a refusal
 // with "Session already has an active Turn. Use queue send to deliver the
@@ -2204,6 +2210,8 @@ export class ACPAgentClient implements AgentClient {
 
 export class ACPAgentSession implements AgentSession, ACPClient {
   readonly provider: string;
+  // A copy, so advertising an extension in one session does not leak into every
+  // other session of the same provider.
   readonly capabilities: AgentCapabilityFlags;
 
   private readonly logger: Logger;
@@ -2342,7 +2350,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   constructor(config: AgentSessionConfig, options: ACPAgentSessionOptions) {
     this.provider = options.provider;
     this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
-    this.capabilities = options.capabilities;
+    this.capabilities = { ...options.capabilities };
     this.logger = options.logger.child({ module: "agent", provider: options.provider });
     this.runtimeSettings = options.runtimeSettings;
     this.defaultCommand = options.defaultCommand;
@@ -2400,6 +2408,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.connection = spawned.connection;
       this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
       this.agentMeta = spawned.initialize._meta ?? null;
+      this.applyAdvertisedCapabilities();
 
       const response = await this.runACPRequest(() =>
         this.connection!.newSession({
@@ -2458,6 +2467,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.connection = spawned.connection;
       this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
       this.agentMeta = spawned.initialize._meta ?? null;
+      this.applyAdvertisedCapabilities();
       this.sessionId = handle.sessionId;
       this.bootstrapThreadEventPending = true;
 
@@ -3392,29 +3402,35 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   /**
+   * The extension methods the provider named in its `initialize` metadata.
+   *
+   * A provider advertises what it can do in the handshake, so a method it never
+   * named is not offered to the session: guessing would turn a missing feature
+   * into an error the user cannot act on.
+   */
+  private advertisedProviderMethods(): unknown[] {
+    const extensions = this.agentMeta?.[MCODE_EXTENSIONS_META_KEY];
+    if (!extensions || typeof extensions !== "object") {
+      return [];
+    }
+    const methods = (extensions as { methods?: unknown }).methods;
+    return Array.isArray(methods) ? methods : [];
+  }
+
+  /**
    * Reports whether the provider advertised a steering extension. The
    * advertisement lives in the `initialize` metadata, so a provider that
    * never offered steering is reported as unavailable instead of failing.
    */
   private supportsVendorSteer(): boolean {
-    const extensions = this.agentMeta?.[MCODE_EXTENSIONS_META_KEY];
-    if (!extensions || typeof extensions !== "object") {
-      return false;
-    }
-    const methods = (extensions as { methods?: unknown }).methods;
-    return Array.isArray(methods) && methods.includes(MCODE_STEER_METHOD);
+    return this.advertisedProviderMethods().includes(MCODE_STEER_METHOD);
   }
 
   /**
    * Reports whether the provider advertised a queue extension.
    */
   private supportsVendorQueue(): boolean {
-    const extensions = this.agentMeta?.[MCODE_EXTENSIONS_META_KEY];
-    if (!extensions || typeof extensions !== "object") {
-      return false;
-    }
-    const methods = (extensions as { methods?: unknown }).methods;
-    return Array.isArray(methods) && methods.includes(MCODE_QUEUE_ENQUEUE_METHOD);
+    return this.advertisedProviderMethods().includes(MCODE_QUEUE_ENQUEUE_METHOD);
   }
 
   /**
@@ -3423,24 +3439,36 @@ export class ACPAgentSession implements AgentSession, ACPClient {
    * stays in its queue and the user is not promised otherwise.
    */
   private supportsVendorQueueDelete(): boolean {
-    const extensions = this.agentMeta?.[MCODE_EXTENSIONS_META_KEY];
-    if (!extensions || typeof extensions !== "object") {
-      return false;
-    }
-    const methods = (extensions as { methods?: unknown }).methods;
-    return Array.isArray(methods) && methods.includes(MCODE_QUEUE_DELETE_METHOD);
+    return this.advertisedProviderMethods().includes(MCODE_QUEUE_DELETE_METHOD);
   }
 
   /**
    * Reports whether the provider advertised a delegation extension.
    */
   private supportsVendorDelegation(): boolean {
-    const extensions = this.agentMeta?.[MCODE_EXTENSIONS_META_KEY];
-    if (!extensions || typeof extensions !== "object") {
-      return false;
-    }
-    const methods = (extensions as { methods?: unknown }).methods;
-    return Array.isArray(methods) && methods.includes(MCODE_DELEGATION_GET_METHOD);
+    return this.advertisedProviderMethods().includes(MCODE_DELEGATION_GET_METHOD);
+  }
+
+  /**
+   * Publishes what the handshake allows.
+   *
+   * The capabilities reach the app in the agent snapshot, which is how the
+   * track learns whether a stop exists before offering one. A provider that
+   * names no stop method keeps the rows read-only.
+   */
+  private applyAdvertisedCapabilities(): void {
+    this.capabilities.supportsProviderDelegationStop = this.supportsVendorDelegationStop();
+  }
+
+  /**
+   * Reports whether the provider can stop the delegations of a session.
+   *
+   * Stopping a provider's delegated tasks is a root-session operation, so the
+   * method has to be advertised: a provider that only publishes its tree keeps
+   * the rows read-only instead of offering a stop it cannot carry out.
+   */
+  private supportsVendorDelegationStop(): boolean {
+    return this.advertisedProviderMethods().includes(MCODE_DELEGATION_STOP_METHOD);
   }
 
   /**
@@ -3546,6 +3574,48 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       // session: the tree is an extra, not a requirement.
       this.logger.debug({ err: error }, "ACP provider did not report a delegation tree");
     }
+  }
+
+  /**
+   * Stops the turn that runs the provider's delegation tree, and with it every
+   * task delegated under it.
+   *
+   * There is no per-child stop: a child is not a turn of its own and the
+   * provider answers -32002 for its session id. The root session id is what the
+   * provider's stop takes, and aborting the root turn is what cancels the work
+   * underneath it.
+   *
+   * The receipt is not evidence. `rootStopped` comes back true even when
+   * nothing was running, and `stoppedSessionIds` can be empty for a child that
+   * really did stop. What actually happened is in the tree, so the snapshot is
+   * read again before answering and the rows carry the statuses the user reads.
+   */
+  async stopProviderDelegations(): Promise<ProviderDelegationStopResult> {
+    const connection = this.connection;
+    if (!connection || !this.sessionId) {
+      throw new Error(`${this.provider} session is not initialized`);
+    }
+    if (!this.supportsVendorDelegationStop()) {
+      throw new Error(`${this.provider} does not support stopping delegated tasks`);
+    }
+    let acknowledged = false;
+    try {
+      const response = await connection.extMethod(MCODE_DELEGATION_STOP_METHOD, {
+        sessionId: this.sessionId,
+      });
+      acknowledged = isRecord(response) && isRecord(response.receipt);
+      // A message the provider queued for a later turn outlives the abort of
+      // the current one: it would run behind a stop that promised it would not.
+      await this.withdrawQueuedPrompts();
+    } catch (error) {
+      this.logger.warn({ err: error }, "ACP provider did not accept the delegation stop");
+      // The stop may still have landed - a provider can fail the request after
+      // aborting the tree. The tree is the only report, so read it anyway.
+      await this.refreshDelegationSnapshot();
+      throw error;
+    }
+    await this.refreshDelegationSnapshot();
+    return { acknowledged };
   }
 
   /**

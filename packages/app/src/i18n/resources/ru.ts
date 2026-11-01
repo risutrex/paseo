@@ -1983,6 +1983,19 @@ export const ru: TranslationResources = {
     archiveTooltip: "Архивировать субагента",
     archiveFinishedAction: "Архивировать завершенные субагенты",
     archiveFinishedRetry: "Повторить ({{failed}}/{{total}})",
+    providerInternalTask: "Внутренняя задача {{provider}}",
+    providerLogUnavailable: "Провайдер не делится журналом этой задачи. Показан только её статус.",
+    stopProviderDelegationsAction: "Остановить родителя и делегированные задачи",
+    stopProviderDelegationsRequesting: "Останавливаем...",
+    stopProviderDelegationsDialogTitle: "Остановить {{provider}}?",
+    stopProviderDelegationsDialogMessage:
+      "Это остановит родительский ход и все задачи, делегированные {{provider}} (сейчас в работе: {{count}}). Сообщения, которые провайдер поставил в очередь на потом, отзываются, если он это позволяет; иначе они могут выполниться позже.",
+    stopProviderDelegationsConfirm: "Остановить всё",
+    stopProviderDelegationsStopped: "Остановлено: ни одна делегированная задача не выполняется",
+    stopProviderDelegationsPartial: "Ещё выполняется делегированных задач: {{count}}",
+    stopProviderDelegationsUnknown:
+      "Результат остановки неизвестен: провайдер её не подтвердил. Проверьте статусы задач.",
+    stopProviderDelegationsFailed: "Не удалось остановить делегированные задачи: {{message}}",
   },
   panels: {
     draft: {

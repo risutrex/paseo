@@ -5562,6 +5562,87 @@ test("detaches an agent through the namespaced detach RPC", async () => {
   await expect(promise).resolves.toBeUndefined();
 });
 
+test("stops a provider delegation tree through the namespaced stop RPC", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const promise = client.stopProviderDelegations("parent-agent");
+
+  expect(mock.sent).toHaveLength(1);
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toMatchObject({
+    type: "agent.provider_delegations.stop.request",
+    agentId: "parent-agent",
+  });
+  expect(typeof request.requestId).toBe("string");
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.provider_delegations.stop.response",
+      payload: {
+        requestId: request.requestId,
+        agentId: "parent-agent",
+        accepted: true,
+        acknowledged: true,
+        error: null,
+      },
+    }),
+  );
+
+  // The daemon reports the provider's answer, not what stopped: the delegation
+  // rows carry that.
+  await expect(promise).resolves.toEqual({ acknowledged: true });
+});
+
+test("rejects the stop when the provider cannot stop its delegations", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const promise = client.stopProviderDelegations("parent-agent");
+  const request = parseSentFrame(mock.sent[0]);
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.provider_delegations.stop.response",
+      payload: {
+        requestId: request.requestId,
+        agentId: "parent-agent",
+        accepted: false,
+        acknowledged: false,
+        error: "minimax-code does not support stopping delegated tasks",
+      },
+    }),
+  );
+
+  await expect(promise).rejects.toThrow("does not support stopping delegated tasks");
+});
+
 test("sends active-scoped fetch_agents_request", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

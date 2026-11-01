@@ -3406,6 +3406,28 @@ export class DaemonClient {
     }
   }
 
+  /**
+   * Stops the parent turn of a provider-owned delegation tree, and with it every
+   * task the provider delegated under it.
+   *
+   * A provider sub-agent has no addressable turn, so there is no per-child stop
+   * to offer instead. Only a provider that advertised the stop accepts one; the
+   * daemon rejects the request otherwise. The answer reports whether the provider
+   * acknowledged it - the delegation rows report what actually stopped.
+   */
+  async stopProviderDelegations(agentId: string): Promise<{ acknowledged: boolean }> {
+    const payload =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.provider_delegations.stop.response">(
+        {
+          message: { type: "agent.provider_delegations.stop.request", agentId },
+        },
+      );
+    if (!payload.accepted) {
+      throw new Error(payload.error ?? "stopProviderDelegations rejected");
+    }
+    return { acknowledged: payload.acknowledged };
+  }
+
   async updateAgent(
     agentId: string,
     updates: { name?: string; labels?: Record<string, string> },

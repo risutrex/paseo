@@ -120,6 +120,7 @@ import {
   cancelAgentRunCommand,
   closeAgentCommand,
   detachAgentCommand,
+  stopProviderDelegationsCommand,
   setAgentModeCommand,
   updateAgentCommand,
 } from "./agent/lifecycle-command.js";
@@ -2803,6 +2804,8 @@ export class Session {
     switch (msg.type) {
       case "agent.detach.request":
         return this.handleDetachAgentRequest(msg.agentId, msg.requestId);
+      case "agent.provider_delegations.stop.request":
+        return this.handleStopProviderDelegationsRequest(msg.agentId, msg.requestId);
       default:
         return undefined;
     }
@@ -3444,6 +3447,54 @@ export class Session {
     }
 
     return { agentId, archivedAt };
+  }
+
+  /**
+   * Stops a provider's whole delegation tree: the parent turn and every task the
+   * provider started under it.
+   *
+   * There is no per-child stop to offer instead - a provider sub-agent is not an
+   * addressable turn. The answer reports whether the provider acknowledged the
+   * request; what actually stopped arrives as delegation rows, which the app
+   * reads rather than trusting a receipt that calls an idle tree stopped.
+   */
+  private async handleStopProviderDelegationsRequest(
+    agentId: string,
+    requestId: string,
+  ): Promise<void> {
+    this.sessionLogger.info({ agentId, requestId }, "Stopping provider delegations");
+    try {
+      const result = await stopProviderDelegationsCommand(
+        { agentManager: this.agentManager },
+        agentId,
+      );
+      this.emit({
+        type: "agent.provider_delegations.stop.response",
+        payload: {
+          requestId,
+          agentId,
+          accepted: true,
+          acknowledged: result.acknowledged,
+          error: null,
+        },
+      });
+    } catch (error) {
+      const message = getErrorMessageOr(error, "Failed to stop delegated tasks");
+      this.sessionLogger.error(
+        { err: error, agentId, requestId },
+        "Failed to stop provider delegations",
+      );
+      this.emit({
+        type: "agent.provider_delegations.stop.response",
+        payload: {
+          requestId,
+          agentId,
+          accepted: false,
+          acknowledged: false,
+          error: message,
+        },
+      });
+    }
   }
 
   private async handleDetachAgentRequest(agentId: string, requestId: string): Promise<void> {

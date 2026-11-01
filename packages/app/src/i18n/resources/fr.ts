@@ -1997,6 +1997,20 @@ export const fr: TranslationResources = {
     archiveTooltip: "Archiver le sous-agent",
     archiveFinishedAction: "Archiver les sous-agents terminés",
     archiveFinishedRetry: "Réessayer ({{failed}}/{{total}})",
+    providerInternalTask: "Tâche interne de {{provider}}",
+    providerLogUnavailable:
+      "Le fournisseur ne partage pas le journal de cette tâche. Seul son état est affiché.",
+    stopProviderDelegationsAction: "Arrêter le parent et les tâches déléguées",
+    stopProviderDelegationsRequesting: "Arrêt en cours...",
+    stopProviderDelegationsDialogTitle: "Arrêter {{provider}} ?",
+    stopProviderDelegationsDialogMessage:
+      "Cela arrête le tour du parent et toutes les tâches déléguées par {{provider}} ({{count}} en cours). Les messages mis en file d'attente par le fournisseur sont retirés s'il le permet ; sinon ils peuvent encore s'exécuter.",
+    stopProviderDelegationsConfirm: "Tout arrêter",
+    stopProviderDelegationsStopped: "Arrêté : aucune tâche déléguée en cours",
+    stopProviderDelegationsPartial: "{{count}} tâches déléguées sont encore en cours",
+    stopProviderDelegationsUnknown:
+      "Résultat de l'arrêt inconnu : le fournisseur ne l'a pas confirmé. Vérifiez l'état des tâches.",
+    stopProviderDelegationsFailed: "Impossible d'arrêter les tâches déléguées : {{message}}",
   },
   panels: {
     draft: {

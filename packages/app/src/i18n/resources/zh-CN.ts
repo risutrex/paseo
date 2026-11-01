@@ -1928,6 +1928,18 @@ export const zhCN: TranslationResources = {
     archiveTooltip: "归档 subagent",
     archiveFinishedAction: "归档已完成的 subagent",
     archiveFinishedRetry: "重试 ({{failed}}/{{total}})",
+    providerInternalTask: "{{provider}} 内部任务",
+    providerLogUnavailable: "提供方不共享此任务的记录，只显示状态。",
+    stopProviderDelegationsAction: "停止父代理和所有委派任务",
+    stopProviderDelegationsRequesting: "正在停止...",
+    stopProviderDelegationsDialogTitle: "停止 {{provider}}？",
+    stopProviderDelegationsDialogMessage:
+      "这会停止父代理的这一轮以及 {{provider}} 委派的全部任务（{{count}} 个运行中）。提供方允许时会撤回它排入队列等待后续执行的消息，否则这些消息仍可能稍后运行。",
+    stopProviderDelegationsConfirm: "全部停止",
+    stopProviderDelegationsStopped: "已停止：没有正在运行的委派任务",
+    stopProviderDelegationsPartial: "仍有 {{count}} 个委派任务在运行",
+    stopProviderDelegationsUnknown: "停止结果未知：提供方未确认。请检查任务状态。",
+    stopProviderDelegationsFailed: "无法停止委派任务：{{message}}",
   },
   panels: {
     draft: {

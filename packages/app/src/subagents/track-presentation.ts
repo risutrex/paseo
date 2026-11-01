@@ -5,6 +5,21 @@ import { deriveSidebarStateBucket, STATUS_BUCKET_ORDER } from "@/utils/sidebar-a
 import type { SubagentRow } from "./select";
 import { isFinishedSubagent } from "./archive-finished";
 import { providerSubagentLifecycleStatus } from "./provider-store";
+import type { ProviderDelegationStopStatus } from "./provider-delegation-stop";
+
+/**
+ * A provider's own name, prepared for a sentence.
+ *
+ * Provider ids are slugs ("minimax-code"); a row that calls the provider by its
+ * wire name reads like a log line instead of a product.
+ */
+export function formatProviderName(provider: string): string {
+  return provider
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
 
 function presentationStatus(row: SubagentRow) {
   if (row.kind === "paseo") {
@@ -12,6 +27,42 @@ function presentationStatus(row: SubagentRow) {
     return row.status === "running" ? "idle" : row.status;
   }
   return providerSubagentLifecycleStatus(row.status);
+}
+
+/**
+ * Whether the track offers the stop that covers a provider's whole tree.
+ *
+ * The stop belongs to the parent, so it shows only while the provider itself can
+ * carry it out and its tree still has work. A finished tree has nothing to stop,
+ * and an offer that stops nothing is a lie.
+ */
+export function resolveProviderDelegationStopPresentation(input: {
+  rows: readonly SubagentRow[];
+  canStop: boolean;
+  status: ProviderDelegationStopStatus;
+}): { activeProviderTaskCount: number; showStop: boolean; showResult: boolean } {
+  const activeProviderTaskCount = input.rows.reduce(
+    (count, row) => (row.kind === "provider" && row.status === "running" ? count + 1 : count),
+    0,
+  );
+  const status = input.status;
+  return {
+    activeProviderTaskCount,
+    showStop: input.canStop && activeProviderTaskCount > 0,
+    showResult:
+      status.kind === "stopped" ||
+      status.kind === "partial" ||
+      status.kind === "unknown" ||
+      status.kind === "failed",
+  };
+}
+
+/**
+ * The line that keeps a provider row honest: it is work inside the provider's own
+ * run, not an agent with a session a user could open, detach or promote.
+ */
+export function buildProviderInternalTaskLabel(t: TFunction, provider: string): string {
+  return t("subagents.providerInternalTask", { provider: formatProviderName(provider) });
 }
 
 export interface SubagentRowPresentationData {

@@ -430,6 +430,10 @@ const AgentCapabilityFlagsSchema: z.ZodType<AgentCapabilityFlags> = z
     supportsRewindFiles: z.boolean().optional().default(false),
     // COMPAT(rewind): added in v0.1.X, drop when floor >= v0.1.X.
     supportsRewindBoth: z.boolean().optional().default(false),
+    // COMPAT(providerDelegationStop): added after v0.13.0, remove gate after 2027-05-01.
+    // A provider that keeps its own delegation tree answers the stop; any other
+    // provider leaves it absent, so the app offers no stop it cannot carry out.
+    supportsProviderDelegationStop: z.boolean().optional(),
   })
   .catchall(z.boolean());
 
@@ -2117,6 +2121,33 @@ export const AgentDetachResponseMessageSchema = z.object({
   payload: AgentActionResponsePayloadSchema,
 });
 
+/**
+ * Stops the parent turn of a provider that owns its delegation tree, together
+ * with every task delegated under it.
+ *
+ * There is no per-child stop: a provider sub-agent has no addressable turn.
+ * This is a root-session operation, which is why it hangs off the parent agent.
+ */
+export const AgentProviderDelegationsStopRequestMessageSchema = z.object({
+  type: z.literal("agent.provider_delegations.stop.request"),
+  agentId: z.string(),
+  requestId: z.string(),
+});
+
+export const AgentProviderDelegationsStopResponseMessageSchema = z.object({
+  type: z.literal("agent.provider_delegations.stop.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    accepted: z.boolean(),
+    // The provider answered the stop. It is not a claim that anything stopped:
+    // its receipt reports the root as stopped even for an idle tree. The
+    // delegation rows say what really happened, so the app reads those.
+    acknowledged: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const AgentRewindModeSchema = z.enum(["conversation", "files", "both"]);
 
 export const AgentRewindRequestMessageSchema = z.object({
@@ -3413,6 +3444,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentFeatureRequestMessageSchema,
   AgentConfigApplyRequestMessageSchema,
   AgentDetachRequestMessageSchema,
+  AgentProviderDelegationsStopRequestMessageSchema,
   AgentRewindRequestMessageSchema,
   AgentPermissionResponseMessageSchema,
   CheckoutStatusRequestSchema,
@@ -3821,6 +3853,9 @@ export const ServerInfoStatusPayloadSchema = z
         agentForkContextCursor: z.boolean().optional(),
         // COMPAT(providerSubagents): added in v0.1.107, remove gate after 2027-01-12.
         providerSubagents: z.boolean().optional(),
+        // COMPAT(providerDelegationStop): added after v0.13.0, remove gate after 2027-05-01.
+        // The daemon accepts a stop for a provider-owned delegation tree.
+        providerDelegationStop: z.boolean().optional(),
         // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gates after 2027-03-14; retain wire field.
         projectedSubagentTimeline: z.boolean().optional(),
         wholeTurnTimeline: z.boolean().optional(),
@@ -7160,6 +7195,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentFeatureResponseMessageSchema,
   AgentConfigApplyResponseMessageSchema,
   AgentDetachResponseMessageSchema,
+  AgentProviderDelegationsStopResponseMessageSchema,
   AgentRewindResponseMessageSchema,
   UpdateAgentResponseMessageSchema,
   ProjectRenameResponseSchema,
