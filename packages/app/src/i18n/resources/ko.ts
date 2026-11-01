@@ -441,6 +441,21 @@ export const ko: TranslationResources = {
       alreadyImported: "최근 세션이 모두 이미 가져와졌습니다.",
       noProviderSessions: "{{provider}} 세션을 찾을 수 없습니다.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "기록을 불러오는 데 몇 분과 많은 메모리가 필요할 수 있습니다",
+      body: "세션을 열기 전에 프로바이더가 대화 전체를 다시 구성합니다. 큰 세션은 메모리를 몇 기가바이트까지 사용할 수 있습니다.",
+      confirm: "그래도 가져오기",
+      cancel: "취소",
+    },
+    progress: {
+      title: "기록을 가져오는 중…",
+      body: "프로바이더가 아직 이 세션을 다시 구성하고 있습니다.",
+      elapsed: "{{seconds}}초",
+      cancel: "가져오기 중지",
+    },
+    cancelled: "가져오기를 중지했습니다. 작업 공간에 아무것도 추가되지 않았습니다.",
     row: {
       importing: "가져오는 중...",
     },

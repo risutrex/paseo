@@ -444,6 +444,21 @@ export const ru: TranslationResources = {
       alreadyImported: "Все недавние сессии уже импортированы.",
       noProviderSessions: "Сессии провайдера {{provider}} не найдены.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "Загрузка истории может занять несколько минут и много памяти",
+      body: "Перед открытием сессии провайдер заново собирает всю переписку. Большие сессии могут занять гигабайты памяти.",
+      confirm: "Всё равно импортировать",
+      cancel: "Отмена",
+    },
+    progress: {
+      title: "Импортируем историю…",
+      body: "Провайдер всё ещё собирает эту сессию.",
+      elapsed: "{{seconds}} с",
+      cancel: "Остановить импорт",
+    },
+    cancelled: "Импорт прерван. В рабочее пространство ничего не добавлено.",
     row: {
       importing: "Импортируется...",
     },

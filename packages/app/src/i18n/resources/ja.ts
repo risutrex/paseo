@@ -445,6 +445,21 @@ export const ja: TranslationResources = {
       alreadyImported: "最近のセッションはすでにすべてインポートされています。",
       noProviderSessions: "{{provider}}のセッションが見つかりません。",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "履歴の読み込みには数分と大きなメモリが必要になる場合があります",
+      body: "セッションを開く前に、プロバイダーが会話全体を再構築します。大きなセッションでは数ギガバイトのメモリを使うことがあります。",
+      confirm: "それでもインポートする",
+      cancel: "キャンセル",
+    },
+    progress: {
+      title: "履歴をインポートしています…",
+      body: "プロバイダーはまだこのセッションを再構築しています。",
+      elapsed: "{{seconds}} 秒",
+      cancel: "インポートを停止",
+    },
+    cancelled: "インポートを停止しました。ワークスペースには何も追加されていません。",
     row: {
       importing: "インポート中...",
     },

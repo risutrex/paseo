@@ -445,6 +445,21 @@ export const fr: TranslationResources = {
       alreadyImported: "Toutes les sessions récentes sont déjà importées.",
       noProviderSessions: "Aucune session {{provider}} trouvée.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "Le chargement de l’historique peut prendre plusieurs minutes et beaucoup de mémoire",
+      body: "Le fournisseur reconstruit toute la conversation avant d’ouvrir la session. Les grosses sessions peuvent occuper plusieurs gigaoctets de mémoire.",
+      confirm: "Importer quand même",
+      cancel: "Annuler",
+    },
+    progress: {
+      title: "Importation de l’historique…",
+      body: "Le fournisseur reconstruit toujours cette session.",
+      elapsed: "{{seconds}} s",
+      cancel: "Arrêter l’importation",
+    },
+    cancelled: "Importation arrêtée. Rien n’a été ajouté à votre espace de travail.",
     row: {
       importing: "Importation…",
     },

@@ -116,6 +116,9 @@ const INBOUND_PERMISSION = {
   "hub.management.daemon.get_status.request": "tunnel.manage",
   "hub.management.daemon.permissions.update.request": "access.manage",
   import_agent_request: "workspace.write",
+  // Same authority as cancelling a listing: stopping work the caller started
+  // must not need a stronger grant than watching it.
+  cancel_import_agent_request: "workspace.read",
   kill_terminal_request: "workspace.write",
   list_available_editors_request: "workspace.read",
   list_available_providers_request: "daemon.read",

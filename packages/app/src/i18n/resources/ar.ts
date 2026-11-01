@@ -440,6 +440,21 @@ export const ar: TranslationResources = {
       alreadyImported: "تم بالفعل استيراد كافة الجلسات الأخيرة.",
       noProviderSessions: "لم يتم العثور على جلسات{{provider}}.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "قد يستغرق تحميل السجل عدة دقائق ويستهلك ذاكرة كبيرة",
+      body: "يعيد المزوّد بناء المحادثة كاملة قبل فتح الجلسة. قد تستهلك الجلسات الكبيرة عدة غيغابايت من الذاكرة.",
+      confirm: "استيراد على أي حال",
+      cancel: "إلغاء",
+    },
+    progress: {
+      title: "جارٍ استيراد السجل…",
+      body: "لا يزال المزوّد يعيد بناء هذه الجلسة.",
+      elapsed: "{{seconds}} ثانية",
+      cancel: "إيقاف الاستيراد",
+    },
+    cancelled: "تم إيقاف الاستيراد. لم تتم إضافة أي شيء إلى مساحة العمل.",
     row: {
       importing: "جارٍ الاستيراد...",
     },

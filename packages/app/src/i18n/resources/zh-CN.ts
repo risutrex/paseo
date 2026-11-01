@@ -439,6 +439,21 @@ export const zhCN: TranslationResources = {
       alreadyImported: "所有最近会话都已导入。",
       noProviderSessions: "没有找到 {{provider}} 会话。",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "加载历史可能需要几分钟，并占用大量内存",
+      body: "打开会话前，提供方会重新构建整段对话。大型会话可能占用数 GB 内存。",
+      confirm: "仍然导入",
+      cancel: "取消",
+    },
+    progress: {
+      title: "正在导入历史…",
+      body: "提供方仍在重新构建此会话。",
+      elapsed: "{{seconds}} 秒",
+      cancel: "停止导入",
+    },
+    cancelled: "导入已停止，工作区中未添加任何内容。",
     row: {
       importing: "正在导入...",
     },

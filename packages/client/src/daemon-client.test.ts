@@ -5832,6 +5832,93 @@ test("releases the waiter of a recent provider sessions listing its caller aband
   expect(internal.waiters.size).toBe(0);
 });
 
+test("cancels an import the caller stopped waiting for", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const controller = new AbortController();
+  const promise = client.importAgent(
+    { providerId: "custom-codex", providerHandleId: "big-thread", cwd: "/tmp/repo" },
+    controller.signal,
+  );
+
+  expect(mock.sent).toHaveLength(1);
+  const request = JSON.parse(String(mock.sent[0])) as {
+    message: { type: string; requestId: string };
+  };
+  expect(request.message.type).toBe("import_agent_request");
+
+  controller.abort();
+
+  await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+  // Only the daemon can end the provider process that is loading the session,
+  // so a cancelled import has to be reported to it.
+  expect(mock.sent).toHaveLength(2);
+  const cancel = JSON.parse(String(mock.sent[1])) as {
+    message: { type: string; requestId: string };
+  };
+  expect(cancel.message).toMatchObject({
+    type: "cancel_import_agent_request",
+    requestId: request.message.requestId,
+  });
+});
+
+test("reports a stopped import confirmed by the daemon as a cancellation", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const promise = client.importAgent({
+    providerId: "custom-codex",
+    providerHandleId: "big-thread",
+    cwd: "/tmp/repo",
+  });
+  const request = JSON.parse(String(mock.sent[0])) as {
+    message: { requestId: string };
+  };
+
+  // The daemon finished the cancellation: the provider is gone and nothing was
+  // imported, which is a cancellation rather than an import failure.
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "status",
+      payload: {
+        status: "agent_create_failed",
+        requestId: request.message.requestId,
+        error: "Import cancelled",
+        errorCode: "import_cancelled",
+      },
+    }),
+  );
+
+  await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+});
+
 test("imports an agent by provider handle id", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

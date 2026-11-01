@@ -358,6 +358,96 @@ function PreviewsUnavailableNote() {
   );
 }
 
+/**
+ * Warns before the expensive half of an import. ACP providers answer an import
+ * with session/load, which rebuilds the whole conversation in memory; a large
+ * session takes minutes and gigabytes of RAM. Nothing reports its size —
+ * session/list has none, and bytes on disk are not a RAM forecast — so the
+ * warning states the risk instead of inventing an estimate.
+ */
+function ImportCostWarning({
+  onConfirm,
+  onCancel,
+}: {
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <View style={styles.importNotice} testID="import-session-import-warning">
+      <Text style={styles.importNoticeTitle}>{t("importSession.warning.title")}</Text>
+      <Text style={styles.importNoticeBody}>{t("importSession.warning.body")}</Text>
+      <View style={styles.importNoticeActions}>
+        <Button
+          variant="ghost"
+          size="xs"
+          onPress={onCancel}
+          testID="import-session-import-warning-cancel"
+        >
+          {t("importSession.warning.cancel")}
+        </Button>
+        <Button
+          variant="default"
+          size="xs"
+          onPress={onConfirm}
+          testID="import-session-import-warning-confirm"
+        >
+          {t("importSession.warning.confirm")}
+        </Button>
+      </View>
+    </View>
+  );
+}
+
+/**
+ * The import is running. It says so and counts the seconds, because the honest
+ * signal during a long load is "still working", and it offers the one action
+ * that matters: stopping it.
+ */
+function ImportProgressNote({
+  elapsedSeconds,
+  onCancel,
+}: {
+  elapsedSeconds: number;
+  onCancel: () => void;
+}) {
+  const { theme } = useUnistyles();
+  const { t } = useTranslation();
+  return (
+    <View style={styles.importNotice} testID="import-session-import-progress">
+      <View style={styles.importProgressHeader}>
+        <LoadingSpinner color={theme.colors.foregroundMuted} />
+        <Text style={styles.importNoticeTitle}>{t("importSession.progress.title")}</Text>
+        <Text style={styles.rowMeta} testID="import-session-import-elapsed">
+          {t("importSession.progress.elapsed", { seconds: elapsedSeconds })}
+        </Text>
+      </View>
+      <Text style={styles.importNoticeBody}>{t("importSession.progress.body")}</Text>
+      <View style={styles.importNoticeActions}>
+        <Button variant="ghost" size="xs" onPress={onCancel} testID="import-session-import-cancel">
+          {t("importSession.progress.cancel")}
+        </Button>
+      </View>
+    </View>
+  );
+}
+
+/** The client stopped the import; the provider is no longer loading it. */
+function ImportCancelledNote() {
+  const { t } = useTranslation();
+  return (
+    <Text style={styles.importCancelledNote} testID="import-session-import-cancelled">
+      {t("importSession.cancelled")}
+    </Text>
+  );
+}
+
+function isImportCancelledError(error: unknown): boolean {
+  // daemon-client answers a stopped import with an AbortError, whether the
+  // caller aborted first or the daemon confirmed the cancellation.
+  return error instanceof Error && error.name === "AbortError";
+}
+
 function SheetEmptyState({ title }: { title: string }) {
   const { theme } = useUnistyles();
   return (
@@ -597,12 +687,22 @@ export function ImportSessionSheet({
   const isShowingAllDirectories = scopePreference === "all";
   // The sheet's own `cwd` still decides where an imported agent lands; the
   // scope only changes which sessions are listed.
+  // The entry waiting for the "this import is expensive" confirmation, and the
+  // controller that stops a running import on the provider side.
+  const [pendingWarning, setPendingWarning] = useState<FetchRecentProviderSessionEntry | null>(
+    null,
+  );
+  const [importElapsedSeconds, setImportElapsedSeconds] = useState(0);
+  const importAbortRef = useRef<AbortController | null>(null);
+
   const scopeCwd = isShowingAllDirectories ? null : (cwd ?? null);
 
   useEffect(() => {
     if (visible) return;
     setScopePreference(null);
     setSearchInput("");
+    // A warning for a row the user no longer sees must not survive a reopen.
+    setPendingWarning(null);
   }, [visible]);
 
   // A narrower or wider list starts at page one; keeping a grown limit would
@@ -664,6 +764,18 @@ export function ImportSessionSheet({
   const queries = useQueries({ queries: queriesConfig });
 
   const aggregatedEntries = useMemo(() => aggregateSessionEntries(queries), [queries]);
+  // A provider that listed without prompt previews cannot read a session
+  // cheaply either: its import has to rebuild the history on the provider side.
+  // Providers that preview cheaply import cheaply, so they get no warning.
+  const expensiveImportProviders = useMemo(() => {
+    const providers = new Set<string>();
+    providersToFetch?.forEach((provider, index) => {
+      if (queries[index]?.data?.previewsUnavailable === true) {
+        providers.add(provider);
+      }
+    });
+    return providers;
+  }, [providersToFetch, queries]);
   // Any provider answering without prompt previews makes that provider's rows
   // a names-and-folders match, so the note is a property of the whole list.
   // Without a search there is nothing to explain: no prompt was looked for.
@@ -798,13 +910,29 @@ export function ImportSessionSheet({
         workspaceId,
         isScopedListing: scopeCwd !== null,
       });
-      const agent = await client.importAgent({
-        providerId: entry.providerId,
-        providerHandleId: entry.providerHandleId,
-        cwd: entry.cwd,
-        ...(target.workspaceId ? { workspaceId: target.workspaceId } : {}),
-      });
-      return { agent, target };
+      // Cancelling has to reach the provider: the signal ends this request and
+      // asks the daemon to stop the process that is loading the session.
+      const controller = new AbortController();
+      importAbortRef.current = controller;
+      try {
+        const agent = await client.importAgent(
+          {
+            providerId: entry.providerId,
+            providerHandleId: entry.providerHandleId,
+            cwd: entry.cwd,
+            ...(target.workspaceId ? { workspaceId: target.workspaceId } : {}),
+          },
+          controller.signal,
+        );
+        return { agent, target };
+      } finally {
+        if (importAbortRef.current === controller) {
+          importAbortRef.current = null;
+        }
+      }
+    },
+    onMutate: () => {
+      setImportElapsedSeconds(0);
     },
     onSuccess: ({ agent, target }) => {
       onClose();
@@ -820,6 +948,20 @@ export function ImportSessionSheet({
     },
   });
 
+  const importing = importMutation.isPending;
+  // The provider reports no progress, so elapsed time is the honest sign that
+  // the import is working instead of stuck.
+  useEffect(() => {
+    if (!importing) return;
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      setImportElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1_000);
+    return () => clearInterval(timer);
+  }, [importing]);
+
+  const importCancelled = importMutation.isError && isImportCancelledError(importMutation.error);
+
   const importingSessionKey =
     importMutation.isPending && importMutation.variables
       ? `${importMutation.variables.providerId}:${importMutation.variables.providerHandleId}`
@@ -827,10 +969,29 @@ export function ImportSessionSheet({
 
   const handleImportSession = useCallback(
     (entry: FetchRecentProviderSessionEntry) => {
+      if (expensiveImportProviders.has(entry.providerId)) {
+        // The provider rebuilds this session's history for the import, so the
+        // warning comes before that work starts, not after it looks hung.
+        setPendingWarning(entry);
+        return;
+      }
       importMutation.mutate(entry);
     },
-    [importMutation],
+    [expensiveImportProviders, importMutation],
   );
+
+  const handleConfirmImport = useCallback(() => {
+    if (!pendingWarning) return;
+    const entry = pendingWarning;
+    setPendingWarning(null);
+    importMutation.mutate(entry);
+  }, [pendingWarning, importMutation]);
+
+  const handleDismissImportWarning = useCallback(() => setPendingWarning(null), []);
+
+  const handleCancelImport = useCallback(() => {
+    importAbortRef.current?.abort();
+  }, []);
 
   const providerErrorRows = useMemo(
     () => collectProviderErrorRows(providersToFetch, queries, providerLabelById),
@@ -936,21 +1097,48 @@ export function ImportSessionSheet({
   });
   const showFilter = filterProviders.length > 1;
   const showLoadMore = hasMoreSessions(queries, pageLimit);
-  const showListHeader = hasListHeader({
-    showFilter,
-    isClientReady: Boolean(client),
-    isSnapshotUnsupported,
-    hasNoImportableProviders,
-    isLoadingSessions,
-    hasRows: visibleEntries.length > 0,
-    importErrored: importMutation.isError,
-    hasProviderErrors: providerErrorRows.length > 0,
-    hasPreviewsUnavailable: previewsUnavailable,
-  });
+  const importNotice = useMemo(() => {
+    if (pendingWarning) {
+      return (
+        <ImportCostWarning onConfirm={handleConfirmImport} onCancel={handleDismissImportWarning} />
+      );
+    }
+    if (importing) {
+      return (
+        <ImportProgressNote elapsedSeconds={importElapsedSeconds} onCancel={handleCancelImport} />
+      );
+    }
+    if (importCancelled) {
+      return <ImportCancelledNote />;
+    }
+    return null;
+  }, [
+    pendingWarning,
+    importing,
+    importElapsedSeconds,
+    importCancelled,
+    handleConfirmImport,
+    handleDismissImportWarning,
+    handleCancelImport,
+  ]);
+  const showListHeader =
+    hasListHeader({
+      showFilter,
+      isClientReady: Boolean(client),
+      isSnapshotUnsupported,
+      hasNoImportableProviders,
+      isLoadingSessions,
+      hasRows: visibleEntries.length > 0,
+      // A stopped import is not a failure, so it must not read like one.
+      importErrored: importMutation.isError && !importCancelled,
+      hasProviderErrors: providerErrorRows.length > 0,
+      hasPreviewsUnavailable: previewsUnavailable,
+    }) || importNotice !== null;
   const listHeader = useMemo(
     () =>
       showListHeader ? (
         <View style={styles.listHeaderContent}>
+          {importNotice}
           {showFilter ? (
             <View ref={filterAnchorRef} collapsable={false} style={styles.filterTriggerWrap}>
               <Pressable
@@ -991,7 +1179,7 @@ export function ImportSessionSheet({
             hasNoImportableProviders={hasNoImportableProviders}
             isLoadingSessions={isLoadingSessions}
             hasRows={visibleEntries.length > 0}
-            importErrored={importMutation.isError}
+            importErrored={importMutation.isError && !importCancelled}
           />
           {providerErrorRows.length > 0 ? (
             <ProviderErrorBanner rows={providerErrorRows} onRetry={handleRetryProvider} />
@@ -1021,6 +1209,8 @@ export function ImportSessionSheet({
       providerErrorRows,
       handleRetryProvider,
       previewsUnavailable,
+      importNotice,
+      importCancelled,
     ],
   );
   const listFooter = useMemo(
@@ -1196,6 +1386,40 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: theme.fontSize.base,
   },
   previewsNote: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+  },
+  importNotice: {
+    gap: theme.spacing[2],
+    marginBottom: theme.spacing[2],
+    borderWidth: theme.borderWidth[1],
+    borderColor: theme.colors.border,
+    borderRadius: theme.borderRadius.lg,
+    backgroundColor: theme.colors.surface1,
+    paddingVertical: theme.spacing[3],
+    paddingHorizontal: theme.spacing[3],
+  },
+  importProgressHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+  },
+  importNoticeTitle: {
+    flexShrink: 1,
+    color: theme.colors.foreground,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+  },
+  importNoticeBody: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+  },
+  importNoticeActions: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: theme.spacing[2],
+  },
+  importCancelledNote: {
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.sm,
   },

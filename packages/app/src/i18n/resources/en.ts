@@ -437,6 +437,21 @@ export const en = {
       alreadyImported: "All recent sessions are already imported.",
       noProviderSessions: "No {{provider}} sessions found.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "Loading the history can take several minutes and a lot of memory",
+      body: "The provider rebuilds the whole conversation before the session opens. Large sessions can use gigabytes of RAM.",
+      confirm: "Import anyway",
+      cancel: "Cancel",
+    },
+    progress: {
+      title: "Importing history…",
+      body: "The provider is still rebuilding this session.",
+      elapsed: "{{seconds}}s",
+      cancel: "Stop import",
+    },
+    cancelled: "Import stopped. Nothing was added to your workspace.",
     row: {
       importing: "Importing...",
     },

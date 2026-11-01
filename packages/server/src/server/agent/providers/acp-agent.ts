@@ -113,6 +113,7 @@ import {
   resolveDefaultAgentCreateConfig,
 } from "../create-agent-mode.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
+import { registerInFlightImportProcess } from "../import-session-cancellation.js";
 import {
   checkProviderLaunchAvailable,
   createProviderEnv,
@@ -2427,13 +2428,32 @@ export class ACPAgentSession implements AgentSession, ACPClient {
    * from these calls regardless of capabilities.
    */
   async initializeResumedSession(): Promise<void> {
+    const handle = this.initialHandle;
+    if (!handle) {
+      throw new Error("Resume requested without persistence handle");
+    }
+    // An import spends minutes inside this method: the provider rebuilds the
+    // whole conversation for session/load. Registering the cancellation before
+    // the process exists lets a stopped import kill the child, while `dispose`
+    // in `finally` keeps a finished session from counting as an in-flight
+    // import that a later cancel could kill.
+    const cancellation = this.trackResumeCancellation(handle.sessionId);
     try {
-      const handle = this.initialHandle;
-      if (!handle) {
-        throw new Error("Resume requested without persistence handle");
-      }
-
-      const spawned = await this.spawnProcess();
+      const spawnPromise = this.spawnProcess();
+      // A cancellation that lands during the handshake races past the spawn, so
+      // the process that starts afterwards has to be stopped here.
+      spawnPromise.then(
+        (spawnedProcess) => {
+          if (!cancellation.cancelled()) {
+            return undefined;
+          }
+          return terminateChildProcess(spawnedProcess.child, 1_000, this.terminateProcess).catch(
+            () => undefined,
+          );
+        },
+        () => undefined,
+      );
+      const spawned = await cancellation.race(spawnPromise);
       this.child = spawned.child;
       this.connection = spawned.connection;
       this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
@@ -2445,11 +2465,13 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       if (this.agentCapabilities?.loadSession) {
         this.replayingHistory = true;
         const response = await this.runACPRequest(() =>
-          this.connection!.loadSession({
-            sessionId: handle.sessionId,
-            cwd: this.config.cwd,
-            mcpServers: this.acpMcpServers(),
-          }),
+          cancellation.race(
+            this.connection!.loadSession({
+              sessionId: handle.sessionId,
+              cwd: this.config.cwd,
+              mcpServers: this.acpMcpServers(),
+            }),
+          ),
         );
         this.deliverTranslatedEvents(this.flushPendingUserMessage());
         this.replayingHistory = false;
@@ -2476,7 +2498,50 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       }
     } catch (error) {
       await this.closeAfterInitializationFailure(error);
+    } finally {
+      cancellation.dispose();
     }
+  }
+
+  /**
+   * Watches one session initialization so an import can stop it.
+   *
+   * `session/load` makes the provider replay (and hold) the whole history, so
+   * releasing the waiting caller is not enough: cancellation kills the child and
+   * rejects the pending request, leaving the caller with a dead import instead
+   * of a process that keeps working for nobody.
+   */
+  private trackResumeCancellation(sessionId: string): {
+    race: <T>(request: Promise<T>) => Promise<T>;
+    cancelled: () => boolean;
+    dispose: () => void;
+  } {
+    let cancelled = false;
+    let rejectCancelled: ((error: Error) => void) | null = null;
+    const cancelledPromise = new Promise<never>((_resolve, reject) => {
+      rejectCancelled = reject;
+    });
+    // The losing branch of every race must not read as an unhandled rejection.
+    cancelledPromise.catch(() => undefined);
+    const unregister = registerInFlightImportProcess(this.provider, sessionId, async () => {
+      cancelled = true;
+      rejectCancelled?.(new Error(`${this.provider} session import was cancelled`));
+      const child = this.child;
+      if (!child) return;
+      try {
+        await terminateChildProcess(child, 1_000, this.terminateProcess);
+      } catch (error) {
+        this.logger.warn(
+          { err: error, sessionId },
+          "ACP cancelled import process could not be stopped",
+        );
+      }
+    });
+    return {
+      race: (request) => Promise.race([request, cancelledPromise]),
+      cancelled: () => cancelled,
+      dispose: unregister,
+    };
   }
 
   // History resumes exist to replay persisted events into the canonical

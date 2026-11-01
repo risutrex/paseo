@@ -139,6 +139,7 @@ import {
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import {
+  ImportCancelledError,
   ImportSessionsRequestError,
   importProviderSession,
   listImportableProviderSessions,
@@ -801,6 +802,10 @@ export class Session {
   // moves on (another keystroke, a closed sheet) cancels the listing, so the
   // provider stops working on an answer nobody reads.
   private readonly recentProviderSessionListings = new Map<string, AbortController>();
+  // Imports the client has not abandoned yet, by request id. Importing a large
+  // provider session is minutes of provider work, so a cancelled import has to
+  // end the process doing it, not only stop the wait.
+  private readonly importingAgentRequests = new Map<string, AbortController>();
   private readonly terminalManager: TerminalManager | null;
   private readonly providerSnapshotManager: ProviderSnapshotManager;
   private readonly serviceProxy: ServiceProxySubsystem | null;
@@ -2894,6 +2899,7 @@ export class Session {
     }
   }
 
+  // eslint-disable-next-line complexity -- one case per inbound session message
   private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     switch (msg.type) {
       case "fetch_agents_request":
@@ -2904,6 +2910,9 @@ export class Session {
         return this.handleFetchRecentProviderSessions(msg);
       case "cancel_recent_provider_sessions_request":
         this.handleCancelRecentProviderSessions(msg);
+        return undefined;
+      case "cancel_import_agent_request":
+        this.handleCancelImportAgent(msg);
         return undefined;
       case "fetch_agent_request":
         return this.handleFetchAgent(msg.agentId, msg.requestId);
@@ -4710,6 +4719,12 @@ export class Session {
       `Importing agent ${providerHandleId} (${provider})`,
     );
 
+    // An import makes the provider rebuild the whole conversation (ACP
+    // session/load); for a large session that is minutes of provider work. The
+    // request id maps to a controller so a client that stops waiting can stop
+    // the import instead of leaving the provider loading a session nobody opens.
+    const controller = new AbortController();
+    this.importingAgentRequests.set(requestId, controller);
     try {
       if (!normalized.cwd) {
         throw new Error("Import requires cwd from the selected provider session");
@@ -4720,7 +4735,13 @@ export class Session {
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) {
+        // The import finished after the client gave up. importProviderSession
+        // rolled the registered agent back, so there is nothing to announce.
+        return;
+      }
       if (createdWorkspace) {
         await this.registerWorkspaceForImportedAgent(createdWorkspace);
       }
@@ -4736,6 +4757,21 @@ export class Session {
         },
       });
     } catch (error) {
+      if (controller.signal.aborted || error instanceof ImportCancelledError) {
+        // A cancelled import is not a failure: the provider process was ended on
+        // purpose, and the client is told plainly that nothing was imported.
+        this.sessionLogger.info({ provider, providerHandleId }, "Agent import cancelled");
+        this.emit({
+          type: "status",
+          payload: {
+            status: "agent_create_failed",
+            requestId,
+            error: "Import cancelled",
+            errorCode: "import_cancelled",
+          },
+        });
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       this.sessionLogger.error({ err: error }, "Failed to import agent");
       this.emit({
@@ -4755,6 +4791,10 @@ export class Session {
           content: `Failed to import agent: ${message}`,
         },
       });
+    } finally {
+      if (this.importingAgentRequests.get(requestId) === controller) {
+        this.importingAgentRequests.delete(requestId);
+      }
     }
   }
 
@@ -6464,6 +6504,23 @@ export class Session {
       return;
     }
     this.recentProviderSessionListings.delete(request.requestId);
+    controller.abort();
+  }
+
+  /**
+   * Stops an import the client no longer waits for. Aborting the controller
+   * ends the provider process that is rebuilding the session and rolls back an
+   * agent the import had already registered.
+   */
+  private handleCancelImportAgent(
+    request: Extract<SessionInboundMessage, { type: "cancel_import_agent_request" }>,
+  ): void {
+    const controller = this.importingAgentRequests.get(request.requestId);
+    if (!controller) {
+      // The import already finished (or never started). Nothing to stop.
+      return;
+    }
+    this.importingAgentRequests.delete(request.requestId);
     controller.abort();
   }
 

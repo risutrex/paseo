@@ -3589,7 +3589,7 @@ export class DaemonClient {
     return status.agent;
   }
 
-  async importAgent(input: ImportAgentInput): Promise<AgentSnapshotPayload> {
+  async importAgent(input: ImportAgentInput, signal?: AbortSignal): Promise<AgentSnapshotPayload> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
       type: "import_agent_request",
@@ -3601,34 +3601,59 @@ export class DaemonClient {
       ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
       ...(input.labels && Object.keys(input.labels).length > 0 ? { labels: input.labels } : {}),
     });
-
-    const status = await this.sendRequest({
-      requestId,
-      message,
-      options: { skipQueue: true },
-      select: (msg) => {
-        if (msg.type !== "status") {
-          return null;
-        }
-        const resumed = AgentResumedStatusPayloadSchema.safeParse(msg.payload);
-        if (resumed.success && resumed.data.requestId === requestId) {
-          return resumed.data;
-        }
-
-        const failed = AgentCreateFailedStatusPayloadSchema.safeParse(msg.payload);
-        if (failed.success && failed.data.requestId === requestId) {
-          return failed.data;
-        }
-
-        return null;
-      },
-    });
-
-    if (status.status === "agent_create_failed") {
-      throw new Error(status.error);
+    if (signal?.aborted) {
+      throw createAbortedError();
     }
+    // An import is expensive work on the provider side (ACP session/load). A
+    // caller that stops waiting (the user pressed "Stop import") must stop that
+    // work, otherwise the provider keeps rebuilding a conversation nobody will
+    // open. The daemon kills the process and answers with `import_cancelled`.
+    const cancelImport = () => {
+      void this.sendSessionMessageOrThrow(
+        SessionInboundMessageSchema.parse({
+          type: "cancel_import_agent_request",
+          requestId,
+        }),
+      ).catch(() => undefined);
+    };
+    signal?.addEventListener("abort", cancelImport, { once: true });
+    try {
+      const status = await this.sendRequest({
+        requestId,
+        message,
+        options: { skipQueue: true },
+        signal,
+        select: (msg) => {
+          if (msg.type !== "status") {
+            return null;
+          }
+          const resumed = AgentResumedStatusPayloadSchema.safeParse(msg.payload);
+          if (resumed.success && resumed.data.requestId === requestId) {
+            return resumed.data;
+          }
 
-    return status.agent;
+          const failed = AgentCreateFailedStatusPayloadSchema.safeParse(msg.payload);
+          if (failed.success && failed.data.requestId === requestId) {
+            return failed.data;
+          }
+
+          return null;
+        },
+      });
+
+      if (status.status === "agent_create_failed") {
+        // The daemon confirms the stopped import left nothing behind, so this is
+        // a cancellation the caller asked for, not a failure to report.
+        if (status.errorCode === "import_cancelled") {
+          throw createAbortedError();
+        }
+        throw new Error(status.error);
+      }
+
+      return status.agent;
+    } finally {
+      signal?.removeEventListener("abort", cancelImport);
+    }
   }
 
   async refreshAgent(agentId: string, requestId?: string): Promise<AgentRefreshedStatusPayload> {

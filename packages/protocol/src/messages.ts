@@ -1422,6 +1422,15 @@ export const CancelRecentProviderSessionsRequestMessageSchema = z.object({
   requestId: z.string(),
 });
 
+// Importing a provider session can make the provider rebuild a whole
+// conversation (ACP session/load). A client that no longer waits for it asks
+// for the import to stop, so the daemon can kill the provider process instead
+// of leaving it loading a session nobody will open.
+export const CancelImportAgentRequestMessageSchema = z.object({
+  type: z.literal("cancel_import_agent_request"),
+  requestId: z.string(),
+});
+
 export const FetchAgentRequestMessageSchema = z.object({
   type: z.literal("fetch_agent_request"),
   requestId: z.string(),
@@ -3314,6 +3323,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   FetchAgentHistoryRequestMessageSchema,
   FetchRecentProviderSessionsRequestMessageSchema,
   CancelRecentProviderSessionsRequestMessageSchema,
+  CancelImportAgentRequestMessageSchema,
   FetchWorkspacesRequestMessageSchema,
   ProjectListRequestMessageSchema,
   FetchAgentRequestMessageSchema,

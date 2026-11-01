@@ -444,6 +444,21 @@ export const ptBR: TranslationResources = {
       alreadyImported: "Todas as sessões recentes já foram importadas.",
       noProviderSessions: "Nenhuma sessão de {{provider}} encontrada.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "Carregar o histórico pode levar vários minutos e muita memória",
+      body: "O provedor reconstrói a conversa inteira antes de abrir a sessão. Sessões grandes podem usar gigabytes de memória.",
+      confirm: "Importar mesmo assim",
+      cancel: "Cancelar",
+    },
+    progress: {
+      title: "Importando o histórico…",
+      body: "O provedor ainda está reconstruindo esta sessão.",
+      elapsed: "{{seconds}} s",
+      cancel: "Parar importação",
+    },
+    cancelled: "Importação interrompida. Nada foi adicionado ao seu workspace.",
     row: {
       importing: "Importando...",
     },

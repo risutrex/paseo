@@ -66,6 +66,10 @@ import { buildProviderRegistry } from "../provider-registry.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { buildStringCommandShellInvocation } from "../../../utils/string-command-shell.js";
 import { asInternals } from "../../test-utils/class-mocks.js";
+import {
+  cancelInFlightImportProcess,
+  countInFlightImportProcesses,
+} from "../import-session-cancellation.js";
 import * as spawnUtils from "../../../utils/spawn.js";
 
 describe("buildACPClientCapabilities", () => {
@@ -6582,5 +6586,120 @@ describe("ACP interruption contract — interruption waits for the provider to r
 
     await expect(session.interrupt()).resolves.toBeUndefined();
     expect(cancel).not.toHaveBeenCalled();
+  });
+});
+
+describe("ACP import cancellation", () => {
+  const IMPORT_SESSION_ID = "big-history-session";
+
+  function createImportPersistenceHandle(): AgentPersistenceHandle {
+    return {
+      provider: "claude-acp",
+      sessionId: IMPORT_SESSION_ID,
+      metadata: { provider: "claude-acp", cwd: "/tmp/paseo-acp-test" },
+    };
+  }
+
+  /**
+   * Stands in for the provider process. Importing is a session/load, so the
+   * load is what hangs while the user waits; the abort has to end the child.
+   */
+  function makeImportSession(args: {
+    spawn: () => Promise<SpawnedACPProcess>;
+    terminateProcess: ProcessTerminator;
+  }) {
+    class TestSession extends ACPAgentSession {
+      protected override async spawnProcess(): Promise<SpawnedACPProcess> {
+        return await args.spawn();
+      }
+    }
+
+    return new TestSession(
+      { provider: "claude-acp", cwd: "/tmp/paseo-acp-test" },
+      {
+        provider: "claude-acp",
+        logger: createTestLogger(),
+        defaultCommand: ["claude", "--acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+        handle: createImportPersistenceHandle(),
+        terminateProcess: args.terminateProcess,
+      },
+    );
+  }
+
+  function makeSpawned(
+    child: ChildProcessWithoutNullStreams,
+    loadSession: ReturnType<typeof vi.fn>,
+  ) {
+    return {
+      child,
+      connection: {
+        prompt: vi.fn(),
+        loadSession,
+        unstable_resumeSession: vi.fn(),
+      } as unknown as ClientSideConnection,
+      initialize: { agentCapabilities: { loadSession: true } },
+    } as SpawnedACPProcess;
+  }
+
+  test("cancelling an import kills the process that is loading the history", async () => {
+    const terminate = new FakeTerminator();
+    const child = createProbeChildStub();
+    let loadStarted: () => void = () => {};
+    const loadStartedPromise = new Promise<void>((resolve) => {
+      loadStarted = resolve;
+    });
+    const loadSession = vi.fn(() => {
+      loadStarted();
+      // The provider rebuilds the whole conversation and never answers.
+      return new Promise<never>(() => {});
+    });
+    const session = makeImportSession({
+      spawn: async () => makeSpawned(child, loadSession),
+      terminateProcess: terminate.terminate,
+    });
+
+    const resuming = session.initializeResumedSession();
+    await loadStartedPromise;
+    expect(countInFlightImportProcesses("claude-acp", IMPORT_SESSION_ID)).toBe(1);
+
+    await expect(cancelInFlightImportProcess("claude-acp", IMPORT_SESSION_ID)).resolves.toBe(1);
+
+    // The resume ends as cancelled instead of waiting for a history nobody will
+    // look at, and the process that was loading it is gone.
+    await expect(resuming).rejects.toThrow(/session import was cancelled/);
+    expect(terminate.terminated[0]).toBe(child);
+    expect(countInFlightImportProcesses("claude-acp", IMPORT_SESSION_ID)).toBe(0);
+  });
+
+  test("an import cancelled during the handshake stops the process that starts afterwards", async () => {
+    const terminate = new FakeTerminator();
+    const child = createProbeChildStub();
+    let releaseSpawn: (spawned: SpawnedACPProcess) => void = () => {};
+    const session = makeImportSession({
+      spawn: () =>
+        new Promise<SpawnedACPProcess>((resolve) => {
+          releaseSpawn = resolve;
+        }),
+      terminateProcess: terminate.terminate,
+    });
+
+    const resuming = session.initializeResumedSession();
+    await expect(cancelInFlightImportProcess("claude-acp", IMPORT_SESSION_ID)).resolves.toBe(1);
+    await expect(resuming).rejects.toThrow(/session import was cancelled/);
+
+    releaseSpawn(makeSpawned(child, vi.fn()));
+
+    await vi.waitFor(() => {
+      expect(terminate.terminated).toContain(child);
+    });
   });
 });
