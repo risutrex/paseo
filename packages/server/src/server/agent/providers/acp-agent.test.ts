@@ -117,6 +117,7 @@ interface ACPSessionInternals {
   };
   agentMeta: Record<string, unknown> | null;
   activeForegroundTurnId: string | null;
+  foregroundPrompts: Map<string, unknown>;
   configOptions: SessionConfigOption[];
   translateSessionUpdate(update: SessionUpdate): AgentStreamEvent[];
   acpMcpServers(): unknown[];
@@ -6556,6 +6557,24 @@ describe("custom ACP provider with configured models", () => {
 });
 
 describe("ACP interruption contract — interruption waits for the provider to release the session", () => {
+  test("keeps a single foreground prompt, so a late answer cannot settle another turn", async () => {
+    const session = createSession();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    const internals = asInternals<ACPSessionInternals>(session);
+    internals.sessionId = "session-1";
+    internals.connection = { prompt, cancel };
+
+    await session.startTurn("hello");
+
+    // Only one foreground prompt may be in flight, so the map the
+    // interruption waits on holds exactly one entry. A late answer of an
+    // older prompt therefore cannot settle a newer turn.
+    await expect(session.startTurn("second")).rejects.toThrow(/already active/);
+    expect(internals.foregroundPrompts.size).toBe(1);
+  });
+
   test("interrupt() does not resolve while the provider still owns the foreground turn", async () => {
     const session = createSession();
     let resolvePrompt!: (value: PromptResponse) => void;
