@@ -425,7 +425,8 @@ export const en = {
       scopeToWorkspace: "This workspace",
     },
     previews: {
-      unavailable: "Some providers were searched by title and folder only — their prompt text was not loaded.",
+      unavailable:
+        "Some providers were searched by title and folder only — their prompt text was not loaded.",
     },
     preview: {
       untitledSession: "Untitled session",
