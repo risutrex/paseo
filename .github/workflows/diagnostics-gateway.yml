@@ -11,42 +11,39 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Where does LiteLLM connect
+      - name: Where does the timeout come from
         run: |
           cat > /tmp/probe.py <<'PY'
+          import inspect
           import os
-          import socket
-          import time
-          import urllib.request
 
-          print("--- plain https to api.anthropic.com ---")
-          started = time.time()
+          print("--- litellm timeout wording ---")
+          import litellm.litellm_core_utils.exception_mapping_utils as mapping
+          source = inspect.getsource(mapping)
+          for line in source.splitlines():
+              lowered = line.lower()
+              if "timed out" in lowered or "ConnectTimeout" in line or "ReadTimeout" in line:
+                  print("   ", line.strip()[:140])
+
+          print("--- pr-agent timeout settings ---")
+          import pr_agent.settings as settings
+          names = [n for n in dir(settings) if "TIMEOUT" in n.upper()]
+          print("   settings names:", names)
           try:
-              request = urllib.request.Request("https://api.anthropic.com/v1/messages", data=b"{}", headers={"content-type": "application/json"})
-              with urllib.request.urlopen(request, timeout=15) as response:
-                  print("anthropic.com ->", response.status, "%.2fs" % (time.time() - started))
+              resolved = settings.get_settings()
+              for name in names:
+                  print("   ", name, "=", getattr(resolved, name.lower(), None))
           except Exception as error:
-              print("anthropic.com failed:", type(error).__name__, str(error)[:120], "%.2fs" % (time.time() - started))
+              print("   settings failed:", type(error).__name__, error)
 
-          print("--- litellm with ANTHROPIC_API_BASE set ---")
-          os.environ["ANTHROPIC_API_BASE"] = "https://gate.trinity.guru/omni"
-          os.environ["ANTHROPIC_API_KEY"] = "dummy-key"
-          import litellm
-
-          print("litellm version:", getattr(litellm, "__version__", "?"))
-          print("litellm.api_base:", litellm.api_base)
-          started = time.time()
-          try:
-              litellm.completion(
-                  model="anthropic/deepseek-v4.1-flash",
-                  messages=[{"role": "user", "content": "hi"}],
-                  timeout=25,
-              )
-              print("completion OK %.2fs" % (time.time() - started))
-          except Exception as error:
-              print("completion failed:", type(error).__name__, str(error)[:300], "%.2fs" % (time.time() - started))
-              print("  api_base:", getattr(error, "api_base", None))
-              print("  model:", getattr(error, "model", None))
+          print("--- env vars pr-agent reads for timeouts ---")
+          import pathlib
+          root = pathlib.Path(settings.__file__).parent
+          for path in root.rglob("*.py"):
+              text = path.read_text(errors="ignore")
+              for line in text.splitlines():
+                  if "REQUEST_TIMEOUT" in line or "request_timeout" in line:
+                      print("   ", path.name, ":", line.strip()[:140])
           PY
           docker run --rm -v /tmp/probe.py:/probe.py:ro --entrypoint python3 \
             pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c /probe.py
