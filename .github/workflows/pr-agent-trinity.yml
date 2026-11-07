@@ -50,7 +50,9 @@ jobs:
           CONFIG__FALLBACK_MODELS: "[]"
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"
           CONFIG__MAX_MODEL_TOKENS: "128000"
-          CONFIG__MAX_OUTPUT_TOKENS: "32000"
+          # The reviewer reasons for a long time on a large diff, and 32k output
+          # tokens were cut off before it wrote the answer.
+          CONFIG__MAX_OUTPUT_TOKENS: "64000"
           CONFIG__USE_REPO_SETTINGS_FILE: "false"
           CONFIG__USE_GLOBAL_SETTINGS_FILE: "false"
           CONFIG__ENABLE_PER_DIRECTORY_SETTINGS: "false"
