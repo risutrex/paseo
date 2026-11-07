@@ -28,7 +28,7 @@ jobs:
        startsWith(github.event.comment.body, '/review ') ||
        startsWith(github.event.comment.body, '/ask '))
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
     steps:
       # PR-Agent v0.49.0; its action wrapper otherwise pulls a mutable image.
       - name: Run PR-Agent
@@ -41,6 +41,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # LiteLLM appends /v1/messages unless it is already present.
           ANTHROPIC_API_BASE: ${{ vars.ANTHROPIC_API_BASE }}
+          # The review of a large pull request takes longer than the default
+          # ai_timeout of 120 seconds, and the request is cut off in the middle
+          # of the answer.
+          CONFIG__AI_TIMEOUT: "600"
           CONFIG__MODEL: anthropic/deepseek-v4.1-flash
           CONFIG__MODEL_WEAK: anthropic/deepseek-v4.1-flash
           CONFIG__FALLBACK_MODELS: "[]"
