@@ -21,8 +21,8 @@ jobs:
   pr_agent:
     if: >-
       github.repository == 'risutrex/paseo' &&
-      github.event.sender.id == 346105760 &&
-      github.event.comment.user.id == 346105760 &&
+      github.event.sender.login == 'risutrex' &&
+      github.event.comment.user.login == 'risutrex' &&
       github.event.issue.pull_request &&
       (github.event.comment.body == '/review' ||
        startsWith(github.event.comment.body, '/review ') ||
