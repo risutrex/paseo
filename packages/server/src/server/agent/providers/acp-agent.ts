@@ -1469,10 +1469,16 @@ export class ACPAgentClient implements AgentClient {
           recycled = true;
           probeState.current = await this.recycleImportProbe(probeState, history, context.abort);
         } else {
-          // The probe is known to be stuck and may not be replaced any more.
-          // Stop asking it for previews instead of waiting for every remaining
-          // session to time out.
+          // The probe is known to be stuck and its unanswered session/load
+          // still owns the connection: any later session/list would only queue
+          // behind that load and fail the whole listing on the 20s timeout.
+          // Replace it one last time with the previews off, so the rest of the
+          // scan reads from a connection that is known to be free. A probe that
+          // never loads a history cannot get stuck, so this happens once and
+          // the recycle budget still bounds the preview probes.
           canLoadHistory = false;
+          recycled = true;
+          probeState.current = await this.recycleImportProbe(probeState, history, context.abort);
         }
         continue;
       }

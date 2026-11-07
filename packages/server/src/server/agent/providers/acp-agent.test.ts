@@ -3036,8 +3036,9 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
       await vi.advanceTimersByTimeAsync(20_000);
       const result = await listing;
 
-      // The probe is replaced a bounded number of times and then left alone.
-      expect(children).toHaveLength(4);
+      // The probe is replaced a bounded number of times; the last replacement
+      // only lists, so it is never asked for another preview.
+      expect(children).toHaveLength(5);
       expect(loadSession).toHaveBeenCalledTimes(4);
       // Every session stays visible, the ones without a preview included.
       expect(result.map((session) => session.providerHandleId)).toEqual([
@@ -3052,7 +3053,7 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
     }
   });
 
-  test("skips the previews of the later pages once the probe is known to be stuck", async () => {
+  test("reads the later pages from a free probe once the recycle budget is spent", async () => {
     vi.useFakeTimers();
     try {
       const terminateProcess = vi.fn(async () => {});
@@ -3068,26 +3069,40 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
         title: `session ${index + 6}`,
         updatedAt: "2026-06-14T00:00:00.000Z",
       }));
-      const listSessions = vi.fn(async (params?: { cursor?: string }) =>
-        params?.cursor
+      // A provider answers one request at a time, so a probe that still owes
+      // the provider an unanswered session/load never answers the next
+      // session/list either: the request only queues behind that load. Mocking
+      // an instant answer here would hide exactly the defect under test.
+      const busyProbes = new Set<number>();
+      let activeProbe = 0;
+      const listSessions = vi.fn(async (params?: { cursor?: string }) => {
+        if (busyProbes.has(activeProbe)) return await new Promise<never>(() => {});
+        return params?.cursor
           ? { sessions: secondPage, nextCursor: null }
-          : { sessions: firstPage, nextCursor: "cursor-2" },
-      );
-      const loadSession = vi.fn(async () => await new Promise<never>(() => {}));
+          : { sessions: firstPage, nextCursor: "cursor-2" };
+      });
+      const loadSession = vi.fn(async () => {
+        busyProbes.add(activeProbe);
+        return await new Promise<never>(() => {});
+      });
 
-      const { client } = makeClient({
+      const { client, children } = makeClient({
         listSessions,
         loadSession,
         terminateProcess,
+        onSpawn: (index) => {
+          activeProbe = index;
+        },
       });
 
       const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
-      await vi.advanceTimersByTimeAsync(20_000);
+      // Every history load stays unanswered, so the probe is replaced until the
+      // recycle budget is spent, and the page that follows still has to be
+      // read. Advancing past the session/list timeout as well proves that the
+      // scan does not wait on a probe it already knows to be stuck.
+      await vi.advanceTimersByTimeAsync(40_000);
       const result = await listing;
 
-      // The probe is replaced a bounded number of times and then left alone,
-      // so the sessions of the later page are listed without previews.
-      expect(loadSession).toHaveBeenCalledTimes(4);
       expect(result.map((session) => session.providerHandleId)).toEqual([
         "s1",
         "s2",
@@ -3098,7 +3113,12 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
         "s7",
         "s8",
       ]);
+      // The sessions of the later page stay visible without a preview instead
+      // of the whole listing failing on a queued session/list.
       expect(result.slice(5).every((session) => session.firstPromptPreview === null)).toBe(true);
+      // The stuck probe is closed, and the free one lists the rest.
+      expect(children).toHaveLength(5);
+      expect(terminateProcess.mock.calls.some((call) => call[0] === children[3])).toBe(true);
     } finally {
       vi.useRealTimers();
     }
