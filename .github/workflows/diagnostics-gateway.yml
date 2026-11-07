@@ -11,39 +11,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Where does the timeout come from
+      - name: Find the timeout setting
         run: |
           cat > /tmp/probe.py <<'PY'
-          import inspect
-          import os
-
-          print("--- litellm timeout wording ---")
-          import litellm.litellm_core_utils.exception_mapping_utils as mapping
-          source = inspect.getsource(mapping)
-          for line in source.splitlines():
-              lowered = line.lower()
-              if "timed out" in lowered or "ConnectTimeout" in line or "ReadTimeout" in line:
-                  print("   ", line.strip()[:140])
-
-          print("--- pr-agent timeout settings ---")
-          import pr_agent.settings as settings
-          names = [n for n in dir(settings) if "TIMEOUT" in n.upper()]
-          print("   settings names:", names)
-          try:
-              resolved = settings.get_settings()
-              for name in names:
-                  print("   ", name, "=", getattr(resolved, name.lower(), None))
-          except Exception as error:
-              print("   settings failed:", type(error).__name__, error)
-
-          print("--- env vars pr-agent reads for timeouts ---")
           import pathlib
-          root = pathlib.Path(settings.__file__).parent
-          for path in root.rglob("*.py"):
-              text = path.read_text(errors="ignore")
-              for line in text.splitlines():
-                  if "REQUEST_TIMEOUT" in line or "request_timeout" in line:
-                      print("   ", path.name, ":", line.strip()[:140])
+          import pr_agent
+
+          root = pathlib.Path(pr_agent.__file__).parent
+          print("package:", root)
+          print("--- timeout settings in pr_agent ---")
+          for path in sorted(root.rglob("*.py")):
+              if "setting" not in path.name and "config" not in path.name:
+                  continue
+              for number, line in enumerate(path.read_text(errors="ignore").splitlines(), 1):
+                  lowered = line.lower()
+                  if "timeout" in lowered and "=" in line:
+                  print("   ", path.relative_to(root), number, ":", line.strip()[:150])
           PY
           docker run --rm -v /tmp/probe.py:/probe.py:ro --entrypoint python3 \
             pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c /probe.py
