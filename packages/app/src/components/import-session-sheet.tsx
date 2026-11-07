@@ -380,7 +380,7 @@ function ImportCostWarning({
       <View style={styles.importNoticeActions}>
         <Button
           variant="ghost"
-          size="xs"
+          size="sm"
           onPress={onCancel}
           testID="import-session-import-warning-cancel"
         >
@@ -388,7 +388,7 @@ function ImportCostWarning({
         </Button>
         <Button
           variant="default"
-          size="xs"
+          size="sm"
           onPress={onConfirm}
           testID="import-session-import-warning-confirm"
         >
@@ -424,7 +424,7 @@ function ImportProgressNote({
       </View>
       <Text style={styles.importNoticeBody}>{t("importSession.progress.body")}</Text>
       <View style={styles.importNoticeActions}>
-        <Button variant="ghost" size="xs" onPress={onCancel} testID="import-session-import-cancel">
+        <Button variant="ghost" size="sm" onPress={onCancel} testID="import-session-import-cancel">
           {t("importSession.progress.cancel")}
         </Button>
       </View>

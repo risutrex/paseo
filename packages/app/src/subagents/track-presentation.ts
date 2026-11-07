@@ -64,7 +64,9 @@ export function resolveProviderDelegationStopPresentation(input: {
  */
 export function buildProviderInternalTaskLabel(t: TFunction, provider: string): string {
   return t("subagents.providerInternalTask", { provider: formatProviderName(provider) });
+}
 
+/**
  * A child's mark reports what it is doing, not whether anyone read it: the track is where a
  * failed child stays visible after the parent's own attention is cleared.
  */

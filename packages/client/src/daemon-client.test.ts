@@ -8963,6 +8963,7 @@ test("refuses a host that cannot report the provider queue", async () => {
     "Update the host to show the provider queue.",
   );
   expect(mock.sent).toHaveLength(0);
+});
 
 test.each([
   { chunked: false, transportChunked: false },

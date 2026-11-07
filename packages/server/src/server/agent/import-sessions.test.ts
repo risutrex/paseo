@@ -400,7 +400,7 @@ test("listImportableProviderSessions reports that previews were unavailable", as
         previewsUnavailable: true,
       }),
     },
-    agentStorage: { list: async () => [] },
+    agentStorage: { listAll: async () => [] },
     providerSnapshotManager: { getProviderLabel: (provider) => provider },
   });
 

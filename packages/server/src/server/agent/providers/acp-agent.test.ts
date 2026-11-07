@@ -2644,7 +2644,7 @@ describe("ACPAgentClient listImportableSessions while the probe handshake stalls
           connection: { initialize: args.initialize } as unknown as ClientSideConnection,
           stderrChunks: [],
           spawnReady: Promise.resolve(),
-          spawnError: new Promise<never>(() => {}),
+          processError: new Promise<never>(() => {}),
         };
       }
     }
@@ -4009,7 +4009,10 @@ describe("ACPAgentSession", () => {
       });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      signal: new AbortController().signal,
+    };
 
     const { turnId } = await session.startTurn("hello");
     await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
@@ -4040,7 +4043,11 @@ describe("ACPAgentSession", () => {
     const extMethod = vi.fn().mockResolvedValue({ status: "queued", itemId: "item-1" });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
     };
@@ -4075,7 +4082,11 @@ describe("ACPAgentSession", () => {
     const extMethod = vi.fn().mockResolvedValue({ status: "queued", itemId: "item-1" });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
     };
@@ -4110,7 +4121,11 @@ describe("ACPAgentSession", () => {
     );
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
     };
@@ -4163,7 +4178,10 @@ describe("ACPAgentSession", () => {
     });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { methods: ["mcode/session/queue/list"] },
     };
@@ -4184,7 +4202,10 @@ describe("ACPAgentSession", () => {
     const session = createSession();
     const extMethod = vi.fn();
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
     };
@@ -4260,7 +4281,11 @@ describe("ACPAgentSession", () => {
     });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
     };
@@ -4304,7 +4329,12 @@ describe("ACPAgentSession", () => {
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      cancel,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": {
         methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
@@ -4568,7 +4598,11 @@ describe("ACPAgentSession", () => {
     });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": {
         methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
@@ -4615,7 +4649,11 @@ describe("ACPAgentSession", () => {
     });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": {
         methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
@@ -4654,7 +4692,11 @@ describe("ACPAgentSession", () => {
     const extMethod = vi.fn().mockResolvedValue({});
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { methods: ["mcode/session/steer"] },
     };
@@ -4687,7 +4729,11 @@ describe("ACPAgentSession", () => {
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     const { turnId } = await session.startTurn("hello");
     await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
@@ -4717,7 +4763,11 @@ describe("ACPAgentSession", () => {
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
     await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
@@ -4738,7 +4788,10 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn().mockRejectedValue(new Error("Internal error: something else"));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
     await vi.waitFor(() => expect(prompt).toHaveBeenCalled());
@@ -4752,7 +4805,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": {
         version: 1,
@@ -4780,7 +4837,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/queue/enqueue"] },
     };
@@ -4800,7 +4861,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -4817,7 +4882,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -4836,7 +4905,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -4860,7 +4933,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -4878,7 +4955,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -4896,7 +4977,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -5647,7 +5732,11 @@ describe("ACPAgentSession close() tree-kill", () => {
       internals.sessionId = "session-1";
       internals.activeForegroundTurnId = "turn-1";
       internals.agentCapabilities = { sessionCapabilities: { close: {} } };
-      internals.connection = { cancel, unstable_closeSession: unstableCloseSession };
+      internals.connection = {
+        cancel,
+        unstable_closeSession: unstableCloseSession,
+        signal: new AbortController().signal,
+      };
 
       let settled = false;
       const closing = (async () => {
@@ -6913,7 +7002,7 @@ describe("ACP interruption contract — interruption waits for the provider to r
 
     const internals = asInternals<ACPSessionInternals>(session);
     internals.sessionId = "session-1";
-    internals.connection = { prompt, cancel };
+    internals.connection = { prompt, cancel, signal: new AbortController().signal };
 
     await session.startTurn("hello");
 
@@ -6936,7 +7025,11 @@ describe("ACP interruption contract — interruption waits for the provider to r
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
 
@@ -6971,7 +7064,11 @@ describe("ACP interruption contract — interruption waits for the provider to r
       const cancel = vi.fn().mockResolvedValue(undefined);
 
       asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-      asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+      asInternals<ACPSessionInternals>(session).connection = {
+        prompt,
+        cancel,
+        signal: new AbortController().signal,
+      };
 
       await session.startTurn("hello");
 
@@ -7004,7 +7101,11 @@ describe("ACP interruption contract — interruption waits for the provider to r
     });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
 
@@ -7032,7 +7133,11 @@ describe("ACP interruption contract — interruption waits for the provider to r
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
 
@@ -7052,7 +7157,11 @@ describe("ACP interruption contract — interruption waits for the provider to r
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
 
@@ -7071,7 +7180,11 @@ describe("ACP interruption contract — interruption waits for the provider to r
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await expect(session.interrupt()).resolves.toBeUndefined();
     expect(cancel).not.toHaveBeenCalled();

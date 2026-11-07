@@ -13607,6 +13607,7 @@ test("stopProviderDelegations rejects a provider that cannot stop its delegation
     await manager.flush();
     rmSync(workdir, { recursive: true, force: true });
   }
+});
 
 test("folds provider background work and clears it when the agent closes", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-background-work-"));
