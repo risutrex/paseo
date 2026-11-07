@@ -1,22 +1,25 @@
 name: AI Review (Gemini)
 
-# Бесплатный AI-ревьюер для PR в этом форке: тот же код, что будет работать в
-# upstream, чтобы проверять изменения до отправки PR туда.
+# Free AI reviewer for pull requests in this fork: the same code that will run
+# upstream, so a change is checked before it is proposed there.
 #
-# Безопасность:
-# - ключ GEMINI_API_KEY доступен только PR из веток этого же репозитория
-#   (ветки чужих форков отсекаются проверкой head.repo.full_name);
-# - pull_request_target не используется, код PR не исполняется с правами workflow;
-# - сторонние action'ы запинены на конкретный коммит;
-# - расширение code-review ставится из зафиксированного коммита, а не из ветки
-#   по умолчанию (см. шаг установки), версия Gemini CLI тоже зафиксирована;
-# - контейнер github-mcp-server запускается по digest, а не по тегу;
-# - у workflow нет права создавать релизы и деплоить.
+# Security:
+# - the GEMINI_API_KEY secret is only available to pull requests from branches
+#   of this same repository (branches of other forks are rejected by the
+#   head.repo.full_name check);
+# - pull_request_target is not used, so the pull request code never runs with the
+#   workflow's permissions;
+# - third-party actions are pinned to a specific commit;
+# - the code-review extension is installed from a pinned commit instead of its
+#   default branch (see the install step), and the Gemini CLI version is pinned as
+#   well;
+# - the github-mcp-server container runs by digest instead of by tag;
+# - the workflow cannot create releases or deploy anything.
 
 on:
   pull_request:
-    # ready_for_review: черновики не ревьюятся при открытии, но получают ревью
-    # в момент, когда автор переводит PR в готовность.
+    # ready_for_review: a draft is not reviewed when it is opened, but it is
+    # reviewed as soon as the author marks it ready.
     types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
@@ -25,14 +28,16 @@ concurrency:
 
 permissions:
   contents: read
-  # Ревьюер только читает PR и оставляет к нему комментарии. Право issues: write
-  # не нужно: комментарии идут через Review API, а MCP-инструменты ограничены
-  # списком includeTools ниже. Поэтому доступ сужен до минимума.
+  # The reviewer only reads the pull request and leaves comments on it. The
+  # issues: write permission is not needed: comments go through the Review API and
+  # the MCP tools are restricted to the includeTools list below. The access is
+  # therefore kept at the minimum.
   pull-requests: write
 
 jobs:
   review:
-    # Только свои ветки: секрет не должен попасть к коду из чужого форка.
+    # Only this repository's own branches: the secret must not reach code from
+    # another fork.
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 8
@@ -42,14 +47,14 @@ jobs:
         with:
           persist-credentials: 'false'
 
-      # Расширение code-review раньше подтягивалось через with.extensions как
-      # https://github.com/gemini-cli-extensions/code-review, то есть из ветки по
-      # умолчанию. У run-gemini-cli нет способа передать --ref, поэтому при
-      # изменении ветки чужой код расширения выполнился бы в этой джобе с
-      # GITHUB_TOKEN (pull-requests: write) и GEMINI_API_KEY, минуя ревью.
-      # Теперь расширение ставится из зафиксированного коммита (тегов в
-      # репозитории расширения нет), а Gemini CLI — той же версией, что
-      # использует action ниже, чтобы шаги не разъехались.
+      # The code-review extension used to be pulled in through with.extensions as
+      # https://github.com/gemini-cli-extensions/code-review, that is from its
+      # default branch. run-gemini-cli has no way to pass --ref, so a change to that
+      # branch would run foreign code in this job with the GITHUB_TOKEN
+      # (pull-requests: write) and the GEMINI_API_KEY, bypassing the review.
+      # The extension is therefore installed from a pinned commit (the repository
+      # has no tags), and the Gemini CLI is the same version as the action below,
+      # so the steps cannot drift apart.
       - name: Install the pinned code-review extension
         env:
           GEMINI_CLI_VERSION: '0.67.0'
@@ -74,14 +79,14 @@ jobs:
           ADDITIONAL_CONTEXT: 'Focus on correctness, races and resource leaks in the ACP provider code.'
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          # Версия зафиксирована: 'latest' — тоже изменяемая зависимость, а
-          # расширение выше ставится ровно этой версией CLI.
+          # The version is pinned: 'latest' is a mutable dependency too, and the
+          # extension above is installed with exactly this CLI version.
           gemini_cli_version: '0.67.0'
           gemini_model: '${{ vars.GEMINI_MODEL }}'
           github_pr_number: ${{ github.event.pull_request.number }}
           workflow_name: 'ai-review'
-          # Расширения здесь нет намеренно: расширение ставится шагом выше из
-          # зафиксированного коммита.
+          # No extension here on purpose: the extension is installed by the step
+          # above from a pinned commit.
           settings: |-
             {
               "model": {
