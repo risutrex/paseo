@@ -22,28 +22,37 @@ jobs:
             -X POST "https://$host/omni/v1/messages" -H 'content-type: application/json' \
             -d '{"model":"x","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' || echo "host POST failed"
 
-      - name: Inside the PR-Agent image
+      - name: Inside the reviewer image
         run: |
-          docker run --rm --entrypoint python3 pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c -c "
-import socket, ssl, urllib.request, json, time
-host='gate.trinity.guru'
-try:
-    infos=socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-    print('getaddrinfo:', [(i[0].name, i[4][0]) for i in infos])
-except Exception as e:
-    print('getaddrinfo failed:', e)
-for fam,addr in [(i[0], i[4]) for i in infos][:4]:
-    t0=time.time()
-    try:
-        s=socket.socket(fam, socket.SOCK_STREAM); s.settimeout(8); s.connect(addr)
-        print('connect', addr, 'ok in %.2fs' % (time.time()-t0)); s.close()
-    except Exception as e:
-        print('connect', addr, 'failed:', type(e).__name__, e, 'after %.2fs' % (time.time()-t0))
-try:
-    req=urllib.request.Request('https://'+host+'/omni/v1/messages', data=json.dumps({'model':'x','max_tokens':1,'messages':[{'role':'user','content':'hi'}]}).encode(), headers={'content-type':'application/json'})
-    t0=time.time()
-    with urllib.request.urlopen(req, timeout=12) as r:
-        print('urllib POST ->', r.status, '%.2fs' % (time.time()-t0))
-except Exception as e:
-    print('urllib POST failed:', type(e).__name__, str(e)[:200], '%.2fs' % (time.time()-t0))
-"
+          cat > /tmp/probe.py <<'PY'
+          import json
+          import socket
+          import time
+          import urllib.request
+
+          host = "gate.trinity.guru"
+          infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+          print("getaddrinfo:", [(i[0].name, i[4][0]) for i in infos])
+          for info in infos[:4]:
+              family = info[0]
+              address = info[4]
+              started = time.time()
+              try:
+                  sock = socket.socket(family, socket.SOCK_STREAM)
+                  sock.settimeout(8)
+                  sock.connect(address)
+                  print("connect", address, "ok in %.2fs" % (time.time() - started))
+                  sock.close()
+              except Exception as error:
+                  print("connect", address, "failed:", type(error).__name__, error, "after %.2fs" % (time.time() - started))
+          body = json.dumps({"model": "x", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode()
+          request = urllib.request.Request("https://" + host + "/omni/v1/messages", data=body, headers={"content-type": "application/json"})
+          started = time.time()
+          try:
+              with urllib.request.urlopen(request, timeout=12) as response:
+                  print("urllib POST ->", response.status, "%.2fs" % (time.time() - started))
+          except Exception as error:
+              print("urllib POST failed:", type(error).__name__, str(error)[:200], "%.2fs" % (time.time() - started))
+          PY
+          docker run --rm -v /tmp/probe.py:/probe.py:ro --entrypoint python3 \
+            pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c /probe.py
