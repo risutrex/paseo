@@ -167,6 +167,8 @@ export const ptBR: TranslationResources = {
       dropFilesHere: "Solte arquivos aqui",
       editQueuedMessage: "Editar mensagem na fila",
       sendQueuedMessageNow: "Enviar mensagem da fila agora",
+      providerQueueLabel: "Na fila do provedor - não editável aqui",
+      providerQueueStatus: "{{status}}",
       openImage: "Abrir anexo de imagem",
       removeImage: "Remover anexo de imagem",
       removeFile: "Remover anexo de arquivo",
@@ -446,6 +448,11 @@ export const ptBR: TranslationResources = {
       refresh: "Atualizar sessões",
       showAll: "Mostrar tudo",
       loadMore: "Carregar mais",
+      scopeToWorkspace: "Este workspace",
+    },
+    previews: {
+      unavailable:
+        "Alguns provedores foram pesquisados apenas por título e pasta — o texto das prompts não foi carregado.",
     },
     preview: {
       untitledSession: "Sessão sem título",
@@ -457,6 +464,21 @@ export const ptBR: TranslationResources = {
       alreadyImported: "Todas as sessões recentes já foram importadas.",
       noProviderSessions: "Nenhuma sessão de {{provider}} encontrada.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "Carregar o histórico pode levar vários minutos e muita memória",
+      body: "O provedor reconstrói a conversa inteira antes de abrir a sessão. Sessões grandes podem usar gigabytes de memória.",
+      confirm: "Importar mesmo assim",
+      cancel: "Cancelar",
+    },
+    progress: {
+      title: "Importando o histórico…",
+      body: "O provedor ainda está reconstruindo esta sessão.",
+      elapsed: "{{seconds}} s",
+      cancel: "Parar importação",
+    },
+    cancelled: "Importação interrompida. Nada foi adicionado ao seu workspace.",
     row: {
       importing: "Importando...",
     },
@@ -2054,6 +2076,20 @@ export const ptBR: TranslationResources = {
     archiveTooltip: "Arquivar subagente",
     archiveFinishedAction: "Arquivar subagentes concluídos",
     archiveFinishedRetry: "Tentar novamente ({{failed}}/{{total}})",
+    providerInternalTask: "Tarefa interna do {{provider}}",
+    providerLogUnavailable:
+      "O provedor não compartilha o registro desta tarefa. Apenas o status é exibido.",
+    stopProviderDelegationsAction: "Parar o pai e as tarefas delegadas",
+    stopProviderDelegationsRequesting: "Parando...",
+    stopProviderDelegationsDialogTitle: "Parar {{provider}}?",
+    stopProviderDelegationsDialogMessage:
+      "Isso para o turno do pai e todas as tarefas que o {{provider}} delegou ({{count}} em execução). As mensagens que o provedor enfileirou para depois são retiradas quando ele permite; caso contrário, podem ainda ser executadas.",
+    stopProviderDelegationsConfirm: "Parar tudo",
+    stopProviderDelegationsStopped: "Parado: nenhuma tarefa delegada em execução",
+    stopProviderDelegationsPartial: "{{count}} tarefas delegadas ainda estão em execução",
+    stopProviderDelegationsUnknown:
+      "Resultado da parada desconhecido: o provedor não confirmou. Verifique o status das tarefas.",
+    stopProviderDelegationsFailed: "Não foi possível parar as tarefas delegadas: {{message}}",
   },
   panels: {
     draft: {

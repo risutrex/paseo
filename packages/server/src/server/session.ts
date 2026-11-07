@@ -138,6 +138,7 @@ import {
   cancelAgentRunCommand,
   closeAgentCommand,
   detachAgentCommand,
+  stopProviderDelegationsCommand,
   setAgentModeCommand,
   updateAgentCommand,
 } from "./agent/lifecycle-command.js";
@@ -157,6 +158,7 @@ import {
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import {
+  ImportCancelledError,
   ImportSessionsRequestError,
   importProviderSession,
   listImportableProviderSessions,
@@ -836,6 +838,14 @@ export class Session {
     { owner: OwnedSubscription; events: Set<SessionEventSubscription>; notifications: boolean }
   >();
   private readonly workspaceUpdateTails = new Map<string, Promise<void>>();
+  // Listings the client has not abandoned yet, by request id. A client that
+  // moves on (another keystroke, a closed sheet) cancels the listing, so the
+  // provider stops working on an answer nobody reads.
+  private readonly recentProviderSessionListings = new Map<string, AbortController>();
+  // Imports the client has not abandoned yet, by request id. Importing a large
+  // provider session is minutes of provider work, so a cancelled import has to
+  // end the process doing it, not only stop the wait.
+  private readonly importingAgentRequests = new Map<string, AbortController>();
   private readonly terminalManager: TerminalManager | null;
   private readonly providerSnapshotManager: ProviderSnapshotManager;
   private readonly serviceProxy: ServiceProxySubsystem | null;
@@ -2968,6 +2978,8 @@ export class Session {
     switch (msg.type) {
       case "agent.detach.request":
         return this.handleDetachAgentRequest(msg.agentId, msg.requestId);
+      case "agent.provider_delegations.stop.request":
+        return this.handleStopProviderDelegationsRequest(msg.agentId, msg.requestId);
       default:
         return undefined;
     }
@@ -2988,6 +3000,8 @@ export class Session {
         return this.handleAgentTimelineListPromptsRequest(msg, source);
       case "agent.provider_subagents.list.request":
         return this.handleProviderSubagentListRequest(msg);
+      case "agent.provider_queue.get.request":
+        return this.handleAgentProviderQueueRequest(msg);
       case "agent.background_work.list.request":
         return this.handleAgentBackgroundWorkListRequest(msg);
       case "agent.background_work.stop.request":
@@ -3068,6 +3082,7 @@ export class Session {
     }
   }
 
+  // eslint-disable-next-line complexity -- one case per inbound session message
   private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     switch (msg.type) {
       case "fetch_agents_request":
@@ -3076,6 +3091,12 @@ export class Session {
         return this.handleFetchAgentHistory(msg);
       case "fetch_recent_provider_sessions_request":
         return this.handleFetchRecentProviderSessions(msg);
+      case "cancel_recent_provider_sessions_request":
+        this.handleCancelRecentProviderSessions(msg);
+        return undefined;
+      case "cancel_import_agent_request":
+        this.handleCancelImportAgent(msg);
+        return undefined;
       case "fetch_agent_request":
         return this.handleFetchAgent(msg.agentId, msg.requestId);
       case "delete_agent_request":
@@ -3628,6 +3649,54 @@ export class Session {
     }
 
     return { agentId, archivedAt };
+  }
+
+  /**
+   * Stops a provider's whole delegation tree: the parent turn and every task the
+   * provider started under it.
+   *
+   * There is no per-child stop to offer instead - a provider sub-agent is not an
+   * addressable turn. The answer reports whether the provider acknowledged the
+   * request; what actually stopped arrives as delegation rows, which the app
+   * reads rather than trusting a receipt that calls an idle tree stopped.
+   */
+  private async handleStopProviderDelegationsRequest(
+    agentId: string,
+    requestId: string,
+  ): Promise<void> {
+    this.sessionLogger.info({ agentId, requestId }, "Stopping provider delegations");
+    try {
+      const result = await stopProviderDelegationsCommand(
+        { agentManager: this.agentManager },
+        agentId,
+      );
+      this.emit({
+        type: "agent.provider_delegations.stop.response",
+        payload: {
+          requestId,
+          agentId,
+          accepted: true,
+          acknowledged: result.acknowledged,
+          error: null,
+        },
+      });
+    } catch (error) {
+      const message = getErrorMessageOr(error, "Failed to stop delegated tasks");
+      this.sessionLogger.error(
+        { err: error, agentId, requestId },
+        "Failed to stop provider delegations",
+      );
+      this.emit({
+        type: "agent.provider_delegations.stop.response",
+        payload: {
+          requestId,
+          agentId,
+          accepted: false,
+          acknowledged: false,
+          error: message,
+        },
+      });
+    }
   }
 
   private async handleDetachAgentRequest(agentId: string, requestId: string): Promise<void> {
@@ -4932,6 +5001,12 @@ export class Session {
       `Importing agent ${providerHandleId} (${provider})`,
     );
 
+    // An import makes the provider rebuild the whole conversation (ACP
+    // session/load); for a large session that is minutes of provider work. The
+    // request id maps to a controller so a client that stops waiting can stop
+    // the import instead of leaving the provider loading a session nobody opens.
+    const controller = new AbortController();
+    this.importingAgentRequests.set(requestId, controller);
     try {
       if (!normalized.cwd) {
         throw new Error("Import requires cwd from the selected provider session");
@@ -4942,7 +5017,13 @@ export class Session {
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) {
+        // The import finished after the client gave up. importProviderSession
+        // rolled the registered agent back, so there is nothing to announce.
+        return;
+      }
       if (createdWorkspace) {
         await this.registerWorkspaceForImportedAgent(createdWorkspace);
       }
@@ -4958,6 +5039,21 @@ export class Session {
         },
       });
     } catch (error) {
+      if (controller.signal.aborted || error instanceof ImportCancelledError) {
+        // A cancelled import is not a failure: the provider process was ended on
+        // purpose, and the client is told plainly that nothing was imported.
+        this.sessionLogger.info({ provider, providerHandleId }, "Agent import cancelled");
+        this.emit({
+          type: "status",
+          payload: {
+            status: "agent_create_failed",
+            requestId,
+            error: "Import cancelled",
+            errorCode: "import_cancelled",
+          },
+        });
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       this.sessionLogger.error({ err: error }, "Failed to import agent");
       this.emit({
@@ -4977,6 +5073,10 @@ export class Session {
           content: `Failed to import agent: ${message}`,
         },
       });
+    } finally {
+      if (this.importingAgentRequests.get(requestId) === controller) {
+        this.importingAgentRequests.delete(requestId);
+      }
     }
   }
 
@@ -6638,13 +6738,24 @@ export class Session {
   private async handleFetchRecentProviderSessions(
     request: Extract<SessionInboundMessage, { type: "fetch_recent_provider_sessions_request" }>,
   ): Promise<void> {
+    // The client can cancel this listing while it runs. The provider stops as
+    // soon as the signal fires, which is what keeps every keystroke in the
+    // import search from leaving another provider process behind.
+    const controller = new AbortController();
+    this.recentProviderSessionListings.set(request.requestId, controller);
     try {
       const result = await listImportableProviderSessions({
         request,
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         providerSnapshotManager: this.providerSnapshotManager,
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) {
+        // The client asked for the answer to be dropped. Answering anyway would
+        // put a stale listing back into the client's cache.
+        return;
+      }
       this.emit({
         type: "fetch_recent_provider_sessions_response",
         payload: {
@@ -6654,9 +6765,16 @@ export class Session {
             ? { filteredAlreadyImportedCount: result.filteredAlreadyImportedCount }
             : {}),
           ...(result.providerErrors.length > 0 ? { providerErrors: result.providerErrors } : {}),
+          // The client needs to know that the listing was built without prompt
+          // previews: the search then covered titles and folders only.
+          ...(result.previewsUnavailable ? { previewsUnavailable: true } : {}),
         },
       });
     } catch (error) {
+      if (controller.signal.aborted) {
+        // A cancelled listing is not a failure: the provider was told to stop.
+        return;
+      }
       const code =
         error instanceof ImportSessionsRequestError
           ? error.code
@@ -6676,7 +6794,42 @@ export class Session {
           code,
         },
       });
+    } finally {
+      this.recentProviderSessionListings.delete(request.requestId);
     }
+  }
+
+  /**
+   * Stops a listing the client no longer waits for. The provider aborts its
+   * work, so an abandoned search leaves no probe behind.
+   */
+  private handleCancelRecentProviderSessions(
+    request: Extract<SessionInboundMessage, { type: "cancel_recent_provider_sessions_request" }>,
+  ): void {
+    const controller = this.recentProviderSessionListings.get(request.requestId);
+    if (!controller) {
+      // The listing already finished. Nothing to stop.
+      return;
+    }
+    this.recentProviderSessionListings.delete(request.requestId);
+    controller.abort();
+  }
+
+  /**
+   * Stops an import the client no longer waits for. Aborting the controller
+   * ends the provider process that is rebuilding the session and rolls back an
+   * agent the import had already registered.
+   */
+  private handleCancelImportAgent(
+    request: Extract<SessionInboundMessage, { type: "cancel_import_agent_request" }>,
+  ): void {
+    const controller = this.importingAgentRequests.get(request.requestId);
+    if (!controller) {
+      // The import already finished (or never started). Nothing to stop.
+      return;
+    }
+    this.importingAgentRequests.delete(request.requestId);
+    controller.abort();
   }
 
   private async handleFetchWorkspacesRequest(
@@ -8493,6 +8646,47 @@ export class Session {
           requestId: msg.requestId,
           parentAgentId: msg.parentAgentId,
           subagents: [],
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  }
+
+  /**
+   * Reports the queue a provider keeps for later turns.
+   *
+   * A queued message produces no answer in the session stream, so this list is
+   * the only account of what is waiting. The provider is asked live: a cached
+   * copy would be the daemon guessing about work it does not own.
+   */
+  private async handleAgentProviderQueueRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.provider_queue.get.request" }>,
+  ): Promise<void> {
+    try {
+      await ensureUnarchivedAgentLoaded(msg.agentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+      });
+      const queue = await this.agentManager.fetchProviderQueue(msg.agentId);
+      this.emit({
+        type: "agent.provider_queue.get.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          supported: queue.supported,
+          items: queue.items,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.emit({
+        type: "agent.provider_queue.get.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          supported: false,
+          items: [],
           error: error instanceof Error ? error.message : String(error),
         },
       });

@@ -2,7 +2,6 @@ import { setTimeout as pause } from "node:timers/promises";
 import { HostObservationError } from "../host-operations/index.js";
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
-import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
 import type { FinishObservationResult } from "./internal/observation-buffer.js";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
 import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
@@ -148,7 +147,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
   }
   async function suppressed(
     record: FinishSubscription,
-    result?: WaitForFinishResult,
+    result?: FinishObservationResult,
   ): Promise<boolean> {
     if (!(await deps.callerIsActive(record.callerAgentId))) return true;
     if (!record.requireParentOwnership || !result?.final) return false;
@@ -161,6 +160,9 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
   function reasonFor(result: FinishObservationResult): FinishNotificationReason {
     if (result.reason === "host unreachable" || result.reason === "host removed")
       return result.reason;
+    // A queued handoff has no result: the agent looks idle, but this turn produced
+    // nothing, so the notification must not read as a finished turn.
+    if (result.status === "queued") return "was queued";
     if (!result.final) return "is unavailable";
     if (result.final.status === "closed") return "was closed";
     if (result.status === "error") return "errored";

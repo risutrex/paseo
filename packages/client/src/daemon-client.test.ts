@@ -5719,6 +5719,87 @@ test("detaches an agent through the namespaced detach RPC", async () => {
   await expect(promise).resolves.toBeUndefined();
 });
 
+test("stops a provider delegation tree through the namespaced stop RPC", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const promise = client.stopProviderDelegations("parent-agent");
+
+  expect(mock.sent).toHaveLength(1);
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toMatchObject({
+    type: "agent.provider_delegations.stop.request",
+    agentId: "parent-agent",
+  });
+  expect(typeof request.requestId).toBe("string");
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.provider_delegations.stop.response",
+      payload: {
+        requestId: request.requestId,
+        agentId: "parent-agent",
+        accepted: true,
+        acknowledged: true,
+        error: null,
+      },
+    }),
+  );
+
+  // The daemon reports the provider's answer, not what stopped: the delegation
+  // rows carry that.
+  await expect(promise).resolves.toEqual({ acknowledged: true });
+});
+
+test("rejects the stop when the provider cannot stop its delegations", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const promise = client.stopProviderDelegations("parent-agent");
+  const request = parseSentFrame(mock.sent[0]);
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.provider_delegations.stop.response",
+      payload: {
+        requestId: request.requestId,
+        agentId: "parent-agent",
+        accepted: false,
+        acknowledged: false,
+        error: "minimax-code does not support stopping delegated tasks",
+      },
+    }),
+  );
+
+  await expect(promise).rejects.toThrow("does not support stopping delegated tasks");
+});
+
 test("sends active-scoped fetch_agents_request", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();
@@ -5914,6 +5995,166 @@ test("fetches scoped recent provider sessions", async () => {
       },
     ],
   });
+});
+
+test("cancels a recent provider sessions listing the caller stopped waiting for", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const controller = new AbortController();
+  const promise = client.fetchRecentProviderSessions({ cwd: "/tmp/repo" }, controller.signal);
+
+  expect(mock.sent).toHaveLength(1);
+  const request = JSON.parse(String(mock.sent[0])) as {
+    message: { type: string; requestId: string };
+  };
+  expect(request.message.type).toBe("fetch_recent_provider_sessions_request");
+
+  // The caller moved on: the daemon must stop the listing, otherwise the
+  // provider keeps a process alive for an answer nobody reads.
+  controller.abort();
+
+  await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+  expect(mock.sent).toHaveLength(2);
+  const cancel = JSON.parse(String(mock.sent[1])) as {
+    message: { type: string; requestId: string };
+  };
+  expect(cancel.message).toMatchObject({
+    type: "cancel_recent_provider_sessions_request",
+    requestId: request.message.requestId,
+  });
+});
+
+test("releases the waiter of a recent provider sessions listing its caller abandoned", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const controller = new AbortController();
+  const promise = client.fetchRecentProviderSessions({ cwd: "/tmp/repo" }, controller.signal);
+  expect(mock.sent).toHaveLength(1);
+
+  controller.abort();
+
+  await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+
+  // The daemon never answers a cancelled listing (it returns early on purpose),
+  // so the waiter must be gone instead of matching every inbound message until
+  // the sixty-second session RPC timeout.
+  const internal = client as unknown as { waiters: Set<unknown> };
+  expect(internal.waiters.size).toBe(0);
+});
+
+test("cancels an import the caller stopped waiting for", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const controller = new AbortController();
+  const promise = client.importAgent(
+    { providerId: "custom-codex", providerHandleId: "big-thread", cwd: "/tmp/repo" },
+    controller.signal,
+  );
+
+  expect(mock.sent).toHaveLength(1);
+  const request = JSON.parse(String(mock.sent[0])) as {
+    message: { type: string; requestId: string };
+  };
+  expect(request.message.type).toBe("import_agent_request");
+
+  controller.abort();
+
+  await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+  // Only the daemon can end the provider process that is loading the session,
+  // so a cancelled import has to be reported to it.
+  expect(mock.sent).toHaveLength(2);
+  const cancel = JSON.parse(String(mock.sent[1])) as {
+    message: { type: string; requestId: string };
+  };
+  expect(cancel.message).toMatchObject({
+    type: "cancel_import_agent_request",
+    requestId: request.message.requestId,
+  });
+});
+
+test("reports a stopped import confirmed by the daemon as a cancellation", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const promise = client.importAgent({
+    providerId: "custom-codex",
+    providerHandleId: "big-thread",
+    cwd: "/tmp/repo",
+  });
+  const request = JSON.parse(String(mock.sent[0])) as {
+    message: { requestId: string };
+  };
+
+  // The daemon finished the cancellation: the provider is gone and nothing was
+  // imported, which is a cancellation rather than an import failure.
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "status",
+      payload: {
+        status: "agent_create_failed",
+        requestId: request.message.requestId,
+        error: "Import cancelled",
+        errorCode: "import_cancelled",
+      },
+    }),
+  );
+
+  await expect(promise).rejects.toMatchObject({ name: "AbortError" });
 });
 
 test("imports an agent by provider handle id", async () => {
@@ -8651,6 +8892,77 @@ test("closes before admission when a protected-capable daemon is reached in lega
   // Only the application hello reached the daemon; the queued command never did.
   expect(daemonReceived).toHaveLength(1);
   expect(JSON.parse(daemonReceived[0] as string)).toMatchObject({ type: "hello" });
+});
+
+test("reads the provider queue the host reports", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen({ features: { providerQueue: true } });
+  await connectPromise;
+
+  const queuePromise = client.getProviderQueue("agent-1", { requestId: "req-queue-1" });
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "agent.provider_queue.get.request",
+    agentId: "agent-1",
+    requestId: "req-queue-1",
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.provider_queue.get.response",
+      payload: {
+        requestId: "req-queue-1",
+        agentId: "agent-1",
+        supported: true,
+        items: [{ itemId: "item-1", text: "second thought", status: "queued", createdAt: null }],
+        error: null,
+      },
+    }),
+  );
+
+  await expect(queuePromise).resolves.toEqual({
+    requestId: "req-queue-1",
+    agentId: "agent-1",
+    supported: true,
+    items: [{ itemId: "item-1", text: "second thought", status: "queued", createdAt: null }],
+    error: null,
+  });
+});
+
+test("refuses a host that cannot report the provider queue", async () => {
+  // Asking an older host would leave the request unanswered; the gate says so
+  // before the app waits on it.
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen({ features: {} });
+  await connectPromise;
+
+  await expect(client.getProviderQueue("agent-1")).rejects.toThrow(
+    "Update the host to show the provider queue.",
+  );
+  expect(mock.sent).toHaveLength(0);
 });
 
 test.each([

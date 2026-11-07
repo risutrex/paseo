@@ -91,6 +91,8 @@ import {
   type AgentTimelineItem,
   type AgentUsage,
   type AgentUsageSession,
+  type SteerActiveTurnOptions,
+  type SteerResult,
   type FetchCatalogOptions,
   type ProviderRefreshContext,
   type ImportableProviderSession,
@@ -99,6 +101,7 @@ import {
   type ListImportableSessionsOptions,
   type McpServerConfig,
   type ProviderCatalog,
+  type ProviderDelegationStopResult,
   type ResolveAgentCreateConfigInput,
   type ResolveAgentCreateConfigResult,
   type ToolCallDetail,
@@ -113,6 +116,7 @@ import {
   resolveDefaultAgentCreateConfig,
 } from "../create-agent-mode.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
+import { registerInFlightImportProcess } from "../import-session-cancellation.js";
 import {
   checkProviderLaunchAvailable,
   createProviderEnv,
@@ -284,6 +288,12 @@ export const DEFAULT_ACP_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: true,
   supportsSessionPersistence: true,
   supportsSessionListing: true,
+  // ACP has no cheap transcript read: the only way to a prompt preview is
+  // session/load, which makes the provider rebuild the whole session in its own
+  // memory. For a large minimax-code session that is 2.7 GB of RAM per listing
+  // (322 MB of snapshots replayed on every load), so the import list asks for
+  // previews only when the caller can pay for them.
+  importSessionPreviewsAreCheap: false,
   supportsDynamicModes: true,
   supportsMcpServers: true,
   supportsReasoningStream: true,
@@ -335,9 +345,242 @@ const ACP_PROBE_CLOSE_TIMEOUT_MS = 2_000;
 // request when the provider never answers, so these calls must be bounded
 // or the provider process is never terminated.
 const ACP_CLOSE_REQUEST_TIMEOUT_MS = 2_000;
+// An ACP provider answers the cancelled `session/prompt` with a `cancelled`
+// stop reason. Interruption waits for that answer so the session is released
+// before the caller sends a replacement prompt. The two waits below run one
+// after another, so their sum has to stay below the agent manager's interrupt
+// rescue timeout (2s): otherwise the manager gives up first, reports the
+// interruption as not acknowledged, and the adapter's descriptive error never
+// reaches the caller.
+const ACP_TURN_RELEASE_TIMEOUT_MS = 1_200;
+// A provider that just answered a cancelled prompt frees the session a
+// moment later. The prompt it refuses in that window ("Session already has
+// an active Turn") is the same message, so it is delivered again after a
+// short pause instead of failing the run.
+const ACP_BUSY_PROMPT_RETRY_DELAY_MS = 250;
+const ACP_BUSY_PROMPT_RETRY_LIMIT = 2;
+// ACP itself has no mid-turn steering method: the protocol only knows
+// `session/prompt`, `session/cancel` and the session lifecycle. Providers
+// expose steering as a namespaced extension instead. MiniMax Code advertises
+// its extensions in `initialize` under `_meta["minimax-code/extensions"]` and
+// accepts a steer as `mcode/session/steer`, which keeps the running turn alive
+// and answers with the turn it steered plus the disposition of the message.
+const MCODE_EXTENSIONS_META_KEY = "minimax-code/extensions";
+const MCODE_STEER_METHOD = "mcode/session/steer";
+// MiniMax Code sends its extension notifications only when the client asks for
+// them in the handshake. Without this the provider keeps its background work
+// to itself: no delegation updates, no queue updates, no goal updates and no
+// notice that another client owns the session. The request is a vendor
+// extension, so it goes only to a provider that is MiniMax Code: another ACP
+// provider has no business receiving it.
+export const MCODE_CLIENT_CAPABILITY_META: ACPClientCapabilityMeta = {
+  [MCODE_EXTENSIONS_META_KEY]: { version: 1, notifications: true },
+};
+
+const MCODE_PROVIDER_ID = "minimax-code";
+// The names MiniMax Code installs its entry point under.
+const MCODE_EXECUTABLE_NAMES = new Set(["mcode", "minimax-code", "minimax"]);
+
+/**
+ * Reports whether a provider is MiniMax Code.
+ *
+ * The provider id is the usual answer, but a user may register the same
+ * command under a name of their own, so the executable is checked as well.
+ * Only the executable counts: an ACP agent that merely lives under a path
+ * containing "minimax" is another provider, and sending it MiniMax Code's
+ * handshake meta would announce extensions it does not understand.
+ */
+export function isMiniMaxCodeProvider(
+  providerId: string | undefined,
+  command: readonly string[] | undefined,
+): boolean {
+  if (providerId === MCODE_PROVIDER_ID) {
+    return true;
+  }
+  const executable = command?.[0];
+  if (!executable) {
+    return false;
+  }
+  const name = path
+    .basename(executable)
+    .replace(/\.(exe|cmd|bat|ps1)$/i, "")
+    .toLowerCase();
+  return MCODE_EXECUTABLE_NAMES.has(name);
+}
+
+/**
+ * Combines client capability metadata so the vendor handshake and the user's
+ * own metadata can travel together.
+ *
+ * MiniMax Code answers its extension notifications only when the handshake
+ * carries the vendor key, while the user may still need their own keys. One
+ * object cannot replace the other, so keys are merged and, for the same key,
+ * the later object wins field by field.
+ */
+export function mergeACPClientCapabilityMeta(
+  base: ACPClientCapabilityMeta | undefined,
+  override: ACPClientCapabilityMeta | undefined,
+): ACPClientCapabilityMeta | undefined {
+  if (!base) {
+    return override;
+  }
+  if (!override) {
+    return base;
+  }
+  const merged: ACPClientCapabilityMeta = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    const existing: unknown = merged[key];
+    merged[key] = isRecord(existing) && isRecord(value) ? { ...existing, ...value } : value;
+  }
+  return merged;
+}
+
+/**
+ * One message the provider holds for a later turn.
+ *
+ * text and status are the provider's own report; nothing here is inferred.
+ */
+export interface ProviderQueueItemSnapshot {
+  itemId: string;
+  text: string;
+  status: string;
+  createdAt: string | null;
+}
+
+/**
+ * Reads the queue the provider reports, from either queue/list or a
+ * queue_update notification.
+ *
+ * Both carry the items under `items`, so one reader serves the request and the
+ * notification. A malformed entry is dropped instead of failing the whole list:
+ * one unreadable item must not hide the others.
+ */
+function readProviderQueueItems(params: unknown): ProviderQueueItemSnapshot[] | null {
+  if (!isRecord(params)) {
+    return null;
+  }
+  const raw = (params as { items?: unknown }).items;
+  if (!Array.isArray(raw)) {
+    return null;
+  }
+  const items: ProviderQueueItemSnapshot[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const itemId = typeof entry.itemId === "string" ? entry.itemId : null;
+    if (!itemId) {
+      continue;
+    }
+    const createdAtMs =
+      typeof entry.createdAt === "number" && Number.isFinite(entry.createdAt)
+        ? entry.createdAt
+        : null;
+    items.push({
+      itemId,
+      text: typeof entry.content === "string" ? entry.content : "",
+      status: typeof entry.status === "string" ? entry.status : "queued",
+      createdAt: createdAtMs === null ? null : new Date(createdAtMs).toISOString(),
+    });
+  }
+  return items;
+}
+
+/**
+ * Reads the queue id the provider assigned to a message it queued.
+ *
+ * Both halves of the answer matter: `status` is the provider's own word that it
+ * took the message, and the id is the only handle that can take it back. An
+ * answer missing either one is no confirmation at all, and treating it as one
+ * would promise a withdrawal the next Stop could not perform.
+ */
+function readQueuedItemId(response: unknown): string | null {
+  if (!isRecord(response)) {
+    return null;
+  }
+  const item = isRecord(response.item) ? response.item : null;
+  const status = typeof response.status === "string" ? response.status : item?.status;
+  if (status !== "queued") {
+    return null;
+  }
+  if (typeof response.itemId === "string" && response.itemId.length > 0) {
+    return response.itemId;
+  }
+  if (item && typeof item.itemId === "string" && item.itemId.length > 0) {
+    return item.itemId;
+  }
+  return null;
+}
+
+/**
+ * What became of a message the busy provider refused.
+ *
+ * `skipped` never reached the queue; `queued` was confirmed with an item id;
+ * `withdrawn` was queued after the user stopped and taken back again;
+ * `unconfirmed` may or may not be in the provider's queue.
+ */
+type QueuePromptOutcome = "queued" | "withdrawn" | "unconfirmed" | "skipped";
+const MCODE_DELEGATION_GET_METHOD = "mcode/session/delegation/get";
+const MCODE_DELEGATION_UPDATE_NOTIFICATION = "mcode/session/delegation_update";
+// A provider that keeps its own delegation tree decides which tasks run under it.
+// A child is not addressable as a turn (the provider answers -32002 for its id),
+// so the only stop that exists is the root: the provider aborts the turn that
+// runs the tree and every task delegated under it.
+const MCODE_DELEGATION_STOP_METHOD = "mcode/session/delegation/stop";
+// A provider that still owns its previous turn refuses a new prompt and tells
+// the client to use its queue instead. MiniMax Code answers such a refusal
+// with "Session already has an active Turn. Use queue send to deliver the
+// message after it." and exposes the queue as `mcode/session/queue/enqueue`.
+// Without it the message is not delivered at all: the client only sees an
+// error, and the text the user typed is gone.
+const MCODE_QUEUE_ENQUEUE_METHOD = "mcode/session/queue/enqueue";
+// A queued message is not a promise to stop: the provider runs it after the
+// current turn. `mcode/session/queue/delete` cancels a queued item, and the
+// provider refuses (`not_editable`) once it has claimed the item for a turn.
+const MCODE_QUEUE_DELETE_METHOD = "mcode/session/queue/delete";
+// The provider answers `queue/enqueue` with the item it created. A Stop cannot
+// withdraw an item whose id has not arrived yet, so it waits for that answer
+// instead of guessing whether a message is about to appear in the queue.
+const ACP_QUEUE_ACK_WAIT_MS = 5_000;
+// What the provider is holding for later turns. The list is the only report that
+// survives a reconnect: the provider does not replay its queue notifications after
+// a resume, so a client that reconnects has to ask. Bound the call - a provider
+// stuck in a turn would otherwise hold the reply forever.
+const MCODE_QUEUE_LIST_METHOD = "mcode/session/queue/list";
+const ACP_QUEUE_LIST_TIMEOUT_MS = 5_000;
+// The provider publishes the whole queue whenever it changes. This is how a
+// position is seen leaving the queue, which the session stream never reports:
+// measured against MiniMax Code 0.7.3, a queued message produces no
+// session/update, so its answer never arrives through the timeline.
+const MCODE_QUEUE_UPDATE_NOTIFICATION = "mcode/session/queue_update";
+// An enqueue that failed, or answered without a status and an item id, may still
+// have landed, and the provider does not deduplicate `clientRequestId`. Calling
+// the acceptance unconfirmed is the only report that stays true either way.
+const ACP_QUEUE_UNCONFIRMED_MESSAGE =
+  "The provider did not confirm that the message was taken into its queue. It may still run it in a later turn; check the session before sending it again.";
+// `session/cancel` is a notification, so the write itself can block on a
+// stuck provider. Bound it instead of letting the interruption hang.
+const ACP_CANCEL_NOTIFICATION_TIMEOUT_MS = 500;
+
 const ACP_DISCONNECT_EXIT_GRACE_MS = 1_000;
 const ACP_IMPORT_HISTORY_LOAD_TIMEOUT_MS = 30_000;
-const ACP_IMPORT_HISTORY_BUDGET_MS = 60_000;
+// A provider that never answers `session/list` must not block the listing
+// forever: bound the call and let the caller retry.
+const ACP_IMPORT_SESSION_LIST_TIMEOUT_MS = 20_000;
+const ACP_IMPORT_HISTORY_BUDGET_MS = 45_000;
+// A history load that takes longer than this means the provider is stuck on
+// that session. Providers answer ACP requests one at a time, so every later
+// request on the same connection queues behind it; the import gives up on the
+// preview instead of waiting for the whole history.
+const ACP_IMPORT_HISTORY_SLOW_LOAD_MS = 5_000;
+// How often the import may replace a stuck probe before it gives up on
+// previews altogether.
+const ACP_IMPORT_MAX_PROBE_RECYCLES = 3;
+// A probe that never finishes its handshake is unreachable for the abort
+// handler until the handshake ends, so the handshake itself has to be
+// bounded: otherwise a provider that stalls in `initialize` leaves a child
+// process that nobody can kill.
+const ACP_IMPORT_PROBE_INITIALIZE_TIMEOUT_MS = 15_000;
 
 /**
  * An ACP agent publishes its slash-command inventory incrementally. Wait this
@@ -664,6 +907,18 @@ interface PendingUserMessage {
   messageId?: string;
 }
 
+/**
+ * How the foreground turn ended from the provider's point of view.
+ *
+ * - `released`: the provider confirmed the turn is over, so the session can
+ *   take a new prompt.
+ * - `unconfirmed`: the provider never confirmed the end of the turn (it
+ *   rejected the prompt, or the transport broke without the process dying).
+ *   The session may still be busy, so an interruption must fail instead of
+ *   assuming the session is free.
+ */
+type ForegroundTurnOutcome = "released" | "unconfirmed";
+
 export type SessionStateResponse = NewSessionResponse | LoadSessionResponse | ResumeSessionResponse;
 
 interface TerminalExit {
@@ -935,6 +1190,19 @@ function isACPCreateConfigUnattended(input: AgentCreateConfigUnattendedInput): b
         feature.value === true,
     ) === true
   );
+}
+
+/**
+ * The live probe of an import listing.
+ *
+ * `current` is the probe that answered its handshake; `child` is the process
+ * behind it. They are not the same moment: the child exists before the
+ * handshake finished, and the abort handler has to be able to reach it in
+ * that window, otherwise a stalled handshake leaves a process nobody can kill.
+ */
+interface ImportProbeState {
+  current: SpawnedACPProcess | null;
+  child: ChildProcessWithoutNullStreams | null;
 }
 
 export class ACPAgentClient implements AgentClient {
@@ -1243,67 +1511,317 @@ export class ACPAgentClient implements AgentClient {
     options?: ListImportableSessionsOptions,
   ): Promise<ImportableProviderSession[]> {
     const history = new ACPImportHistoryCollector();
-    const probe = await this.spawnProcess(PROBE_ENV, {
-      client: this.buildProbeClient((params) => history.accept(params)),
-    });
+    // The live probe lives in a shared holder: a stuck provider is replaced
+    // while the listing runs, and the abort handler has to kill the probe that
+    // is actually alive.
+    const probeState: ImportProbeState = { current: null, child: null };
+    // An abandoned listing must not leave the probe running: the provider keeps
+    // working on the requests it already received, so cancelling the caller is
+    // not enough - the child process has to go. The handler is bound before
+    // the probe is spawned, so a caller that gives up during the handshake
+    // still reaches the child.
+    const abort = this.bindImportAbort(options?.signal, probeState);
     try {
+      if (abort.triggered()) {
+        // The caller gave up before the probe even existed: starting one now
+        // would only cost a process that nobody waits for.
+        throw new Error("ACP import session listing was aborted");
+      }
+      const probe = await this.spawnImportProbe(history, probeState, abort);
+      probeState.current = probe;
+      if (abort.triggered()) {
+        throw new Error("ACP import session listing was aborted");
+      }
       if (!probe.initialize.agentCapabilities?.sessionCapabilities?.list) {
         return [];
       }
 
-      const sessions: ImportableProviderSession[] = [];
-      const resultLimit = options?.limit ?? Number.POSITIVE_INFINITY;
-      const scanLimit = Math.min(options?.scanLimit ?? 500, 500);
-      const canLoadHistory = probe.initialize.agentCapabilities.loadSession === true;
-      const historyDeadline = this.now() + ACP_IMPORT_HISTORY_BUDGET_MS;
-      let scanned = 0;
-      let cursor: string | null | undefined;
-      for (;;) {
-        const page: ListSessionsResponse = await this.runACPRequest(() =>
-          probe.connection.listSessions(acpSessionListRequest(cursor, options?.cwd)),
-        );
-        for (const session of page.sessions) {
-          if (scanned >= scanLimit || sessions.length >= resultLimit) break;
-          scanned += 1;
-          const descriptor = await this.describeImportableSession(
-            probe,
-            history,
-            session,
-            canLoadHistory,
-            historyDeadline,
-          );
-          if (descriptor) sessions.push(descriptor);
-        }
-        cursor = page.nextCursor ?? null;
-        if (!cursor) break;
-        if (scanned >= scanLimit || sessions.length >= resultLimit) break;
-      }
-
-      return sessions;
+      return await this.scanImportableSessions(probe, probeState, history, abort, options);
     } finally {
-      await this.closeProbe(probe);
+      abort.dispose();
+      if (probeState.current) {
+        await this.closeProbe(probeState.current);
+      }
+      probeState.child = null;
     }
   }
 
-  private async describeImportableSession(
+  /**
+   * Walks the provider's session list page by page and collects the sessions
+   * that can be imported.
+   */
+  private async scanImportableSessions(
     probe: SpawnedACPProcess,
+    probeState: ImportProbeState,
     history: ACPImportHistoryCollector,
+    abort: { triggered: () => boolean },
+    options: ListImportableSessionsOptions | undefined,
+  ): Promise<ImportableProviderSession[]> {
+    const sessions: ImportableProviderSession[] = [];
+    const resultLimit = options?.limit ?? Number.POSITIVE_INFINITY;
+    const scanLimit = Math.min(options?.scanLimit ?? 500, 500);
+    // A session/list descriptor is already enough to list a session (title, cwd,
+    // updatedAt), and the preview is the only part that needs session/load.
+    // Skipping it keeps a 500 candidate search cheap; the scan limit stays as it
+    // is because descriptors alone are nearly free to walk.
+    const canLoadHistory =
+      options?.includePreviews !== false &&
+      probe.initialize.agentCapabilities?.loadSession === true;
+    // One deadline for the history loads. Together with the page timeouts it
+    // has to stay below the agent manager's 90s budget for the listing.
+    const historyDeadline = this.now() + ACP_IMPORT_HISTORY_BUDGET_MS;
+    const seen = new Set<string>();
+    let scanned = 0;
+    let recycles = 0;
+    let cursor: string | null | undefined;
+    // A probe that is known to be stuck stays known to be stuck: the rest of
+    // the scan asks it for no more previews.
+    let historiesAvailable = canLoadHistory;
+    for (;;) {
+      if (abort.triggered()) {
+        throw new Error("ACP import session listing was aborted");
+      }
+      const liveProbe = probeState.current;
+      if (!liveProbe) {
+        throw new Error("ACP import session listing has no live probe");
+      }
+      const page = await this.fetchImportSessionsPage(liveProbe, cursor, options?.cwd);
+      const candidates = page.sessions.filter((session) => !seen.has(session.sessionId));
+      const collected = await this.collectImportablePage(probeState, history, candidates, {
+        abort,
+        canLoadHistory: historiesAvailable,
+        historyDeadline,
+        collected: sessions.length,
+        resultLimit,
+        scanLimit,
+        scanned,
+        recycles,
+        seen,
+      });
+      sessions.push(...collected.sessions);
+      scanned = collected.scanned;
+      recycles = collected.recycles;
+      historiesAvailable = collected.canLoadHistory;
+      cursor = page.nextCursor ?? null;
+      if (collected.recycled) {
+        // The page came from a probe that has been replaced, so its cursor
+        // says nothing about the new one. Read the list again from the
+        // start; the sessions already seen are skipped.
+        cursor = null;
+        continue;
+      }
+      if (!cursor) break;
+      if (scanned >= scanLimit || sessions.length >= resultLimit) break;
+    }
+
+    if (abort.triggered()) {
+      throw new Error("ACP import session listing was aborted");
+    }
+    return sessions;
+  }
+
+  /**
+   * Describes the sessions of one list page and loads their prompt previews.
+   * A provider that gets stuck on a history is replaced, so the remaining
+   * sessions and the next list page are answered by a fresh probe.
+   */
+  private async collectImportablePage(
+    probeState: ImportProbeState,
+    history: ACPImportHistoryCollector,
+    candidates: ListSessionsResponse["sessions"],
+    context: {
+      abort: { triggered: () => boolean };
+      canLoadHistory: boolean;
+      historyDeadline: number;
+      collected: number;
+      resultLimit: number;
+      scanLimit: number;
+      scanned: number;
+      recycles: number;
+      seen: Set<string>;
+    },
+  ): Promise<{
+    sessions: ImportableProviderSession[];
+    scanned: number;
+    recycles: number;
+    recycled: boolean;
+    canLoadHistory: boolean;
+  }> {
+    const sessions: ImportableProviderSession[] = [];
+    let scanned = context.scanned;
+    let recycles = context.recycles;
+    let recycled = false;
+    let canLoadHistory = context.canLoadHistory;
+    for (const session of candidates) {
+      if (context.abort.triggered()) {
+        throw new Error("ACP import session listing was aborted");
+      }
+      if (scanned >= context.scanLimit) break;
+      if (context.collected + sessions.length >= context.resultLimit) break;
+      scanned += 1;
+      context.seen.add(session.sessionId);
+      const probe = probeState.current;
+      if (!probe) {
+        throw new Error("ACP import session listing has no live probe");
+      }
+      const outcome = canLoadHistory
+        ? await this.loadImportPromptPreviews(probe, history, session, context.historyDeadline)
+        : { status: "skipped" as const };
+      if (context.abort.triggered()) {
+        // The caller gave up while the provider was loading. The probe is
+        // already killed, so the listing has to fail instead of returning a
+        // half filled result.
+        throw new Error("ACP import session listing was aborted");
+      }
+      if (outcome.status === "slow") {
+        // The provider is stuck on this history and answers no later request on
+        // this connection. Replace the probe: killing the child also stops the
+        // runaway work the provider already started.
+        sessions.push(this.toImportableSession(session, null));
+        if (context.abort.triggered()) {
+          throw new Error("ACP import session listing was aborted");
+        }
+        if (recycles < ACP_IMPORT_MAX_PROBE_RECYCLES) {
+          recycles += 1;
+          recycled = true;
+          probeState.current = await this.recycleImportProbe(probeState, history, context.abort);
+        } else {
+          // The probe is known to be stuck and its unanswered session/load
+          // still owns the connection: any later session/list would only queue
+          // behind that load and fail the whole listing on the 20s timeout.
+          // Replace it one last time with the previews off, so the rest of the
+          // scan reads from a connection that is known to be free. A probe that
+          // never loads a history cannot get stuck, so this happens once and
+          // the recycle budget still bounds the preview probes.
+          canLoadHistory = false;
+          recycled = true;
+          probeState.current = await this.recycleImportProbe(probeState, history, context.abort);
+        }
+        continue;
+      }
+      if (outcome.status === "skipped") {
+        sessions.push(this.toImportableSession(session, null));
+        continue;
+      }
+      if (outcome.status === "expired") {
+        // The listing budget is spent. The session stays visible, but the
+        // remaining ones are listed without previews instead of paying for a
+        // load that the budget cannot pay for.
+        sessions.push(this.toImportableSession(session, null));
+        canLoadHistory = false;
+        continue;
+      }
+      if (outcome.previews.hasConversation === false) continue;
+      sessions.push(this.toImportableSession(session, outcome.previews));
+    }
+    return { sessions, scanned, recycles, recycled, canLoadHistory };
+  }
+
+  /**
+   * Spawns a probe that feeds its session updates into the history collector.
+   *
+   * The child is registered with the shared holder as soon as it exists, and
+   * the handshake is bounded: a provider that stalls in `initialize` would
+   * otherwise leave a process that no abort can reach.
+   */
+  private async spawnImportProbe(
+    history: ACPImportHistoryCollector,
+    probeState: ImportProbeState,
+    abort: { triggered: () => boolean },
+  ): Promise<SpawnedACPProcess> {
+    const probe = await this.spawnProcess(PROBE_ENV, {
+      client: this.buildProbeClient((params) => history.accept(params)),
+      initializeTimeoutMs: ACP_IMPORT_PROBE_INITIALIZE_TIMEOUT_MS,
+      onSpawned: (spawned) => {
+        probeState.child = spawned.child;
+        if (abort.triggered()) {
+          void terminateChildProcess(spawned.child, 2_000, this.terminateProcess).catch(
+            () => undefined,
+          );
+        }
+      },
+    });
+    probeState.child = probe.child;
+    if (abort.triggered()) {
+      void terminateChildProcess(probe.child, 2_000, this.terminateProcess).catch(() => undefined);
+    }
+    return probe;
+  }
+
+  /**
+   * Replaces a probe whose provider got stuck. The stuck child is killed, which
+   * also stops the provider work it already started, and a fresh probe takes
+   * over the remaining sessions.
+   */
+  private async recycleImportProbe(
+    probeState: ImportProbeState,
+    history: ACPImportHistoryCollector,
+    abort: { triggered: () => boolean },
+  ): Promise<SpawnedACPProcess> {
+    const previous = probeState.current;
+    if (previous) {
+      probeState.child = null;
+      await this.closeProbe(previous);
+    }
+    return await this.spawnImportProbe(history, probeState, abort);
+  }
+
+  private toImportableSession(
     session: ListSessionsResponse["sessions"][number],
-    canLoadHistory: boolean,
-    historyDeadline: number,
-  ): Promise<ImportableProviderSession | null> {
-    const loadedPreviews = canLoadHistory
-      ? await this.loadImportPromptPreviews(probe, history, session, historyDeadline)
-      : null;
-    if (loadedPreviews?.hasConversation === false) return null;
+    previews: ACPImportPromptPreviews | null,
+  ): ImportableProviderSession {
     return {
       providerHandleId: session.sessionId,
       cwd: session.cwd,
       title: session.title ?? null,
-      firstPromptPreview: loadedPreviews?.firstPromptPreview ?? null,
-      lastPromptPreview: loadedPreviews?.lastPromptPreview ?? null,
+      firstPromptPreview: previews?.firstPromptPreview ?? null,
+      lastPromptPreview: previews?.lastPromptPreview ?? null,
       lastActivityAt: session.updatedAt ? new Date(session.updatedAt) : new Date(0),
     };
+  }
+
+  /**
+   * Terminates the probe process when the caller gives up on the listing, so
+   * an abandoned request cannot leave the provider working in the background.
+   * The probe is replaced while the listing runs, so the live one is read from
+   * the shared holder instead of a captured value.
+   */
+  private bindImportAbort(
+    signal: AbortSignal | undefined,
+    probeState: ImportProbeState,
+  ): { triggered: () => boolean; dispose: () => void } {
+    let aborted = false;
+    const handleAbort = (): void => {
+      if (aborted) return;
+      aborted = true;
+      // The child is reachable before the handshake finished, so an abort
+      // during the handshake still kills the process.
+      const child = probeState.child ?? probeState.current?.child;
+      if (!child) return;
+      void terminateChildProcess(child, 2_000, this.terminateProcess).catch(() => undefined);
+    };
+    if (signal?.aborted) {
+      // An already aborted signal never fires the listener.
+      handleAbort();
+    }
+    signal?.addEventListener("abort", handleAbort, { once: true });
+    return {
+      triggered: () => aborted,
+      dispose: () => signal?.removeEventListener("abort", handleAbort),
+    };
+  }
+
+  /** A provider that never answers `session/list` must not block the listing. */
+  private async fetchImportSessionsPage(
+    probe: SpawnedACPProcess,
+    cursor: string | null | undefined,
+    cwd: string | undefined,
+  ): Promise<ListSessionsResponse> {
+    return withTimeout(
+      this.runACPRequest(() => probe.connection.listSessions(acpSessionListRequest(cursor, cwd))),
+      ACP_IMPORT_SESSION_LIST_TIMEOUT_MS,
+      `ACP session/list timed out after ${ACP_IMPORT_SESSION_LIST_TIMEOUT_MS}ms`,
+    );
   }
 
   private async loadImportPromptPreviews(
@@ -1311,48 +1829,104 @@ export class ACPAgentClient implements AgentClient {
     history: ACPImportHistoryCollector,
     session: ListSessionsResponse["sessions"][number],
     historyDeadline: number,
-  ): Promise<ACPImportPromptPreviews | null> {
+  ): Promise<
+    | { status: "loaded"; previews: ACPImportPromptPreviews }
+    | { status: "skipped" }
+    | { status: "slow" }
+    | { status: "expired" }
+  > {
     const updatedAt = session.updatedAt ?? null;
     const cached = this.importPromptCache.get(session.sessionId);
     if (updatedAt !== null && cached?.updatedAt === updatedAt) {
       return {
-        firstPromptPreview: cached.firstPromptPreview,
-        lastPromptPreview: cached.lastPromptPreview,
-        hasConversation: cached.hasConversation,
+        status: "loaded",
+        previews: {
+          firstPromptPreview: cached.firstPromptPreview,
+          lastPromptPreview: cached.lastPromptPreview,
+          hasConversation: cached.hasConversation,
+        },
       };
     }
 
     const remainingMs = historyDeadline - this.now();
-    if (remainingMs <= 0) return null;
+    if (remainingMs <= 0) return { status: "skipped" };
+    // The listing budget is nearly spent. A load started here could only be
+    // abandoned by the slow guard, and the probe that would be replaced
+    // afterwards would cost a fresh process for a result nobody waits for.
+    if (remainingMs < ACP_IMPORT_HISTORY_SLOW_LOAD_MS) {
+      return { status: "expired" };
+    }
     const loadTimeoutMs = Math.min(ACP_IMPORT_HISTORY_LOAD_TIMEOUT_MS, remainingMs);
 
     history.begin(session.sessionId);
-    try {
-      await withTimeout(
-        this.runACPRequest(() =>
-          probe.connection.loadSession({
-            sessionId: session.sessionId,
-            cwd: session.cwd,
-            mcpServers: [],
-          }),
-        ),
-        loadTimeoutMs,
-        `ACP import history load timed out after ${loadTimeoutMs}ms`,
-      );
-      const previews = history.finish(session.sessionId);
-      if (updatedAt !== null) {
-        this.importPromptCache.set(session.sessionId, { updatedAt, ...previews });
-      }
-      return previews;
-    } catch (error) {
+    const loadPromise = this.runACPRequest(() =>
+      probe.connection.loadSession({
+        sessionId: session.sessionId,
+        cwd: session.cwd,
+        mcpServers: [],
+      }),
+    );
+    // The slow guard may abandon the load, so its rejection stays handled.
+    loadPromise.catch(() => undefined);
+    const outcome = await this.raceImportHistoryLoad(loadPromise, loadTimeoutMs);
+    if (outcome === "slow") {
+      history.discard(session.sessionId);
+      // The provider is busy with this session: a session/close would only
+      // queue behind the pending load and burn its timeout. The probe is
+      // replaced instead.
+      return { status: "slow" };
+    }
+    if (outcome === "failed") {
       history.discard(session.sessionId);
       this.logger.debug(
-        { err: error, sessionId: session.sessionId },
+        { sessionId: session.sessionId },
         "ACP import history load failed; keeping the session visible",
       );
-      return null;
-    } finally {
       await this.closeLoadedSession(probe, session.sessionId, historyDeadline);
+      return { status: "skipped" };
+    }
+    const previews = history.finish(session.sessionId);
+    if (updatedAt !== null) {
+      this.importPromptCache.set(session.sessionId, { updatedAt, ...previews });
+    }
+    await this.closeLoadedSession(probe, session.sessionId, historyDeadline);
+    return { status: "loaded", previews };
+  }
+
+  /**
+   * Waits for a history load and reports whether the provider answered, failed
+   * or got stuck. A load that runs longer than
+   * ACP_IMPORT_HISTORY_SLOW_LOAD_MS means the provider is busy with that
+   * session: every later request on the same connection would queue behind it.
+   *
+   * A load that only hits the wait timeout is reported as a failure: the
+   * budget for previews is nearly spent at that point, and the listing stops
+   * asking for previews instead of replacing a probe that is not stuck.
+   */
+  private async raceImportHistoryLoad(
+    loadPromise: Promise<unknown>,
+    timeoutMs: number,
+  ): Promise<"loaded" | "failed" | "slow"> {
+    const loaded = loadPromise.then(
+      () => "loaded" as const,
+      () => "failed" as const,
+    );
+    let slowTimer: ReturnType<typeof setTimeout> | undefined;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    // Both timers are cleared when the race is over: the slow guard wins long
+    // before the load timeout, and an armed timer would keep the provider
+    // request alive for the rest of its budget.
+    const timed = new Promise<"failed">((resolve) => {
+      timeoutTimer = setTimeout(() => resolve("failed"), timeoutMs);
+    });
+    const slow = new Promise<"slow">((resolve) => {
+      slowTimer = setTimeout(() => resolve("slow"), ACP_IMPORT_HISTORY_SLOW_LOAD_MS);
+    });
+    try {
+      return await Promise.race([loaded, timed, slow]);
+    } finally {
+      if (slowTimer) clearTimeout(slowTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
     }
   }
 
@@ -1442,34 +2016,46 @@ export class ACPAgentClient implements AgentClient {
       }),
       stdio: ["pipe", "pipe", "pipe"],
     });
-    assertChildWithPipes(child);
+    try {
+      assertChildWithPipes(child);
 
-    const stderrChunks: string[] = [];
-    child.stderr.on("data", (chunk: Buffer | string) => {
-      stderrChunks.push(chunk.toString());
-    });
-
-    const processErrorPromise = rejectOnProcessFailure(child, stderrChunks);
-    const spawnReadyPromise = new Promise<void>((resolve) => {
-      child.once("spawn", () => {
-        resolve();
+      const stderrChunks: string[] = [];
+      child.stderr.on("data", (chunk: Buffer | string) => {
+        stderrChunks.push(chunk.toString());
       });
-    });
 
-    const stream = createLoggedNdJsonStream(
-      Writable.toWeb(child.stdin),
-      Readable.toWeb(child.stdout),
-      { logger: this.logger, provider: this.provider },
-    );
-    const connection = new ClientSideConnection(() => client, stream);
+      const processErrorPromise = rejectOnProcessFailure(child, stderrChunks);
+      const spawnReadyPromise = new Promise<void>((resolve) => {
+        child.once("spawn", () => {
+          resolve();
+        });
+      });
 
-    return {
-      child,
-      connection,
-      stderrChunks,
-      spawnReady: spawnReadyPromise,
-      processError: processErrorPromise,
-    };
+      const stream = createLoggedNdJsonStream(
+        Writable.toWeb(child.stdin),
+        Readable.toWeb(child.stdout),
+        { logger: this.logger, provider: this.provider },
+      );
+      const connection = new ClientSideConnection(() => client, stream);
+
+      return {
+        child,
+        connection,
+        stderrChunks,
+        spawnReady: spawnReadyPromise,
+        processError: processErrorPromise,
+      };
+    } catch (error) {
+      // The child is already running here. If the transport cannot be set up,
+      // the process would outlive the caller without anyone able to reach it:
+      // the probe is not registered anywhere yet.
+      await terminateChildProcess(
+        child as ChildProcessWithoutNullStreams,
+        2_000,
+        this.terminateProcess,
+      ).catch(() => undefined);
+      throw error;
+    }
   }
 
   protected async initializeTransport(
@@ -1716,6 +2302,8 @@ export class ACPAgentClient implements AgentClient {
 
 export class ACPAgentSession implements AgentSession, ACPClient {
   readonly provider: string;
+  // A copy, so advertising an extension in one session does not leak into every
+  // other session of the same provider.
   readonly capabilities: AgentCapabilityFlags;
 
   private readonly logger: Logger;
@@ -1756,6 +2344,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private pendingUserMessage: PendingUserMessage | null = null;
   private submittedUserMessageTurnId: string | null = null;
   private readonly toolCalls = new Map<string, ACPToolSnapshot>();
+  // The last delegation tree the provider published, so a repeated snapshot
+  // does not redraw the same rows.
+  private delegationSignature: string | null = null;
+  // Sub-agents the provider has already reported as running. A child that has
+  // not started yet is projected as finished by some providers, and only a
+  // child known to have started may be reported as finished on equal
+  // timestamps.
+  private readonly startedDelegationMembers = new Set<string>();
   private readonly terminalEntries = new Map<string, TerminalEntry>();
   private readonly persistedHistory: AgentTimelineItem[] = [];
   private readonly initialHandle?: AgentPersistenceHandle;
@@ -1765,6 +2361,12 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private child: ChildProcessWithoutNullStreams | null = null;
   private connection: ClientSideConnection | null = null;
   private agentCapabilities: ACPAgentCapabilities | null = null;
+  /**
+   * The `initialize` response of the provider. Its `_meta` carries the
+   * namespaced extensions the provider offers, which is how a client learns
+   * that steering is available.
+   */
+  private agentMeta: Record<string, unknown> | null = null;
   private sessionId: string | null = null;
   private readonly earlySessionUpdates: SessionNotification[] = [];
   private currentMode: string | null = null;
@@ -1785,18 +2387,76 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
   private currentTurnUsage: AgentUsage | undefined;
   private activeForegroundTurnId: string | null = null;
+  /**
+   * The foreground turn whose interruption is in flight. A retry that waits
+   * for the provider must not deliver the prompt again once the user stopped
+   * that turn.
+   */
+  private interruptingForegroundTurnId: string | null = null;
+  /**
+   * Tracks the foreground `session/prompt` requests so an interruption can
+   * wait for the provider to confirm that the turn ended. An ACP
+   * `session/cancel` is a notification without a response, so the cancellation
+   * request alone cannot tell us whether the provider already released the
+   * session.
+   */
+  private foregroundPrompts = new Map<
+    string,
+    {
+      turnId: string;
+      outcome: Promise<ForegroundTurnOutcome>;
+      settle: (outcome: ForegroundTurnOutcome) => void;
+    }
+  >();
   private fallbackAssistantMessageId: string | null = null;
   private closed = false;
   private historyPending = false;
   private historyRuntimeReleased = false;
   private replayingHistory = false;
   private bootstrapThreadEventPending = false;
+  /**
+   * Sub-agent rows published before anyone listened. A session initializes and
+   * reads its delegation tree before the agent manager subscribes, and a child
+   * that already finished never publishes again: without this the rows of a
+   * reopened session are lost and the background work stays invisible.
+   */
+  private readonly pendingDelegationEvents: AgentStreamEvent[] = [];
+  private delegationBacklogDelivered = false;
+  /**
+   * Messages handed to the provider's queue, by the turn that queued them. The
+   * queue outlives that turn, so a Stop has to find the item to take it back -
+   * otherwise the message still runs after a stop that said it stopped.
+   */
+  private readonly queuedProviderItems = new Map<string, string>();
+  /**
+   * Enqueues that are still in flight, by the turn that asked for them. A Stop that
+   * arrives before the provider answers has no item id to withdraw, so it waits for
+   * that answer instead of closing the turn on a guess.
+   */
+  private readonly pendingQueueEnqueues = new Map<string, Promise<void>>();
+  /**
+   * Turns whose stop arrived while their enqueue was in flight. Their answer takes
+   * the item back the moment its id exists, because the user already said no.
+   */
+  private readonly stoppedWhileQueueing = new Set<string>();
+  /**
+   * The provider's queue as it last reported it.
+   *
+   * This is a copy of a provider report, never a promise: an item can leave the
+   * queue without the session ever receiving a result for it.
+   */
+  private providerQueueItems: ProviderQueueItemSnapshot[] = [];
+  /**
+   * Items this client took back. Their departure from the queue is the client's
+   * own doing, so it must not be reported as a message that ran unobserved.
+   */
+  private readonly withdrawnQueueItemIds = new Set<string>();
   private readonly terminateProcess: ProcessTerminator;
 
   constructor(config: AgentSessionConfig, options: ACPAgentSessionOptions) {
     this.provider = options.provider;
     this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
-    this.capabilities = options.capabilities;
+    this.capabilities = { ...options.capabilities };
     this.logger = options.logger.child({ module: "agent", provider: options.provider });
     this.runtimeSettings = options.runtimeSettings;
     this.defaultCommand = options.defaultCommand;
@@ -1853,6 +2513,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.child = spawned.child;
       this.connection = spawned.connection;
       this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
+      this.agentMeta = spawned.initialize._meta ?? null;
+      this.applyAdvertisedCapabilities();
 
       const response = await this.runACPRequest(() =>
         this.connection!.newSession({
@@ -1867,6 +2529,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         await this.sessionUpdate(update);
       }
       await this.applyConfiguredOverrides();
+      await this.refreshDelegationSnapshot();
     } catch (error) {
       await this.closeAfterInitializationFailure(error);
     }
@@ -1880,16 +2543,37 @@ export class ACPAgentSession implements AgentSession, ACPClient {
    * from these calls regardless of capabilities.
    */
   async initializeResumedSession(): Promise<void> {
+    const handle = this.initialHandle;
+    if (!handle) {
+      throw new Error("Resume requested without persistence handle");
+    }
+    // An import spends minutes inside this method: the provider rebuilds the
+    // whole conversation for session/load. Registering the cancellation before
+    // the process exists lets a stopped import kill the child, while `dispose`
+    // in `finally` keeps a finished session from counting as an in-flight
+    // import that a later cancel could kill.
+    const cancellation = this.trackResumeCancellation(handle.sessionId);
     try {
-      const handle = this.initialHandle;
-      if (!handle) {
-        throw new Error("Resume requested without persistence handle");
-      }
-
-      const spawned = await this.spawnProcess();
+      const spawnPromise = this.spawnProcess();
+      // A cancellation that lands during the handshake races past the spawn, so
+      // the process that starts afterwards has to be stopped here.
+      spawnPromise.then(
+        (spawnedProcess) => {
+          if (!cancellation.cancelled()) {
+            return undefined;
+          }
+          return terminateChildProcess(spawnedProcess.child, 1_000, this.terminateProcess).catch(
+            () => undefined,
+          );
+        },
+        () => undefined,
+      );
+      const spawned = await cancellation.race(spawnPromise);
       this.child = spawned.child;
       this.connection = spawned.connection;
       this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
+      this.agentMeta = spawned.initialize._meta ?? null;
+      this.applyAdvertisedCapabilities();
       this.sessionId = handle.sessionId;
       this.bootstrapThreadEventPending = true;
 
@@ -1897,11 +2581,13 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       if (this.agentCapabilities?.loadSession) {
         this.replayingHistory = true;
         const response = await this.runACPRequest(() =>
-          this.connection!.loadSession({
-            sessionId: handle.sessionId,
-            cwd: this.config.cwd,
-            mcpServers: this.acpMcpServers(),
-          }),
+          cancellation.race(
+            this.connection!.loadSession({
+              sessionId: handle.sessionId,
+              cwd: this.config.cwd,
+              mcpServers: this.acpMcpServers(),
+            }),
+          ),
         );
         this.deliverTranslatedEvents(this.flushPendingUserMessage());
         this.replayingHistory = false;
@@ -1921,13 +2607,57 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       }
 
       await this.applyConfiguredOverrides();
+      await this.refreshDelegationSnapshot();
 
       if (this.resumePurpose === "history") {
         await this.releaseHistoryRuntime();
       }
     } catch (error) {
       await this.closeAfterInitializationFailure(error);
+    } finally {
+      cancellation.dispose();
     }
+  }
+
+  /**
+   * Watches one session initialization so an import can stop it.
+   *
+   * `session/load` makes the provider replay (and hold) the whole history, so
+   * releasing the waiting caller is not enough: cancellation kills the child and
+   * rejects the pending request, leaving the caller with a dead import instead
+   * of a process that keeps working for nobody.
+   */
+  private trackResumeCancellation(sessionId: string): {
+    race: <T>(request: Promise<T>) => Promise<T>;
+    cancelled: () => boolean;
+    dispose: () => void;
+  } {
+    let cancelled = false;
+    let rejectCancelled: ((error: Error) => void) | null = null;
+    const cancelledPromise = new Promise<never>((_resolve, reject) => {
+      rejectCancelled = reject;
+    });
+    // The losing branch of every race must not read as an unhandled rejection.
+    cancelledPromise.catch(() => undefined);
+    const unregister = registerInFlightImportProcess(this.provider, sessionId, async () => {
+      cancelled = true;
+      rejectCancelled?.(new Error(`${this.provider} session import was cancelled`));
+      const child = this.child;
+      if (!child) return;
+      try {
+        await terminateChildProcess(child, 1_000, this.terminateProcess);
+      } catch (error) {
+        this.logger.warn(
+          { err: error, sessionId },
+          "ACP cancelled import process could not be stopped",
+        );
+      }
+    });
+    return {
+      race: (request) => Promise.race([request, cancelledPromise]),
+      cancelled: () => cancelled,
+      dispose: unregister,
+    };
   }
 
   // History resumes exist to replay persisted events into the canonical
@@ -1992,7 +2722,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (!this.connection || !this.sessionId) {
       throw new Error(`${this.provider} session is not initialized`);
     }
-    if (this.connection.signal.aborted) {
+    const connection = this.connection;
+    if (connection.signal.aborted) {
       throw new Error(describeACPDisconnect(this.child));
     }
     if (this.activeForegroundTurnId) {
@@ -2009,21 +2740,133 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
     this.emitSubmittedUserMessage(prompt, messageId, turnId, options?.clientMessageId);
 
-    const connection = this.connection;
     const child = this.child;
     const failOnDisconnect = () => void this.failDisconnectedTurn(turnId, child);
     connection.signal.addEventListener("abort", failOnDisconnect, { once: true });
-    void connection
-      .prompt({
-        sessionId: this.sessionId,
-        messageId,
-        prompt: toACPContentBlocks(prompt),
-      })
+    const promptParams = {
+      sessionId: this.sessionId,
+      messageId,
+      prompt: toACPContentBlocks(prompt),
+    };
+    let busyRetries = 0;
+    const promptRequest = connection.prompt(promptParams);
+    let settleForegroundPrompt!: (outcome: ForegroundTurnOutcome) => void;
+    const outcome = new Promise<ForegroundTurnOutcome>((resolve) => {
+      settleForegroundPrompt = resolve;
+    });
+    this.foregroundPrompts.set(turnId, { turnId, outcome, settle: settleForegroundPrompt });
+    // Only an answer from the provider confirms that the turn ended. A
+    // rejected prompt leaves the session state unknown, so it must not be
+    // reported as a release - unless the provider only refused the prompt
+    // because it still owned the previous turn. Such a refusal is temporary,
+    // so the same prompt is sent again after a short pause.
+    promptRequest.then(
+      () => settleForegroundPrompt("released"),
+      () => undefined,
+    );
+
+    void promptRequest
       .then((response) => {
         this.handlePromptResponse(response, turnId);
         return;
       })
-      .catch((error) => {
+      .catch(async (error: unknown) => {
+        if (this.isProviderBusyError(error) && busyRetries < ACP_BUSY_PROMPT_RETRY_LIMIT) {
+          busyRetries += 1;
+          this.logger.warn(
+            { err: error },
+            "ACP provider still owns the previous turn; retrying the prompt",
+          );
+          await new Promise((resolve) => setTimeout(resolve, ACP_BUSY_PROMPT_RETRY_DELAY_MS));
+          // The user may have stopped the turn while the retry waited. The
+          // interruption owns the outcome now, and delivering the prompt again
+          // would resurrect the turn the user just stopped.
+          if (
+            this.interruptingForegroundTurnId === turnId ||
+            this.activeForegroundTurnId !== turnId
+          ) {
+            settleForegroundPrompt("released");
+            // The interruption resolves the release above, so nothing else
+            // closes this turn. Leaving it open would keep the session busy
+            // for good: the next prompt is refused and Stop never reports the
+            // session as stoppable. A turn the other side already closed keeps
+            // its single terminal event.
+            if (this.activeForegroundTurnId === turnId) {
+              this.finishTurn({
+                type: "turn_canceled",
+                provider: this.provider,
+                reason: "interrupted",
+                turnId,
+              });
+            }
+            return;
+          }
+          try {
+            const retried = await connection.prompt(promptParams);
+            this.handlePromptResponse(retried, turnId);
+            settleForegroundPrompt("released");
+            return;
+          } catch (retryError: unknown) {
+            const queued = await this.queuePromptForLaterTurn({
+              error: retryError,
+              prompt,
+              turnId,
+              ...(options?.clientMessageId ? { clientMessageId: options.clientMessageId } : {}),
+            });
+            if (queued === "queued") {
+              // The message is safe in the provider's queue, and the provider is
+              // still busy: the session may not take another prompt yet.
+              settleForegroundPrompt("unconfirmed");
+              this.finishTurn({
+                type: "turn_queued",
+                provider: this.provider,
+                reason: "The provider took the message into its queue while it was busy",
+                turnId,
+              });
+              return;
+            }
+            if (queued === "withdrawn") {
+              // The user stopped while the queue request was in flight, so the item
+              // was taken back the moment its id arrived. Nothing of ours is queued,
+              // and this turn ends canceled instead of claiming a queued message.
+              settleForegroundPrompt("released");
+              this.finishTurn({
+                type: "turn_canceled",
+                provider: this.provider,
+                reason: "interrupted",
+                turnId,
+              });
+              return;
+            }
+            if (queued === "unconfirmed") {
+              // The enqueue may have landed without a confirmation. Sending it again
+              // would duplicate the message, and turn_queued would promise a run nobody
+              // can point at, so the turn fails and says exactly what is unknown.
+              settleForegroundPrompt("unconfirmed");
+              this.finishTurn({
+                type: "turn_failed",
+                provider: this.provider,
+                error: ACP_QUEUE_UNCONFIRMED_MESSAGE,
+                code: "queue_unconfirmed",
+                diagnostic: this.collectDiagnostic(ACP_QUEUE_UNCONFIRMED_MESSAGE),
+                turnId,
+              });
+              return;
+            }
+            const summary = summarizeACPRequestError(retryError);
+            settleForegroundPrompt("unconfirmed");
+            this.finishTurn({
+              type: "turn_failed",
+              provider: this.provider,
+              error: summary.message,
+              code: summary.code,
+              diagnostic: this.collectDiagnostic(summary.diagnostic ?? summary.message),
+              turnId,
+            });
+            return;
+          }
+        }
+        settleForegroundPrompt("unconfirmed");
         const summary = summarizeACPRequestError(error);
         this.finishTurn({
           type: "turn_failed",
@@ -2071,9 +2914,25 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         sessionId: this.sessionId,
       });
     }
+    this.deliverDelegationBacklog(callback);
     return () => {
       this.subscribers.delete(callback);
     };
+  }
+
+  /**
+   * Hands the rows published before the first subscriber to that subscriber,
+   * in the order the provider published them. Later events are delivered live,
+   * so a row is never reported twice.
+   */
+  private deliverDelegationBacklog(callback: (event: AgentStreamEvent) => void): void {
+    if (this.delegationBacklogDelivered) {
+      return;
+    }
+    this.delegationBacklogDelivered = true;
+    for (const event of this.pendingDelegationEvents.splice(0)) {
+      callback(event);
+    }
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
@@ -2576,15 +3435,766 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     };
   }
 
+  /**
+   * Steers the running foreground turn instead of replacing it.
+   *
+   * ACP has no core steering method, so a provider has to offer one as a
+   * namespaced extension. MiniMax Code advertises `mcode/session/steer` in the
+   * `initialize` metadata and keeps the running turn alive: the provider
+   * answers with the turn it steered and the disposition of the message, and
+   * the agent keeps working on the same turn with the new guidance.
+   */
+  async steerActiveTurn(
+    prompt: AgentPromptInput,
+    options: SteerActiveTurnOptions,
+  ): Promise<SteerResult> {
+    const connection = this.connection;
+    const sessionId = this.sessionId;
+    const activeTurnId = this.activeForegroundTurnId;
+    if (!connection || !sessionId) {
+      return { status: "unavailable" };
+    }
+    // The steer has to land in the turn the caller admitted. A turn that moved
+    // on since then would steer the wrong run.
+    if (!activeTurnId || activeTurnId !== options.expectedTurnId) {
+      return { status: "unavailable" };
+    }
+    if (!this.supportsVendorSteer()) {
+      return { status: "unavailable" };
+    }
+    // The steer extension carries text only. A prompt with attachments would
+    // lose them on the way, so such a prompt is not steered at all: the
+    // manager falls back to the interrupt-and-replace path, which delivers the
+    // whole prompt.
+    const blocks = typeof prompt === "string" ? [{ type: "text" as const, text: prompt }] : prompt;
+    if (blocks.some((block) => block.type !== "text")) {
+      return { status: "unavailable" };
+    }
+    const text = extractPromptText(prompt);
+    if (!text.trim()) {
+      return { status: "unavailable" };
+    }
+
+    try {
+      const response = await connection.extMethod(MCODE_STEER_METHOD, {
+        sessionId,
+        text,
+        ...(options.clientMessageId ? { clientRequestId: options.clientMessageId } : {}),
+      });
+      const mode = typeof response.mode === "string" ? response.mode : null;
+      if (mode === "activated") {
+        throw new Error("ACP provider activated a new turn instead of steering the running one");
+      }
+      // `steered` means the message joined the running turn, `duplicate` means
+      // the same client request id was already accepted, and `merged` means
+      // the provider folded the message into the current one. All three are a
+      // delivery. Anything else is unknown and must not be reported as one.
+      if (mode !== "steered" && mode !== "merged" && mode !== "duplicate") {
+        throw new Error(`ACP provider returned an unknown steer disposition: ${mode ?? "none"}`);
+      }
+      if (options.clearPendingPermissions) {
+        this.cancelPendingPermissions();
+      }
+      // The provider answers with its own turn id, which is not the Paseo turn
+      // id and cannot be compared with it. It is logged for diagnostics only.
+      this.logger.info(
+        { mode, turnId: activeTurnId, providerTurnId: response.turnId },
+        "ACP provider accepted the steer for the running turn",
+      );
+      return { status: "accepted" };
+    } catch (error) {
+      // A provider without the extension answers "method not found". That is a
+      // definitive "no steering here", so the manager may fall back to the
+      // interrupt-and-replace path. Any other failure leaves the fate of the
+      // message unknown and must surface instead of being retried.
+      if (isMethodNotFoundError(error)) {
+        return { status: "unavailable" };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * The extension methods the provider named in its `initialize` metadata.
+   *
+   * A provider advertises what it can do in the handshake, so a method it never
+   * named is not offered to the session: guessing would turn a missing feature
+   * into an error the user cannot act on.
+   */
+  private advertisedProviderMethods(): unknown[] {
+    const extensions = this.agentMeta?.[MCODE_EXTENSIONS_META_KEY];
+    if (!extensions || typeof extensions !== "object") {
+      return [];
+    }
+    const methods = (extensions as { methods?: unknown }).methods;
+    return Array.isArray(methods) ? methods : [];
+  }
+
+  /**
+   * Reports whether the provider advertised a steering extension. The
+   * advertisement lives in the `initialize` metadata, so a provider that
+   * never offered steering is reported as unavailable instead of failing.
+   */
+  private supportsVendorSteer(): boolean {
+    return this.advertisedProviderMethods().includes(MCODE_STEER_METHOD);
+  }
+
+  /**
+   * Reports whether the provider advertised a queue extension.
+   */
+  private supportsVendorQueue(): boolean {
+    return this.advertisedProviderMethods().includes(MCODE_QUEUE_ENQUEUE_METHOD);
+  }
+
+  /**
+   * Reports whether the provider advertised the queue removal method. A
+   * provider that only enqueues keeps the previous behaviour: the message
+   * stays in its queue and the user is not promised otherwise.
+   */
+  private supportsVendorQueueDelete(): boolean {
+    return this.advertisedProviderMethods().includes(MCODE_QUEUE_DELETE_METHOD);
+  }
+
+  /**
+   * Reports whether the provider lets this client read its queue.
+   *
+   * Reading is what makes a queued message visible at all: the provider sends
+   * no answer for a queued message through the session stream, so the list is
+   * the only place its fate can be seen.
+   */
+  private supportsVendorQueueList(): boolean {
+    return this.advertisedProviderMethods().includes(MCODE_QUEUE_LIST_METHOD);
+  }
+
+  /**
+   * Reports the messages the provider is holding for later turns, as it reports
+   * them right now.
+   *
+   * The provider is the owner of its queue: reading it on demand is what lets a
+   * reconnecting client show a position again, because the provider does not
+   * replay its queue notifications after a resume. A failure is thrown rather
+   * than reported as an empty queue - "nothing is waiting" and "the queue could
+   * not be read" are different facts, and only one of them is true.
+   */
+  async getProviderQueue(): Promise<ProviderQueueItemSnapshot[]> {
+    if (!this.supportsVendorQueueList()) {
+      return [];
+    }
+    const connection = this.connection;
+    const sessionId = this.sessionId;
+    if (!connection || !sessionId) {
+      return [];
+    }
+    const response = await withTimeout(
+      connection.extMethod(MCODE_QUEUE_LIST_METHOD, { sessionId }),
+      ACP_QUEUE_LIST_TIMEOUT_MS,
+      `ACP queue list did not answer within ${ACP_QUEUE_LIST_TIMEOUT_MS}ms`,
+    );
+    const items = readProviderQueueItems(response) ?? [];
+    this.applyProviderQueueSnapshot(items);
+    return items;
+  }
+
+  /**
+   * Records the provider queue and reports the items that left it.
+   *
+   * A queued message has no answer in the session stream: measured against
+   * MiniMax Code 0.7.3, the item leaves the queue when the running turn ends and
+   * no `session/update` ever carries its text or its reply. Reporting the
+   * departure is therefore the only honest account of what became of it - and it
+   * says exactly that, instead of promising a result that never arrives.
+   */
+  private applyProviderQueueSnapshot(items: ProviderQueueItemSnapshot[]): void {
+    const previous = this.providerQueueItems;
+    this.providerQueueItems = items;
+    if (previous.length === 0) {
+      return;
+    }
+    const present = new Set(items.map((item) => item.itemId));
+    const leftBehind = previous.filter(
+      (item) => !present.has(item.itemId) && !this.withdrawnQueueItemIds.delete(item.itemId),
+    );
+    if (leftBehind.length === 0) {
+      return;
+    }
+    for (const item of leftBehind) {
+      this.queuedProviderItems.forEach((itemId, turnId) => {
+        if (itemId === item.itemId) {
+          this.queuedProviderItems.delete(turnId);
+        }
+      });
+    }
+    this.pushEvent(
+      this.wrapTimeline({
+        type: "notification",
+        level: "warning",
+        message:
+          "A message left the provider's queue. The provider does not report the result of a queued message, so whether it ran is unknown.",
+      }),
+    );
+    this.logger.info(
+      { items: leftBehind.map((item) => item.itemId) },
+      "ACP provider drained queued messages without reporting their result",
+    );
+  }
+
+  /**
+   * Reports whether the provider advertised a delegation extension.
+   */
+  private supportsVendorDelegation(): boolean {
+    return this.advertisedProviderMethods().includes(MCODE_DELEGATION_GET_METHOD);
+  }
+
+  /**
+   * Publishes what the handshake allows.
+   *
+   * The capabilities reach the app in the agent snapshot, which is how the
+   * track learns whether a stop exists before offering one. A provider that
+   * names no stop method keeps the rows read-only.
+   */
+  private applyAdvertisedCapabilities(): void {
+    this.capabilities.supportsProviderDelegationStop = this.supportsVendorDelegationStop();
+  }
+
+  /**
+   * Reports whether the provider can stop the delegations of a session.
+   *
+   * Stopping a provider's delegated tasks is a root-session operation, so the
+   * method has to be advertised: a provider that only publishes its tree keeps
+   * the rows read-only instead of offering a stop it cannot carry out.
+   */
+  private supportsVendorDelegationStop(): boolean {
+    return this.advertisedProviderMethods().includes(MCODE_DELEGATION_STOP_METHOD);
+  }
+
+  /**
+   * Publishes the provider's delegation tree as sub-agent rows.
+   *
+   * A provider that runs its own sub-agents keeps them out of the session
+   * list: their sessions cannot be opened, and they never appear as agents of
+   * their own. Without this the background work of a session is invisible -
+   * the user sees the parent turn and nothing about what it delegated.
+   *
+   * The provider sends the whole tree, so the rows replace the previous state
+   * instead of accumulating.
+   */
+  private applyDelegationSnapshot(snapshot: unknown): void {
+    const members = readDelegationMembers(snapshot);
+    if (!members) {
+      return;
+    }
+    const signature = members
+      .map((member) => `${member.sessionId}:${member.status}:${member.updatedAtMs ?? ""}`)
+      .join("|");
+    if (signature === this.delegationSignature) {
+      // The provider repeats a snapshot it already sent. Republishing it would
+      // only redraw the same rows.
+      return;
+    }
+    this.delegationSignature = signature;
+    const memberIds = new Set(members.map((member) => member.sessionId));
+    for (const member of members) {
+      const parentSubagentId =
+        member.parentSessionId && memberIds.has(member.parentSessionId)
+          ? member.parentSessionId
+          : null;
+      const status = this.readDelegationStatus(member);
+      this.pushEvent({
+        type: "provider_subagent",
+        provider: this.provider,
+        event: {
+          type: "upsert",
+          id: member.sessionId,
+          title: member.task,
+          description: member.agentName,
+          status,
+          parentSubagentId,
+          ...(member.updatedAtMs !== null
+            ? { timestamp: new Date(member.updatedAtMs).toISOString() }
+            : {}),
+        },
+      });
+    }
+  }
+
+  /**
+   * Reads the status of one delegation member.
+   *
+   * Some providers project a child that has not started yet as finished, with
+   * the same timestamp for its creation and its last update. Reporting that
+   * as finished would claim the work is done before it began, so such a child
+   * stays running until the provider says otherwise. A child the provider
+   * already reported as running is taken at its word when it finishes.
+   */
+  private readDelegationStatus(
+    member: ProviderDelegationMember,
+  ): ProviderDelegationMember["status"] {
+    if (member.status === "running") {
+      this.startedDelegationMembers.add(member.sessionId);
+      return "running";
+    }
+    const neverStarted =
+      member.createdAtMs !== null &&
+      member.updatedAtMs !== null &&
+      member.createdAtMs === member.updatedAtMs;
+    if (
+      member.status === "completed" &&
+      neverStarted &&
+      !this.startedDelegationMembers.has(member.sessionId)
+    ) {
+      return "running";
+    }
+    return member.status;
+  }
+
+  /**
+   * Reads the delegation tree once, so a session that already had sub-agents
+   * shows them before the next update arrives.
+   */
+  private async refreshDelegationSnapshot(): Promise<void> {
+    const connection = this.connection;
+    if (!connection || !this.sessionId || !this.supportsVendorDelegation()) {
+      return;
+    }
+    try {
+      const response = await connection.extMethod(MCODE_DELEGATION_GET_METHOD, {
+        sessionId: this.sessionId,
+      });
+      const snapshot = isRecord(response) ? response.snapshot : undefined;
+      if (snapshot !== undefined) {
+        this.applyDelegationSnapshot(snapshot);
+      }
+    } catch (error) {
+      // A provider without a delegation tree, or one that is not attached to
+      // this process, answers with an error. That is not a failure of the
+      // session: the tree is an extra, not a requirement.
+      this.logger.debug({ err: error }, "ACP provider did not report a delegation tree");
+    }
+  }
+
+  /**
+   * Stops the turn that runs the provider's delegation tree, and with it every
+   * task delegated under it.
+   *
+   * There is no per-child stop: a child is not a turn of its own and the
+   * provider answers -32002 for its session id. The root session id is what the
+   * provider's stop takes, and aborting the root turn is what cancels the work
+   * underneath it.
+   *
+   * The receipt is not evidence. `rootStopped` comes back true even when
+   * nothing was running, and `stoppedSessionIds` can be empty for a child that
+   * really did stop. What actually happened is in the tree, so the snapshot is
+   * read again before answering and the rows carry the statuses the user reads.
+   */
+  async stopProviderDelegations(): Promise<ProviderDelegationStopResult> {
+    const connection = this.connection;
+    if (!connection || !this.sessionId) {
+      throw new Error(`${this.provider} session is not initialized`);
+    }
+    if (!this.supportsVendorDelegationStop()) {
+      throw new Error(`${this.provider} does not support stopping delegated tasks`);
+    }
+    let acknowledged = false;
+    try {
+      const response = await connection.extMethod(MCODE_DELEGATION_STOP_METHOD, {
+        sessionId: this.sessionId,
+      });
+      acknowledged = isRecord(response) && isRecord(response.receipt);
+      // A message the provider queued for a later turn outlives the abort of
+      // the current one: it would run behind a stop that promised it would not.
+      await this.withdrawQueuedPrompts();
+    } catch (error) {
+      this.logger.warn({ err: error }, "ACP provider did not accept the delegation stop");
+      // The stop may still have landed - a provider can fail the request after
+      // aborting the tree. The tree is the only report, so read it anyway.
+      await this.refreshDelegationSnapshot();
+      throw error;
+    }
+    await this.refreshDelegationSnapshot();
+    return { acknowledged };
+  }
+
+  /**
+   * Hands the message to the provider's queue instead of losing it.
+   *
+   * A provider that still owns its previous turn refuses a new prompt. That
+   * refusal is temporary, but a refusal is not a delivery: the user's message
+   * would be dropped with an error and never reach the agent. Providers that
+   * expose a queue (MiniMax Code does, and its own error message points at
+   * it) can take the message for a later turn, so the agent picks it up once
+   * it is done with the current one.
+   *
+   * The outcome is reported instead of assumed: only a confirmed `queued` answer
+   * ends the turn as queued, and `skipped` lets the caller report the original
+   * failure.
+   */
+  private async queuePromptForLaterTurn(args: {
+    error: unknown;
+    prompt: AgentPromptInput;
+    turnId: string;
+    clientMessageId?: string;
+  }): Promise<QueuePromptOutcome> {
+    const { error, prompt, turnId, clientMessageId } = args;
+    if (!this.isProviderBusyError(error)) {
+      return "skipped";
+    }
+    if (!this.supportsVendorQueue()) {
+      return "skipped";
+    }
+    if (!this.connection || !this.sessionId) {
+      return "skipped";
+    }
+    const text = extractPromptText(prompt);
+    if (!text.trim()) {
+      return "skipped";
+    }
+    if (!isTextOnlyPrompt(prompt)) {
+      // The queue carries text. A prompt with an attachment would lose it, so
+      // it has to fail loudly instead of half-delivering.
+      return "skipped";
+    }
+    const enqueue = this.enqueuePromptForLaterTurn({
+      text,
+      turnId,
+      ...(clientMessageId ? { clientMessageId } : {}),
+    });
+    // A Stop that arrives now finds no item to withdraw yet. Publishing the request
+    // lets the interruption wait for the answer - and withdraw the item the moment
+    // its id exists - instead of closing a turn that may leave a message behind.
+    this.pendingQueueEnqueues.set(
+      turnId,
+      enqueue.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    try {
+      return await enqueue;
+    } finally {
+      this.pendingQueueEnqueues.delete(turnId);
+      this.stoppedWhileQueueing.delete(turnId);
+    }
+  }
+
+  /**
+   * Sends the message to the provider's queue and reports what the answer really
+   * proves.
+   *
+   * Only a `queued` status with an item id is a delivery: anything else leaves the
+   * message in an unknown state. Resending would duplicate it (the provider does not
+   * deduplicate `clientRequestId`), and calling it queued would promise a run nobody
+   * can point at or take back.
+   */
+  private async enqueuePromptForLaterTurn(args: {
+    text: string;
+    turnId: string;
+    clientMessageId?: string;
+  }): Promise<QueuePromptOutcome> {
+    const { text, turnId, clientMessageId } = args;
+    const connection = this.connection;
+    const sessionId = this.sessionId;
+    if (!connection || !sessionId) {
+      return "skipped";
+    }
+    try {
+      const response = await connection.extMethod(MCODE_QUEUE_ENQUEUE_METHOD, {
+        sessionId,
+        text,
+        ...(clientMessageId ? { clientRequestId: clientMessageId } : {}),
+      });
+      const itemId = readQueuedItemId(response);
+      if (!itemId) {
+        this.logger.warn({ turnId }, "ACP provider did not acknowledge the queued prompt");
+        this.reportQueueAcceptanceUnknown();
+        return "unconfirmed";
+      }
+      if (this.stoppedWhileQueueing.delete(turnId)) {
+        // The user stopped before the answer arrived. The item exists now, so take it
+        // back instead of letting it run behind a stop that promised it would not.
+        await this.withdrawQueuedPrompt(turnId, itemId);
+        return "withdrawn";
+      }
+      this.queuedProviderItems.set(turnId, itemId);
+      this.pushEvent(
+        this.wrapTimeline({
+          type: "notification",
+          level: "info",
+          message:
+            "Message accepted into the provider's queue: the agent picks it up after the current turn.",
+        }),
+      );
+      this.logger.info({ turnId }, "ACP provider took the prompt into its queue while it was busy");
+      return "queued";
+    } catch (queueError) {
+      this.logger.warn(
+        { err: queueError, turnId },
+        "ACP provider did not answer the queue request for a later turn",
+      );
+      this.reportQueueAcceptanceUnknown();
+      return "unconfirmed";
+    }
+  }
+
+  /**
+   * Reports a message the provider never confirmed taking. It may still run later,
+   * and it cannot be pointed at or withdrawn from here.
+   */
+  private reportQueueAcceptanceUnknown(): void {
+    this.pushEvent(
+      this.wrapTimeline({
+        type: "notification",
+        level: "warning",
+        message:
+          "The provider did not confirm taking the message into its queue: it may still run it in a later turn.",
+      }),
+    );
+  }
+
+  /**
+   * Reports a message whose queue id is unknown, so the stop cannot take it back.
+   */
+  private reportQueuedMessageUnknown(): void {
+    this.pushEvent(
+      this.wrapTimeline({
+        type: "notification",
+        level: "warning",
+        message:
+          "A message handed to the provider's queue was not confirmed: it may still be in the queue and cannot be withdrawn.",
+      }),
+    );
+  }
+
+  /**
+   * Takes back the messages the provider queued for a later turn.
+   *
+   * The provider cancels a queued item on request and refuses once it has
+   * claimed that item for a turn. A refused removal is reported as it is: the
+   * message will run, and telling the user it stopped would be a lie.
+   */
+  private async withdrawQueuedPrompts(): Promise<void> {
+    if (this.queuedProviderItems.size === 0 && this.pendingQueueEnqueues.size === 0) {
+      return;
+    }
+    const connection = this.connection;
+    if (!connection || !this.sessionId || !this.supportsVendorQueueDelete()) {
+      // Without a queue deletion there is no way to take anything back, and a message
+      // may be on its way in. Saying so is the only honest report.
+      this.reportQueuedMessageUnknown();
+      return;
+    }
+    // An enqueue still in flight has no item id to delete yet. Wait for the answer: it
+    // either makes the item withdrawable or ends the turn as unconfirmed.
+    const inFlight = [...this.pendingQueueEnqueues.values()];
+    if (inFlight.length > 0) {
+      try {
+        await withTimeout(
+          Promise.all(inFlight),
+          ACP_QUEUE_ACK_WAIT_MS,
+          `ACP queue enqueue did not answer within ${ACP_QUEUE_ACK_WAIT_MS}ms`,
+        );
+      } catch (error) {
+        this.logger.warn(
+          { err: error },
+          "ACP provider did not answer the queue request before the stop",
+        );
+        this.reportQueuedMessageUnknown();
+      }
+    }
+    const pending = [...this.queuedProviderItems];
+    this.queuedProviderItems.clear();
+    for (const [turnId, itemId] of pending) {
+      await this.withdrawQueuedPrompt(turnId, itemId);
+    }
+  }
+
+  /**
+   * Asks the provider to drop one queued item and reports the answer as it is.
+   */
+  private async withdrawQueuedPrompt(turnId: string, itemId: string): Promise<void> {
+    const connection = this.connection;
+    const sessionId = this.sessionId;
+    if (!connection || !sessionId) {
+      this.reportQueuedMessageUnknown();
+      return;
+    }
+    try {
+      const response = await connection.extMethod(MCODE_QUEUE_DELETE_METHOD, {
+        sessionId,
+        itemId,
+      });
+      if (isRecord(response) && "item" in response && response.item === null) {
+        this.reportQueuedMessageStuck(turnId, itemId);
+        return;
+      }
+      // The item left the queue because this client took it back, so its
+      // departure is not a message that ran unobserved.
+      this.withdrawnQueueItemIds.add(itemId);
+      this.pushEvent(
+        this.wrapTimeline({
+          type: "notification",
+          level: "info",
+          message: "The queued message was withdrawn from the provider and will not run.",
+        }),
+      );
+    } catch (error) {
+      this.logger.warn(
+        { err: error, turnId, itemId },
+        "ACP provider refused to withdraw the queued prompt",
+      );
+      this.reportQueuedMessageStuck(turnId, itemId);
+    }
+  }
+
+  private reportQueuedMessageStuck(turnId: string, itemId: string): void {
+    this.logger.warn({ turnId, itemId }, "ACP provider did not withdraw the queued prompt");
+    // The provider refuses the removal once it claimed the item, so the
+    // message is either running or already past the queue. Saying which one
+    // would be a guess; saying that it will not run would be a lie.
+    this.pushEvent(
+      this.wrapTimeline({
+        type: "notification",
+        level: "warning",
+        message: "The queued message cannot be withdrawn; the provider may already be running it.",
+      }),
+    );
+  }
+
   async interrupt(): Promise<void> {
     if (!this.connection || !this.sessionId) {
       return;
     }
 
     this.cancelPendingPermissions();
+    // A Stop stops the session, not only the turn that happens to be running:
+    // a message already waiting in the provider's queue would otherwise run
+    // right after the stop the user was promised.
+    // An enqueue still in flight is marked first: nobody could withdraw an item whose
+    // id had not arrived, so its answer withdraws what it just created.
+    for (const turnId of this.pendingQueueEnqueues.keys()) this.stoppedWhileQueueing.add(turnId);
+    await this.withdrawQueuedPrompts();
 
+    const activeTurnId = this.activeForegroundTurnId;
+    if (!activeTurnId) {
+      return;
+    }
+
+    // Capture the pending prompt before cancelling: the provider may answer
+    // the cancelled turn and start another one while the notification is in
+    // flight, and waiting for that other turn would report a release that
+    // never happened.
+    const pending = this.foregroundPrompts.get(activeTurnId) ?? null;
+    this.interruptingForegroundTurnId = activeTurnId;
+
+    try {
+      await withTimeout(
+        this.connection.cancel({ sessionId: this.sessionId }),
+        ACP_CANCEL_NOTIFICATION_TIMEOUT_MS,
+        `ACP session/cancel timed out after ${ACP_CANCEL_NOTIFICATION_TIMEOUT_MS}ms`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        { err: error, turnId: activeTurnId },
+        "Failed to send the ACP session/cancel notification",
+      );
+    }
+
+    if (!pending) {
+      return;
+    }
+    await this.waitForForegroundTurnRelease(pending);
+  }
+
+  /**
+   * Reports whether the provider refused a prompt because it still owns the
+   * previous turn. The refusal is temporary: the same message is accepted
+   * once the provider has released the session.
+   *
+   * The refusal comes in two shapes. A provider that tracks its own prompt
+   * rejects the second one with "A prompt is already active for this
+   * session."; a provider whose runtime is busy answers with "Session already
+   * has an active Turn. Use queue send to deliver the message after it.".
+   */
+  private isProviderBusyError(error: unknown): boolean {
+    const summary = summarizeACPRequestError(error);
+    return (
+      /already has an active turn/i.test(summary.message) ||
+      /a prompt is already active for this session/i.test(summary.message)
+    );
+  }
+
+  /**
+   * `session/cancel` is an ACP notification: it resolves as soon as the
+   * request is written, while the provider may still be running the turn. The
+   * AgentSession contract requires interruption to resolve only once the prior
+   * foreground turn can no longer run, so wait for the provider's answer to the
+   * original `session/prompt` instead of assuming the session is free.
+   */
+  private async waitForForegroundTurnRelease(pending: {
+    turnId: string;
+    outcome: Promise<ForegroundTurnOutcome>;
+  }): Promise<void> {
+    let outcome: ForegroundTurnOutcome;
+    try {
+      outcome = await withTimeout(
+        pending.outcome,
+        ACP_TURN_RELEASE_TIMEOUT_MS,
+        `ACP provider still owns the foreground turn after session/cancel (waited ${ACP_TURN_RELEASE_TIMEOUT_MS}ms)`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        { err: error, turnId: pending.turnId },
+        "Timed out waiting for the ACP provider to release the foreground turn",
+      );
+      throw error;
+    }
+
+    if (outcome !== "released") {
+      const error = new Error(
+        `ACP provider did not confirm the end of the foreground turn (turn ${pending.turnId})`,
+      );
+      this.logger.warn(
+        { err: error, turnId: pending.turnId },
+        "ACP provider did not confirm the foreground turn ended",
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Reports how the foreground turn ended to whoever waits for the provider
+   * to release the session. The first outcome wins, so a late answer cannot
+   * overwrite an exit that already ended the turn.
+   */
+  private settleForegroundPrompt(outcome: ForegroundTurnOutcome): void {
+    for (const pending of this.foregroundPrompts.values()) {
+      pending.settle(outcome);
+    }
+    this.foregroundPrompts.clear();
+  }
+
+  /**
+   * A confirmed process exit ends the foreground turn: the provider cannot own
+   * a session anymore, so a pending interruption must not keep waiting for an
+   * answer that can no longer arrive.
+   */
+  private handleProviderExit(
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    stderrChunks: string[],
+  ): void {
+    if (this.closed || this.historyRuntimeReleased) {
+      return;
+    }
+    this.settleForegroundPrompt("released");
     if (this.activeForegroundTurnId) {
-      await this.connection.cancel({ sessionId: this.sessionId });
+      this.synthesizeCanceledToolCalls();
+      this.finishTurn({
+        type: "turn_failed",
+        provider: this.provider,
+        error: `ACP agent exited unexpectedly (${code ?? "null"}${signal ? `, ${signal}` : ""})`,
+        diagnostic: stderrChunks.join("").trim() || undefined,
+        turnId: this.activeForegroundTurnId,
+      });
     }
   }
 
@@ -2605,6 +4215,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     this.settleCommandsReady();
+
+    // The session is going away, so no pending interruption may keep waiting
+    // for a provider answer that can no longer arrive.
+    this.settleForegroundPrompt("released");
 
     this.cancelPendingPermissions();
 
@@ -2758,6 +4372,28 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       },
       "provider.acp.extension_notification",
     );
+
+    if (method === MCODE_DELEGATION_UPDATE_NOTIFICATION) {
+      // The provider publishes the whole delegation tree whenever it changes.
+      // This is the only way to see the work a session delegated.
+      const sessionId = typeof params.sessionId === "string" ? params.sessionId : null;
+      const snapshot = isRecord(params) ? params.snapshot : undefined;
+      // A provider may publish the tree of another session to the same client.
+      // Only the tree of this session belongs to it.
+      if (snapshot !== undefined && (sessionId === null || sessionId === this.sessionId)) {
+        this.applyDelegationSnapshot(snapshot);
+      }
+    }
+
+    if (method === MCODE_QUEUE_UPDATE_NOTIFICATION) {
+      // The provider publishes the whole queue whenever it changes. Only its own
+      // session queue belongs to this session.
+      const sessionId = typeof params.sessionId === "string" ? params.sessionId : null;
+      const items = readProviderQueueItems(params);
+      if (items && (sessionId === null || sessionId === this.sessionId)) {
+        this.applyProviderQueueSnapshot(items);
+      }
+    }
 
     const parsedCommands = this.extensionCommandsParser?.(method, params);
     if (parsedCommands) {
@@ -2947,19 +4583,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     });
     const processError = rejectOnProcessFailure(child, stderrChunks);
     child.once("exit", (code, signal) => {
-      if (this.closed || this.historyRuntimeReleased) {
-        return;
-      }
-      if (this.activeForegroundTurnId) {
-        this.synthesizeCanceledToolCalls();
-        this.finishTurn({
-          type: "turn_failed",
-          provider: this.provider,
-          error: `ACP agent exited unexpectedly (${code ?? "null"}${signal ? `, ${signal}` : ""})`,
-          diagnostic: stderrChunks.join("").trim() || undefined,
-          turnId: this.activeForegroundTurnId,
-        });
-      }
+      this.handleProviderExit(code, signal, stderrChunks);
     });
 
     const stream = createLoggedNdJsonStream(
@@ -2977,7 +4601,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         connection.initialize({
           protocolVersion: PROTOCOL_VERSION,
           clientCapabilities: buildACPClientCapabilities(
-            this.clientCapabilityMeta,
+            this.handshakeClientCapabilityMeta(),
             this.clientCapabilities,
           ),
           clientInfo: { name: "Paseo", version: "dev" },
@@ -2987,6 +4611,19 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     );
 
     return { child, connection, initialize };
+  }
+
+  /**
+   * Client capability metadata for the handshake with this provider.
+   *
+   * A user-supplied metadata object must not silence the vendor handshake:
+   * without it MiniMax Code keeps its delegations and its queue to itself.
+   */
+  private handshakeClientCapabilityMeta(): ACPClientCapabilityMeta | undefined {
+    if (!isMiniMaxCodeProvider(this.provider, this.defaultCommand)) {
+      return this.clientCapabilityMeta;
+    }
+    return mergeACPClientCapabilityMeta(MCODE_CLIENT_CAPABILITY_META, this.clientCapabilityMeta);
   }
 
   private async runACPRequest<T>(request: () => Promise<T>): Promise<T> {
@@ -3438,6 +5075,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       },
       "provider.acp.event_emit",
     );
+    if (
+      event.type === "provider_subagent" &&
+      this.subscribers.size === 0 &&
+      !this.delegationBacklogDelivered
+    ) {
+      this.pendingDelegationEvents.push(event);
+      return;
+    }
     for (const subscriber of this.subscribers) {
       subscriber(event);
     }
@@ -3482,7 +5127,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   private finishTurn(
-    event: Extract<AgentStreamEvent, { type: "turn_completed" | "turn_failed" | "turn_canceled" }>,
+    event: Extract<
+      AgentStreamEvent,
+      { type: "turn_completed" | "turn_failed" | "turn_canceled" | "turn_queued" }
+    >,
   ): void {
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     // Failed and canceled turns clear every request in the manager. Answer the
@@ -3490,12 +5138,37 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.cancelPendingPermissions(
       (pending) => event.type !== "turn_completed" || pending.turnId === event.turnId,
     );
+    const finishedTurnId = event.turnId ?? this.activeForegroundTurnId;
     this.activeForegroundTurnId = null;
+    if (this.interruptingForegroundTurnId === finishedTurnId) {
+      this.interruptingForegroundTurnId = null;
+    }
+    if (finishedTurnId) {
+      this.foregroundPrompts.delete(finishedTurnId);
+    }
     this.fallbackAssistantMessageId = null;
     if (this.submittedUserMessageTurnId === event.turnId) {
       this.submittedUserMessageTurnId = null;
     }
     this.pushEvent(event);
+    void this.refreshProviderQueueAfterTurn();
+  }
+
+  /**
+   * Re-reads the provider queue when a turn ends.
+   *
+   * The turn that held the queue is over, so this is the moment a position moves.
+   * Reading it here keeps the report in step without polling a busy provider.
+   */
+  private async refreshProviderQueueAfterTurn(): Promise<void> {
+    if (!this.supportsVendorQueueList()) {
+      return;
+    }
+    try {
+      await this.getProviderQueue();
+    } catch (error) {
+      this.logger.warn({ err: error }, "ACP provider did not report its queue after a turn");
+    }
   }
 
   private cancelPendingPermissions(
@@ -3761,6 +5434,19 @@ function toACPContentBlocks(prompt: AgentPromptInput): ContentBlock[] {
   return contentBlocks;
 }
 
+/**
+ * Reports whether an extension request failed because the provider does not
+ * implement that method.
+ */
+function isMethodNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === -32601
+  );
+}
+
 function extractPromptText(prompt: AgentPromptInput): string {
   if (typeof prompt === "string") {
     return prompt;
@@ -3771,6 +5457,93 @@ function extractPromptText(prompt: AgentPromptInput): string {
     )
     .map((block) => block.text)
     .join("");
+}
+
+/**
+ * Reports whether the prompt carries nothing but text.
+ *
+ * A provider's queue takes text. A prompt that also carries an image or an
+ * attachment cannot be queued faithfully, and queuing the text alone would
+ * quietly drop the rest.
+ */
+function isTextOnlyPrompt(prompt: AgentPromptInput): boolean {
+  if (typeof prompt === "string") {
+    return true;
+  }
+  return prompt.every((block) => block.type === "text");
+}
+
+/**
+ * One member of a provider's delegation tree.
+ *
+ * The shape is a provider's own: the session id of the child, the session id
+ * of its parent, the name of the agent that runs it, the task it was given and
+ * where it stands.
+ */
+interface ProviderDelegationMember {
+  sessionId: string;
+  parentSessionId: string | null;
+  agentName: string | null;
+  task: string | null;
+  status: "running" | "completed" | "failed" | "canceled";
+  createdAtMs: number | null;
+  updatedAtMs: number | null;
+}
+
+function readDelegationMemberStatus(value: unknown): ProviderDelegationMember["status"] {
+  switch (value) {
+    case "completed":
+    case "done":
+    case "finished":
+      return "completed";
+    case "failed":
+    case "error":
+      return "failed";
+    case "stopped":
+    case "cancelled":
+    case "canceled":
+      return "canceled";
+    default:
+      // An unknown status is not a finished one. Reporting it as running keeps
+      // the child visible instead of claiming work that may still be going.
+      return "running";
+  }
+}
+
+/**
+ * Reads the members of a delegation snapshot.
+ *
+ * The provider sends the whole tree, not a diff, so the members replace the
+ * previous state. A member without a session id cannot be addressed and is
+ * skipped.
+ */
+function readDelegationMembers(snapshot: unknown): ProviderDelegationMember[] | null {
+  if (!isRecord(snapshot)) {
+    return null;
+  }
+  const members = snapshot.members;
+  if (!Array.isArray(members)) {
+    return null;
+  }
+  const parsed: ProviderDelegationMember[] = [];
+  for (const entry of members) {
+    if (!isRecord(entry) || typeof entry.sessionId !== "string" || !entry.sessionId) {
+      continue;
+    }
+    parsed.push({
+      sessionId: entry.sessionId,
+      parentSessionId:
+        typeof entry.parentSessionId === "string" && entry.parentSessionId
+          ? entry.parentSessionId
+          : null,
+      agentName: typeof entry.agentName === "string" && entry.agentName ? entry.agentName : null,
+      task: typeof entry.task === "string" && entry.task ? entry.task : null,
+      status: readDelegationMemberStatus(entry.status),
+      createdAtMs: typeof entry.createdAtMs === "number" ? entry.createdAtMs : null,
+      updatedAtMs: typeof entry.updatedAtMs === "number" ? entry.updatedAtMs : null,
+    });
+  }
+  return parsed;
 }
 
 function contentBlockToText(content: ContentBlock): string {

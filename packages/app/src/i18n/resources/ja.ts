@@ -167,6 +167,8 @@ export const ja: TranslationResources = {
       dropFilesHere: "ここにファイルをドロップ",
       editQueuedMessage: "キューに入れたメッセージを編集",
       sendQueuedMessageNow: "キューに入れたメッセージを今すぐ送信",
+      providerQueueLabel: "プロバイダーのキュー内 - ここでは編集できません",
+      providerQueueStatus: "{{status}}",
       openImage: "画像添付ファイルを開く",
       removeImage: "画像添付ファイルを削除",
       removeFile: "ファイル添付ファイルを削除",
@@ -447,6 +449,11 @@ export const ja: TranslationResources = {
       refresh: "セッションを更新",
       showAll: "すべて表示",
       loadMore: "さらに読み込む",
+      scopeToWorkspace: "このワークスペース",
+    },
+    previews: {
+      unavailable:
+        "一部のプロバイダーはタイトルとフォルダのみで検索されました。プロンプト本文は読み込まれていません。",
     },
     preview: {
       untitledSession: "無題のセッション",
@@ -458,6 +465,21 @@ export const ja: TranslationResources = {
       alreadyImported: "最近のセッションはすでにすべてインポートされています。",
       noProviderSessions: "{{provider}}のセッションが見つかりません。",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "履歴の読み込みには数分と大きなメモリが必要になる場合があります",
+      body: "セッションを開く前に、プロバイダーが会話全体を再構築します。大きなセッションでは数ギガバイトのメモリを使うことがあります。",
+      confirm: "それでもインポートする",
+      cancel: "キャンセル",
+    },
+    progress: {
+      title: "履歴をインポートしています…",
+      body: "プロバイダーはまだこのセッションを再構築しています。",
+      elapsed: "{{seconds}} 秒",
+      cancel: "インポートを停止",
+    },
+    cancelled: "インポートを停止しました。ワークスペースには何も追加されていません。",
     row: {
       importing: "インポート中...",
     },
@@ -2041,6 +2063,20 @@ export const ja: TranslationResources = {
     archiveTooltip: "サブエージェントをアーカイブ",
     archiveFinishedAction: "完了したサブエージェントをアーカイブ",
     archiveFinishedRetry: "再試行 ({{failed}}/{{total}})",
+    providerInternalTask: "{{provider}} の内部タスク",
+    providerLogUnavailable:
+      "このタスクの記録はプロバイダーから共有されません。状態のみ表示されます。",
+    stopProviderDelegationsAction: "親と委任タスクをすべて停止",
+    stopProviderDelegationsRequesting: "停止中...",
+    stopProviderDelegationsDialogTitle: "{{provider}} を停止しますか？",
+    stopProviderDelegationsDialogMessage:
+      "親のターンと {{provider}} が委任したすべてのタスク（実行中 {{count}} 件）を停止します。プロバイダーが許可する場合、後で実行するためにキューに入れたメッセージは取り消されます。許可しない場合、それらは後で実行される可能性があります。",
+    stopProviderDelegationsConfirm: "すべて停止",
+    stopProviderDelegationsStopped: "停止しました: 実行中の委任タスクはありません",
+    stopProviderDelegationsPartial: "{{count}} 件の委任タスクがまだ実行中です",
+    stopProviderDelegationsUnknown:
+      "停止結果は不明です: プロバイダーが確認しませんでした。タスクの状態を確認してください。",
+    stopProviderDelegationsFailed: "委任タスクを停止できませんでした: {{message}}",
   },
   panels: {
     draft: {

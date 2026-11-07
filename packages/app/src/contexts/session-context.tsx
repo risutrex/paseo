@@ -363,7 +363,8 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
         event.type === "turn_started" ||
         event.type === "turn_completed" ||
         event.type === "turn_failed" ||
-        event.type === "turn_canceled"
+        event.type === "turn_canceled" ||
+        event.type === "turn_queued"
       ) {
         voiceRuntime?.onTurnEvent(serverId, agentId, event.type);
       }

@@ -162,6 +162,8 @@ export const en = {
       dropFilesHere: "Drop files here",
       editQueuedMessage: "Edit queued message",
       sendQueuedMessageNow: "Send queued message now",
+      providerQueueLabel: "In the provider's queue - not editable here",
+      providerQueueStatus: "{{status}}",
       openImage: "Open image attachment",
       removeImage: "Remove image attachment",
       removeFile: "Remove file attachment",
@@ -439,6 +441,11 @@ export const en = {
       refresh: "Refresh sessions",
       showAll: "Show all",
       loadMore: "Load more",
+      scopeToWorkspace: "This workspace",
+    },
+    previews: {
+      unavailable:
+        "Some providers were searched by title and folder only — their prompt text was not loaded.",
     },
     preview: {
       untitledSession: "Untitled session",
@@ -450,6 +457,21 @@ export const en = {
       alreadyImported: "All recent sessions are already imported.",
       noProviderSessions: "No {{provider}} sessions found.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "Loading the history can take several minutes and a lot of memory",
+      body: "The provider rebuilds the whole conversation before the session opens. Large sessions can use gigabytes of RAM.",
+      confirm: "Import anyway",
+      cancel: "Cancel",
+    },
+    progress: {
+      title: "Importing history…",
+      body: "The provider is still rebuilding this session.",
+      elapsed: "{{seconds}}s",
+      cancel: "Stop import",
+    },
+    cancelled: "Import stopped. Nothing was added to your workspace.",
     row: {
       importing: "Importing...",
     },
@@ -2046,6 +2068,20 @@ export const en = {
     archiveTooltip: "Archive subagent",
     archiveFinishedAction: "Archive finished subagents",
     archiveFinishedRetry: "Retry ({{failed}}/{{total}})",
+    providerInternalTask: "Internal {{provider}} task",
+    providerLogUnavailable:
+      "The provider does not share this task's journal. Only its status is shown.",
+    stopProviderDelegationsAction: "Stop parent and delegated tasks",
+    stopProviderDelegationsRequesting: "Stopping...",
+    stopProviderDelegationsDialogTitle: "Stop {{provider}}?",
+    stopProviderDelegationsDialogMessage:
+      "This stops the parent turn and every task {{provider}} delegated ({{count}} running). Messages the provider queued for later are withdrawn when it allows it; otherwise they may still run.",
+    stopProviderDelegationsConfirm: "Stop everything",
+    stopProviderDelegationsStopped: "Stopped: no delegated task is running",
+    stopProviderDelegationsPartial: "{{count}} delegated tasks are still running",
+    stopProviderDelegationsUnknown:
+      "Stop result unknown: the provider did not confirm it. Check the task statuses.",
+    stopProviderDelegationsFailed: "Could not stop the delegated tasks: {{message}}",
   },
   panels: {
     draft: {

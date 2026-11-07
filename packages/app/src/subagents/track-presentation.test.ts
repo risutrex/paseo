@@ -2,9 +2,11 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { i18n } from "@/i18n/i18next";
 import type { PaseoSubagentRow, ProviderSubagentRow, SubagentRow } from "./select";
 import {
+  buildProviderInternalTaskLabel,
   buildSubagentPillPresentation,
   buildSubagentRowPresentationData,
   countFinishedSubagents,
+  resolveProviderDelegationStopPresentation,
   resolveRowLabel,
 } from "./track-presentation";
 
@@ -313,5 +315,96 @@ describe("provider-owned row subtitles", () => {
         providerRow({ description: null, subtitle: null, title: "general-purpose" }),
       ).subtitle,
     ).toBe("");
+  });
+});
+
+describe("resolveProviderDelegationStopPresentation", () => {
+  function providerRow(overrides: Partial<ProviderSubagentRow> = {}): ProviderSubagentRow {
+    return {
+      kind: "provider",
+      id: overrides.id ?? "toolu_1",
+      parentAgentId: "parent",
+      provider: overrides.provider ?? "minimax-code",
+      title: overrides.title ?? "explore",
+      description: overrides.description ?? "List the files",
+      subtitle: null,
+      status: overrides.status ?? "running",
+      requiresAttention: false,
+      createdAt: overrides.createdAt ?? new Date("2026-07-26T00:00:00.000Z"),
+    };
+  }
+
+  it("offers the stop while the provider can carry it out and a task still runs", () => {
+    expect(
+      resolveProviderDelegationStopPresentation({
+        rows: [providerRow({ id: "a" }), providerRow({ id: "b", status: "completed" })],
+        canStop: true,
+        status: { kind: "idle" },
+      }),
+    ).toEqual({ activeProviderTaskCount: 1, showStop: true, showResult: false });
+  });
+
+  it("offers nothing when the provider never advertised the stop", () => {
+    // Without the capability the only honest row is a status: a stop that cannot
+    // be carried out would either fail or stop the parent and leave the children.
+    expect(
+      resolveProviderDelegationStopPresentation({
+        rows: [providerRow()],
+        canStop: false,
+        status: { kind: "idle" },
+      }),
+    ).toEqual({ activeProviderTaskCount: 1, showStop: false, showResult: false });
+  });
+
+  it("offers nothing once every delegated task has finished", () => {
+    expect(
+      resolveProviderDelegationStopPresentation({
+        rows: [providerRow({ status: "completed" }), providerRow({ id: "b", status: "canceled" })],
+        canStop: true,
+        status: { kind: "idle" },
+      }).showStop,
+    ).toBe(false);
+  });
+
+  it("keeps the result visible after the tree loses its last running task", () => {
+    for (const status of [
+      { kind: "stopped", activeTaskCount: 0 },
+      { kind: "partial", activeTaskCount: 2 },
+      { kind: "unknown", activeTaskCount: 0 },
+      { kind: "failed", message: "nope" },
+    ] as const) {
+      expect(
+        resolveProviderDelegationStopPresentation({
+          rows: [providerRow({ status: "canceled" })],
+          canStop: true,
+          status,
+        }).showResult,
+      ).toBe(true);
+    }
+  });
+
+  it("hides the result while the request is still in flight", () => {
+    expect(
+      resolveProviderDelegationStopPresentation({
+        rows: [providerRow()],
+        canStop: true,
+        status: { kind: "requesting" },
+      }).showResult,
+    ).toBe(false);
+  });
+});
+
+describe("buildProviderInternalTaskLabel", () => {
+  beforeAll(async () => {
+    if (!i18n.isInitialized) {
+      await i18n.init();
+    }
+    await i18n.changeLanguage("en");
+  });
+
+  it("names the provider so the row does not read as a standalone agent", () => {
+    expect(buildProviderInternalTaskLabel(i18n.t, "minimax-code")).toBe(
+      "Internal Minimax Code task",
+    );
   });
 });

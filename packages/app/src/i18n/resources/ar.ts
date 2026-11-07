@@ -166,6 +166,8 @@ export const ar: TranslationResources = {
       dropFilesHere: "Drop files here",
       editQueuedMessage: "تحرير الرسالة في قائمة الانتظار",
       sendQueuedMessageNow: "إرسال رسالة في قائمة الانتظار الآن",
+      providerQueueLabel: "في طابور المزوّد - غير قابل للتعديل هنا",
+      providerQueueStatus: "{{status}}",
       openImage: "فتح مرفق الصورة",
       removeImage: "إزالة مرفق الصورة",
       removeFile: "Remove file attachment",
@@ -442,6 +444,11 @@ export const ar: TranslationResources = {
       refresh: "تحديث الجلسات",
       showAll: "عرض الكل",
       loadMore: "تحميل المزيد",
+      scopeToWorkspace: "مساحة العمل هذه",
+    },
+    previews: {
+      unavailable:
+        "تم البحث في بعض المزوّدين حسب العنوان والمجلد فقط — لم يتم تحميل نص الطلبات الخاصة بها.",
     },
     preview: {
       untitledSession: "جلسة بلا عنوان",
@@ -453,6 +460,21 @@ export const ar: TranslationResources = {
       alreadyImported: "تم بالفعل استيراد كافة الجلسات الأخيرة.",
       noProviderSessions: "لم يتم العثور على جلسات{{provider}}.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "قد يستغرق تحميل السجل عدة دقائق ويستهلك ذاكرة كبيرة",
+      body: "يعيد المزوّد بناء المحادثة كاملة قبل فتح الجلسة. قد تستهلك الجلسات الكبيرة عدة غيغابايت من الذاكرة.",
+      confirm: "استيراد على أي حال",
+      cancel: "إلغاء",
+    },
+    progress: {
+      title: "جارٍ استيراد السجل…",
+      body: "لا يزال المزوّد يعيد بناء هذه الجلسة.",
+      elapsed: "{{seconds}} ثانية",
+      cancel: "إيقاف الاستيراد",
+    },
+    cancelled: "تم إيقاف الاستيراد. لم تتم إضافة أي شيء إلى مساحة العمل.",
     row: {
       importing: "جارٍ الاستيراد...",
     },
@@ -2020,6 +2042,19 @@ export const ar: TranslationResources = {
     archiveTooltip: "أرشفة الوكيل الفرعي",
     archiveFinishedAction: "أرشفة الوكلاء الفرعيين المكتملين",
     archiveFinishedRetry: "إعادة المحاولة ({{failed}}/{{total}})",
+    providerInternalTask: "مهمة داخلية لـ {{provider}}",
+    providerLogUnavailable: "لا يشارك المزوّد سجل هذه المهمة. تُعرض الحالة فقط.",
+    stopProviderDelegationsAction: "إيقاف الوكيل الأصلي والمهام المفوّضة",
+    stopProviderDelegationsRequesting: "جارٍ الإيقاف...",
+    stopProviderDelegationsDialogTitle: "إيقاف {{provider}}؟",
+    stopProviderDelegationsDialogMessage:
+      "سيؤدي هذا إلى إيقاف دور الوكيل الأصلي وكل مهمة فوّضها {{provider}} ({{count}} قيد التشغيل). تُسحب الرسائل التي وضعها المزوّد في قائمة الانتظار إذا كان يسمح بذلك، وإلا فقد تُنفَّذ لاحقًا.",
+    stopProviderDelegationsConfirm: "إيقاف الكل",
+    stopProviderDelegationsStopped: "تم الإيقاف: لا توجد مهام مفوّضة قيد التشغيل",
+    stopProviderDelegationsPartial: "ما زالت {{count}} مهام مفوّضة قيد التشغيل",
+    stopProviderDelegationsUnknown:
+      "نتيجة الإيقاف غير معروفة: لم يؤكدها المزوّد. تحقّق من حالات المهام.",
+    stopProviderDelegationsFailed: "تعذّر إيقاف المهام المفوّضة: {{message}}",
   },
   panels: {
     draft: {

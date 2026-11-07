@@ -49,6 +49,8 @@ interface ImportFlowScenario {
   worktreeDirectory: string;
   unrelatedDirectory: string;
   importSessionId: string;
+  /** A fixture session seeded outside the project, reachable only host-wide. */
+  unrelatedSessionId: string;
   importSessionTimestamp: number;
   repoCleanup(): Promise<void>;
   unrelatedCleanup(): Promise<void>;
@@ -95,11 +97,13 @@ test.beforeAll(async () => {
   };
   const reuseTarget = await openProjectViaDaemon(client, unrelated.path);
   const importSessionId = "fixture-custom-title";
+  const unrelatedSessionId = "fixture-unrelated";
   const importSessionTimestamp = await seedClaudeSessions({
     projectRoot: repo.path,
     worktreeDirectory,
     unrelatedDirectory: unrelated.path,
     importSessionId,
+    unrelatedSessionId,
   });
   scenario = {
     project: openedProject,
@@ -109,6 +113,7 @@ test.beforeAll(async () => {
     worktreeDirectory,
     unrelatedDirectory: unrelated.path,
     importSessionId,
+    unrelatedSessionId,
     importSessionTimestamp,
     repoCleanup: repo.cleanup,
     unrelatedCleanup: unrelated.cleanup,
@@ -189,6 +194,30 @@ test("captures the compact import-session journey", async ({ page }, testInfo) =
   await test.step("workspace actions start scoped and can widen to the host", async () => {
     await flow.openFromWorkspaceHeader();
     await capture(page, testInfo, "09-mobile-workspace-scoped.png");
+
+    await test.step("a search stays in the workspace until the list is widened by hand", async () => {
+      const unrelatedRow = page.getByTestId(
+        `import-session-session-claude-${scenario.unrelatedSessionId}`,
+      );
+      await flow.revealSession("fixture-root-01");
+      await expect(unrelatedRow).toHaveCount(0);
+
+      // Typing does not widen the scope: the other project's session stays out.
+      await flow.typeSearch("unrelated");
+      await flow.expectScope("This workspace");
+      await expect(unrelatedRow).toHaveCount(0);
+      await capture(page, testInfo, "09b-mobile-search-stays-scoped.png");
+
+      // Widening is the explicit button, and the query survives it.
+      await flow.showAll();
+      await expect(unrelatedRow).toBeVisible();
+      await capture(page, testInfo, "09c-mobile-show-all-with-query.png");
+
+      // Narrowing back is just as explicit.
+      await flow.clearSearch();
+      await flow.scopeToWorkspace();
+    });
+
     await flow.showAll();
     await flow.expectRows({
       folders: [["fixture-unrelated", scenario.reuseTarget.projectDisplayName]],
@@ -377,6 +406,7 @@ async function seedClaudeSessions(input: {
   worktreeDirectory: string;
   unrelatedDirectory: string;
   importSessionId: string;
+  unrelatedSessionId: string;
 }): Promise<number> {
   const sessions = [
     {
@@ -394,7 +424,7 @@ async function seedClaudeSessions(input: {
     },
     {
       cwd: input.unrelatedDirectory,
-      id: "fixture-unrelated",
+      id: input.unrelatedSessionId,
       title: "Unrelated directory notes",
       prompt: "Review the unrelated directory",
     },

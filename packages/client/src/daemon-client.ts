@@ -744,6 +744,10 @@ export type ProviderSubagentTimelinePayload = Extract<
   SessionOutboundMessage,
   { type: "agent.provider_subagents.timeline.get.response" }
 >["payload"];
+export type ProviderQueuePayload = Extract<
+  SessionOutboundMessage,
+  { type: "agent.provider_queue.get.response" }
+>["payload"];
 export interface FetchProviderSubagentTimelineOptions {
   direction?: ProviderSubagentTimelinePayload["direction"];
   cursor?: FetchAgentTimelineCursor;
@@ -1058,6 +1062,16 @@ type PluginCatalogResponseEntry =
 export type PluginCatalogEntry = Omit<PluginCatalogResponseEntry, "clientBundle"> & {
   clientBundle: string;
 };
+
+/**
+ * The caller stopped waiting for the answer. It carries the `AbortError` name
+ * so callers can tell an abandoned request from a failed one.
+ */
+function createAbortedError(): Error {
+  const error = new Error("The request was aborted");
+  error.name = "AbortError";
+  return error;
+}
 
 export class DaemonConnectionError extends Error {
   readonly serverId?: string;
@@ -2261,9 +2275,18 @@ export class DaemonClient {
     timeout?: number;
     select: (msg: SessionOutboundMessage) => T | null;
     options?: { skipQueue?: boolean };
+    /**
+     * A caller that stops waiting releases this waiter with it. Without it the
+     * predicate keeps running on every inbound message until the RPC timeout,
+     * for an answer nobody is left to read.
+     */
+    signal?: AbortSignal;
     /** Sends the request in another form, such as a binary frame; defaults to `message`. */
     transmit?: () => Promise<void>;
   }): Promise<T> {
+    if (params.signal?.aborted) {
+      throw createAbortedError();
+    }
     const wire = this.owned.prepareRequest(params.message);
     const timeout = params.timeout ?? DEFAULT_SESSION_RPC_TIMEOUT_MS;
     const { promise, cancel } = this.waitForWithCancel<RpcWaitResult<T>>(
@@ -2290,6 +2313,10 @@ export class DaemonClient {
       { ...params.options, requestId: params.requestId },
     );
 
+    const abortWaiter = () => cancel(createAbortedError());
+    params.signal?.addEventListener("abort", abortWaiter, { once: true });
+    const removeAbortListener = () => params.signal?.removeEventListener("abort", abortWaiter);
+
     // The response deadline still applies while the transport waits for drain.
     void promise.catch(() => undefined);
     try {
@@ -2300,10 +2327,12 @@ export class DaemonClient {
       if (result.kind === "error") throw result.error;
       return result.value;
     } catch (error) {
+      removeAbortListener();
       const err = error instanceof Error ? error : new Error(String(error));
       cancel(err);
       throw err;
     } finally {
+      removeAbortListener();
       await wire.finish();
     }
   }
@@ -2831,6 +2860,7 @@ export class DaemonClient {
 
   async fetchRecentProviderSessions(
     options?: FetchRecentProviderSessionsOptions,
+    signal?: AbortSignal,
   ): Promise<FetchRecentProviderSessionsPayload> {
     const resolvedRequestId = this.createRequestId(options?.requestId);
     const message = SessionInboundMessageSchema.parse({
@@ -2842,20 +2872,42 @@ export class DaemonClient {
       ...(options?.limit ? { limit: options.limit } : {}),
       ...(options?.query !== undefined ? { query: options.query } : {}),
     });
-    return this.sendRequest({
-      requestId: resolvedRequestId,
-      message,
-      options: { skipQueue: true },
-      select: (msg) => {
-        if (msg.type !== "fetch_recent_provider_sessions_response") {
-          return null;
-        }
-        if (msg.payload.requestId !== resolvedRequestId) {
-          return null;
-        }
-        return msg.payload;
-      },
-    });
+    if (signal?.aborted) {
+      throw createAbortedError();
+    }
+    // A caller that stops waiting (another keystroke in the search, a closed
+    // sheet) must not leave the daemon working on the listing: the provider
+    // would keep a process alive for an answer nobody reads.
+    const cancelListing = () => {
+      void this.sendSessionMessageOrThrow(
+        SessionInboundMessageSchema.parse({
+          type: "cancel_recent_provider_sessions_request",
+          requestId: resolvedRequestId,
+        }),
+      ).catch(() => undefined);
+    };
+    signal?.addEventListener("abort", cancelListing, { once: true });
+    try {
+      // The signal reaches the request too, so the abandoned waiter is released
+      // now instead of running its predicate until the session RPC timeout.
+      return await this.sendRequest({
+        requestId: resolvedRequestId,
+        message,
+        options: { skipQueue: true },
+        signal,
+        select: (msg) => {
+          if (msg.type !== "fetch_recent_provider_sessions_response") {
+            return null;
+          }
+          if (msg.payload.requestId !== resolvedRequestId) {
+            return null;
+          }
+          return msg.payload;
+        },
+      });
+    } finally {
+      signal?.removeEventListener("abort", cancelListing);
+    }
   }
 
   fetchWorkspaces(
@@ -3463,6 +3515,28 @@ export class DaemonClient {
     }
   }
 
+  /**
+   * Stops the parent turn of a provider-owned delegation tree, and with it every
+   * task the provider delegated under it.
+   *
+   * A provider sub-agent has no addressable turn, so there is no per-child stop
+   * to offer instead. Only a provider that advertised the stop accepts one; the
+   * daemon rejects the request otherwise. The answer reports whether the provider
+   * acknowledged it - the delegation rows report what actually stopped.
+   */
+  async stopProviderDelegations(agentId: string): Promise<{ acknowledged: boolean }> {
+    const payload =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.provider_delegations.stop.response">(
+        {
+          message: { type: "agent.provider_delegations.stop.request", agentId },
+        },
+      );
+    if (!payload.accepted) {
+      throw new Error(payload.error ?? "stopProviderDelegations rejected");
+    }
+    return { acknowledged: payload.acknowledged };
+  }
+
   async updateAgent(
     agentId: string,
     updates: { name?: string; labels?: Record<string, string> },
@@ -3679,7 +3753,7 @@ export class DaemonClient {
     return status.agent;
   }
 
-  async importAgent(input: ImportAgentInput): Promise<AgentSnapshotPayload> {
+  async importAgent(input: ImportAgentInput, signal?: AbortSignal): Promise<AgentSnapshotPayload> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
       type: "import_agent_request",
@@ -3691,34 +3765,59 @@ export class DaemonClient {
       ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
       ...(input.labels && Object.keys(input.labels).length > 0 ? { labels: input.labels } : {}),
     });
-
-    const status = await this.sendRequest({
-      requestId,
-      message,
-      options: { skipQueue: true },
-      select: (msg) => {
-        if (msg.type !== "status") {
-          return null;
-        }
-        const resumed = AgentResumedStatusPayloadSchema.safeParse(msg.payload);
-        if (resumed.success && resumed.data.requestId === requestId) {
-          return resumed.data;
-        }
-
-        const failed = AgentCreateFailedStatusPayloadSchema.safeParse(msg.payload);
-        if (failed.success && failed.data.requestId === requestId) {
-          return failed.data;
-        }
-
-        return null;
-      },
-    });
-
-    if (status.status === "agent_create_failed") {
-      throw new Error(status.error);
+    if (signal?.aborted) {
+      throw createAbortedError();
     }
+    // An import is expensive work on the provider side (ACP session/load). A
+    // caller that stops waiting (the user pressed "Stop import") must stop that
+    // work, otherwise the provider keeps rebuilding a conversation nobody will
+    // open. The daemon kills the process and answers with `import_cancelled`.
+    const cancelImport = () => {
+      void this.sendSessionMessageOrThrow(
+        SessionInboundMessageSchema.parse({
+          type: "cancel_import_agent_request",
+          requestId,
+        }),
+      ).catch(() => undefined);
+    };
+    signal?.addEventListener("abort", cancelImport, { once: true });
+    try {
+      const status = await this.sendRequest({
+        requestId,
+        message,
+        options: { skipQueue: true },
+        signal,
+        select: (msg) => {
+          if (msg.type !== "status") {
+            return null;
+          }
+          const resumed = AgentResumedStatusPayloadSchema.safeParse(msg.payload);
+          if (resumed.success && resumed.data.requestId === requestId) {
+            return resumed.data;
+          }
 
-    return status.agent;
+          const failed = AgentCreateFailedStatusPayloadSchema.safeParse(msg.payload);
+          if (failed.success && failed.data.requestId === requestId) {
+            return failed.data;
+          }
+
+          return null;
+        },
+      });
+
+      if (status.status === "agent_create_failed") {
+        // The daemon confirms the stopped import left nothing behind, so this is
+        // a cancellation the caller asked for, not a failure to report.
+        if (status.errorCode === "import_cancelled") {
+          throw createAbortedError();
+        }
+        throw new Error(status.error);
+      }
+
+      return status.agent;
+    } finally {
+      signal?.removeEventListener("abort", cancelImport);
+    }
   }
 
   async refreshAgent(agentId: string, requestId?: string): Promise<AgentRefreshedStatusPayload> {
@@ -3862,6 +3961,44 @@ export class DaemonClient {
       options: { skipQueue: true },
       select: (response) =>
         response.type === "agent.provider_subagents.list.response" &&
+        response.payload.requestId === requestId
+          ? response.payload
+          : null,
+    });
+    if (payload.error) {
+      throw new Error(payload.error);
+    }
+    return payload;
+  }
+
+  /**
+   * Reads the messages a provider holds for later turns.
+   *
+   * A queued message has no answer in the session stream, so this request is the
+   * only way to show its position - including after a reconnect, when the
+   * provider has already sent (and stopped replaying) its queue notifications.
+   */
+  async getProviderQueue(
+    agentId: string,
+    options: { requestId?: string; timeout?: number } = {},
+  ): Promise<ProviderQueuePayload> {
+    // COMPAT(providerQueue): added after v0.8.0, remove gate after 2027-06-01.
+    if (this.lastServerInfoMessage?.features?.providerQueue !== true) {
+      throw new Error("Update the host to show the provider queue.");
+    }
+    const requestId = this.createRequestId(options.requestId);
+    const message = SessionInboundMessageSchema.parse({
+      type: "agent.provider_queue.get.request",
+      agentId,
+      requestId,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      timeout: options.timeout,
+      options: { skipQueue: true },
+      select: (response) =>
+        response.type === "agent.provider_queue.get.response" &&
         response.payload.requestId === requestId
           ? response.payload
           : null,

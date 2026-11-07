@@ -392,6 +392,32 @@ function updateAgentTasks(
 
 export type WorkspaceRestoreStatus = "restoring" | "failed" | "needs-host-upgrade";
 
+/**
+ * One message a provider holds for a later turn, as the provider reports it.
+ *
+ * This is the provider's queue, not the composer's: a position here is owned by
+ * the agent process and cannot be edited from the composer.
+ */
+export interface ProviderQueueItemState {
+  itemId: string;
+  text: string;
+  status: string;
+  createdAt: string | null;
+}
+
+/**
+ * The queue a provider keeps for later turns.
+ *
+ * `supported: false` means the provider has no queue at all, which is why an
+ * empty list there is not shown as "nothing is waiting".
+ */
+export interface ProviderQueueState {
+  supported: boolean;
+  items: ProviderQueueItemState[];
+}
+
+export const EMPTY_PROVIDER_QUEUE: ProviderQueueState = { supported: false, items: [] };
+
 // Per-session state
 export interface SessionState {
   serverId: string;
@@ -454,6 +480,10 @@ export interface SessionState {
     string,
     Array<{ id: string; text: string; attachments: ComposerAttachment[] }>
   >;
+
+  // Messages the provider holds for later turns, by agent. Kept apart from
+  // `queuedMessages` so the two queues are never mistaken for one another.
+  providerQueues: Map<string, ProviderQueueState>;
 }
 
 // Global store state
@@ -634,6 +664,17 @@ interface SessionStoreActions {
         ) => Map<string, Array<{ id: string; text: string; attachments: ComposerAttachment[] }>>),
   ) => void;
 
+  // Provider queue
+  setProviderQueue: (serverId: string, agentId: string, queue: ProviderQueueState) => void;
+  /**
+   * Asks the host what the provider is holding for later turns.
+   *
+   * The provider does not replay its queue on reconnect, so this request is the
+   * only way a position can be shown again after a resume. A host that cannot
+   * report the queue leaves the composer as it was.
+   */
+  refreshProviderQueue: (serverId: string, agentId: string) => Promise<void>;
+
   // Hydration
   setHasHydratedAgents: (serverId: string, hydrated: boolean) => void;
   setHasHydratedWorkspaces: (serverId: string, hydrated: boolean) => void;
@@ -686,7 +727,30 @@ function createInitialSessionState(
     pendingPermissions: new Map(),
     fileExplorer: new Map(),
     queuedMessages: new Map(),
+    providerQueues: new Map(),
   };
+}
+
+/**
+ * Reports whether two provider queues say the same thing.
+ *
+ * The host is asked on every terminal turn, and most of those answers repeat the
+ * previous one: comparing them keeps a failed read from redrawing the composer.
+ */
+function areProviderQueuesEqual(a: ProviderQueueState, b: ProviderQueueState): boolean {
+  if (a.supported !== b.supported || a.items.length !== b.items.length) {
+    return false;
+  }
+  return a.items.every((item, index) => {
+    const other = b.items[index];
+    return (
+      other !== undefined &&
+      item.itemId === other.itemId &&
+      item.text === other.text &&
+      item.status === other.status &&
+      item.createdAt === other.createdAt
+    );
+  });
 }
 
 function areServerCapabilitiesEqual(
@@ -1829,6 +1893,53 @@ export const useSessionStore = create<SessionStore>()(
             },
           };
         });
+      },
+
+      // Provider queue
+      setProviderQueue: (serverId, agentId, queue) => {
+        set((prev) => {
+          const session = prev.sessions[serverId];
+          if (!session) {
+            return prev;
+          }
+          const current = session.providerQueues.get(agentId);
+          if (current && areProviderQueuesEqual(current, queue)) {
+            return prev;
+          }
+          const providerQueues = new Map(session.providerQueues);
+          if (!queue.supported && queue.items.length === 0) {
+            providerQueues.delete(agentId);
+          } else {
+            providerQueues.set(agentId, queue);
+          }
+          return {
+            ...prev,
+            sessions: {
+              ...prev.sessions,
+              [serverId]: { ...session, providerQueues },
+            },
+          };
+        });
+      },
+
+      refreshProviderQueue: async (serverId, agentId) => {
+        const session = get().sessions[serverId];
+        const client = session?.client;
+        if (!client || typeof client.getProviderQueue !== "function") {
+          return;
+        }
+        try {
+          const payload = await client.getProviderQueue(agentId);
+          get().setProviderQueue(serverId, agentId, {
+            supported: payload.supported,
+            items: payload.items,
+          });
+        } catch {
+          // The queue could not be read, so nothing is known about it. Clearing the
+          // rows is the honest answer: keeping the previous ones would show positions
+          // the host no longer stands behind.
+          get().setProviderQueue(serverId, agentId, EMPTY_PROVIDER_QUEUE);
+        }
       },
 
       // Hydration

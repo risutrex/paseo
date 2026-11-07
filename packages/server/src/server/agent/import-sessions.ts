@@ -9,6 +9,7 @@ import type {
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
 import type { AgentPersistenceHandle, AgentProvider } from "./agent-sdk-types.js";
 import { ensureAgentLoaded, type AgentLoaderManager } from "./agent-loading.js";
+import { cancelInFlightImportProcess } from "./import-session-cancellation.js";
 import { unarchiveAgentState } from "./agent-prompt.js";
 import { toRecentProviderSessionDescriptorPayload } from "./agent-projections.js";
 import type { WorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
@@ -51,6 +52,17 @@ export interface NormalizedImportAgentRequest {
   requestId: string;
 }
 
+/**
+ * The client stopped waiting for an import. The provider process loading the
+ * session is told to stop, and nothing the import started is kept.
+ */
+export class ImportCancelledError extends Error {
+  constructor(provider: string, providerHandleId: string) {
+    super(`Import of ${provider} session ${providerHandleId} was cancelled`);
+    this.name = "ImportCancelledError";
+  }
+}
+
 export class ImportSessionsRequestError extends Error {
   constructor(
     readonly code: string,
@@ -66,12 +78,19 @@ export interface ListImportableProviderSessionsInput {
   agentManager: Pick<AgentManager, "listAgents" | "listImportableSessions">;
   agentStorage: Pick<AgentStorage, "listAll">;
   providerSnapshotManager: Pick<ProviderSnapshotManager, "getProviderLabel">;
+  /**
+   * Aborts the listing when the client stopped waiting for it. The provider
+   * stops its work, so an abandoned search leaves no probe behind.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ListImportableProviderSessionsResult {
   entries: RecentProviderSessionDescriptorPayload[];
   filteredAlreadyImportedCount: number;
   providerErrors: Array<{ provider: string; message: string }>;
+  /** Set when a provider listed sessions without loading their prompt previews. */
+  previewsUnavailable?: boolean;
 }
 
 export interface ImportProviderSessionInput {
@@ -80,6 +99,12 @@ export interface ImportProviderSessionInput {
   agentManager: ImportSessionAgentManager;
   agentStorage: AgentStorage;
   logger: Logger;
+  /**
+   * Aborts the import when the client stopped waiting for it. Cancelling is not
+   * "stop waiting": the provider process that is rebuilding the session is
+   * ended, and an import that raced past completion is rolled back.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ImportProviderSessionResult {
@@ -138,6 +163,7 @@ export async function listImportableProviderSessions(
     ...(query ? { scanLimit: IMPORT_SESSION_SEARCH_SCAN_LIMIT } : {}),
     providerFilter,
     cwd: request.cwd,
+    ...(input.signal ? { signal: input.signal } : {}),
   });
   let filteredAlreadyImportedCount = 0;
   const candidates: ManagedImportableProviderSession[] = [];
@@ -174,6 +200,7 @@ export async function listImportableProviderSessions(
     entries,
     filteredAlreadyImportedCount,
     providerErrors: listing.providerErrors,
+    ...(listing.previewsUnavailable ? { previewsUnavailable: true } : {}),
   };
 }
 
@@ -189,14 +216,94 @@ export async function importProviderSession(
   if (!cwd) {
     throw new Error("Import requires cwd from the selected provider session");
   }
+  const { provider, providerHandleId } = input.request;
+  const signal = input.signal;
+  if (signal?.aborted) {
+    throw new ImportCancelledError(provider, providerHandleId);
+  }
   const key = await resolveProviderSessionImportMutationKey(input);
-  return serializeProviderSessionImport(input.agentManager, key, async () => {
+  const work = serializeProviderSessionImport(input.agentManager, key, async () => {
     const placement = await input.workspaceProvisioning.runInImportWorkspace(
       { cwd, requestedWorkspaceId: input.request.workspaceId },
       (workspace) => importProviderSessionNow(input, cwd, workspace.workspaceId),
     );
     return { ...placement.value, createdWorkspace: placement.createdWorkspace };
   });
+  if (!signal) {
+    return await work;
+  }
+  return await raceImportCancellation(input, work, signal);
+}
+
+/**
+ * Answers a cancelled import immediately and stops the provider, which is what
+ * `Promise.race` alone cannot do: ACP keeps loading the session in its process
+ * until that process is ended.
+ */
+function raceImportCancellation(
+  input: ImportProviderSessionInput,
+  work: Promise<ImportProviderSessionResult>,
+  signal: AbortSignal,
+): Promise<ImportProviderSessionResult> {
+  const { provider, providerHandleId } = input.request;
+  return new Promise<ImportProviderSessionResult>((resolve, reject) => {
+    let settled = false;
+    const cancel = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", cancel);
+      // The provider holds the session in memory while it replays the history;
+      // ending the process is the part of cancelling that frees anything.
+      void cancelInFlightImportProcess(provider, providerHandleId).catch((error: unknown) => {
+        input.logger.warn(
+          { err: error, provider, providerHandleId },
+          "Failed to stop the provider process importing a session",
+        );
+      });
+      reject(new ImportCancelledError(provider, providerHandleId));
+    };
+    signal.addEventListener("abort", cancel, { once: true });
+    work.then(
+      (result) => {
+        signal.removeEventListener("abort", cancel);
+        if (settled || signal.aborted) {
+          // The import finished after the client gave up, so the agent it
+          // registered is an import nobody asked for: drop it instead of
+          // leaving a half-imported agent behind.
+          return discardCancelledImport(input, result).catch(() => undefined);
+        }
+        settled = true;
+        resolve(result);
+        return undefined;
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", cancel);
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+        return undefined;
+      },
+    );
+  });
+}
+
+async function discardCancelledImport(
+  input: ImportProviderSessionInput,
+  result: ImportProviderSessionResult,
+): Promise<void> {
+  const agentId = result.snapshot.id;
+  try {
+    if (input.agentManager.getAgent(agentId)) {
+      await input.agentManager.closeAgent(agentId);
+    }
+    await input.agentManager.archiveSnapshot(agentId, new Date().toISOString());
+  } catch (error) {
+    input.logger.warn(
+      { err: error, agentId },
+      "Failed to discard the agent registered by a cancelled import",
+    );
+  }
 }
 
 async function importProviderSessionNow(
@@ -205,6 +312,7 @@ async function importProviderSessionNow(
   workspaceId: string,
 ): Promise<ImportedProviderSession> {
   const { provider, providerHandleId, labels } = input.request;
+  assertImportNotCancelled(input);
 
   const matchingRecords = await input.agentStorage.listByProviderSession(
     provider,
@@ -232,6 +340,7 @@ async function importProviderSessionNow(
       labels: Object.keys(labelPatch).length > 0 ? labelPatch : undefined,
     });
     try {
+      assertImportNotCancelled(input);
       const snapshot = await ensureAgentLoaded(archivedRecord.id, {
         agentManager: input.agentManager,
         agentStorage: input.agentStorage,
@@ -247,6 +356,9 @@ async function importProviderSessionNow(
     }
   }
 
+  // The session/load behind this call is the expensive part of an import, so a
+  // client that already gave up must not start it.
+  assertImportNotCancelled(input);
   const snapshot = await input.agentManager.importProviderSession({
     provider,
     providerHandleId,
@@ -260,6 +372,12 @@ async function importProviderSessionNow(
     snapshot,
     timelineSize: input.agentManager.getTimeline(snapshot.id).length,
   };
+}
+
+function assertImportNotCancelled(input: ImportProviderSessionInput): void {
+  if (input.signal?.aborted) {
+    throw new ImportCancelledError(input.request.provider, input.request.providerHandleId);
+  }
 }
 
 async function serializeProviderSessionImport<T>(

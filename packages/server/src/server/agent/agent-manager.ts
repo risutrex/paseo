@@ -29,6 +29,7 @@ import type { TerminalManager } from "../../terminal/terminal-manager.js";
 import {
   getAgentStreamEventTurnId,
   type AgentCapabilityFlags,
+  type ProviderDelegationStopResult,
   type AgentClient,
   type AgentCreateSessionOptions,
   type AgentResumePurpose,
@@ -57,6 +58,7 @@ import {
   type ImportedTimelineEntry,
   type ImportableProviderSession,
   type ListImportableSessionsOptions,
+  type ProviderQueueItemReport,
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
 import { toStoredAgentRecord } from "./agent-projections.js";
@@ -308,6 +310,12 @@ export interface ImportableSessionProviderError {
 export interface ManagedImportableSessionsResult {
   sessions: ManagedImportableProviderSession[];
   providerErrors: ImportableSessionProviderError[];
+  /**
+   * True when at least one provider listed its sessions without prompt
+   * previews, because loading them would have cost a full session restore on
+   * the provider side.
+   */
+  previewsUnavailable?: boolean;
 }
 
 export type AgentAttentionCallback = (params: {
@@ -400,6 +408,12 @@ export interface WaitForAgentResult {
   status: AgentLifecycleStatus;
   permission: AgentPermissionRequest | null;
   lastMessage: string | null;
+  /**
+   * The provider took this turn's message into its own queue instead of running it.
+   * The turn is over for us but produced no result, so `lastMessage` is null and the
+   * previous answer must not be read as this turn's output.
+   */
+  queued?: boolean;
 }
 
 export interface WaitForAgentStartOptions {
@@ -577,7 +591,10 @@ function attachManagedTurnIdentity(
     }
     case "turn_completed":
     case "turn_failed":
-    case "turn_canceled": {
+    case "turn_canceled":
+    // A queued turn is over for us: the provider owns the message now, but it still ends
+    // this dispatch and has to stay attached to the turn that submitted it.
+    case "turn_queued": {
       const turnId = agent.activeForegroundTurnId ?? agent.activeTurnId ?? undefined;
       return turnId ? { event: { ...event, turnId }, turnId } : { event, turnId };
     }
@@ -649,7 +666,11 @@ function isTurnTerminalEvent(event: AgentStreamEvent): boolean {
   return (
     event.type === "turn_completed" ||
     event.type === "turn_failed" ||
-    event.type === "turn_canceled"
+    event.type === "turn_canceled" ||
+    // The provider took the message into its own queue instead of running it. The run
+    // ends here even though the provider keeps working: nothing will be dispatched for
+    // this turn again, so waiting for another terminal event would hang the run.
+    event.type === "turn_queued"
   );
 }
 
@@ -843,6 +864,12 @@ export class AgentManager {
   private readonly registry?: AgentStorage;
   private readonly durableTimelineStore?: AgentTimelineStore;
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
+  /**
+   * Agents whose last turn ended in the provider's queue. The agent looks idle, but
+   * nothing ran for that turn, so a waiter must report "unknown" instead of serving
+   * the previous answer as its result.
+   */
+  private readonly queuedHandoffs = new WeakSet<ActiveManagedAgent>();
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
@@ -1192,22 +1219,58 @@ export class AgentManager {
     );
     const providerResults = await Promise.all(
       providerEntries.map(async ([provider, client]) => {
+        if (options?.signal?.aborted) {
+          // The caller stopped waiting before this provider was reached. There
+          // is nothing to list, and starting the provider now would only make
+          // it work for an answer nobody reads.
+          return {
+            sessions: [],
+            error: null,
+            previewsUnavailable: false,
+          };
+        }
+        // A preview is only "cheap" when the provider can read it out of a
+        // descriptor or a transcript. ACP agents have to session/load, which
+        // makes the provider rebuild the whole conversation in memory (2.7 GB
+        // of RAM for one large minimax-code session), so the import list asks
+        // them for descriptors only.
+        const includePreviews = client.capabilities.importSessionPreviewsAreCheap !== false;
         try {
+          // The provider does expensive work for a listing (loading session
+          // histories). Give it an abort signal so an abandoned listing stops
+          // the provider instead of leaving it running in the background.
+          const controller = new AbortController();
+          // The caller's signal says the client stopped waiting. The provider
+          // must stop as well, or every abandoned request leaves work running.
+          const abortFromCaller = () => controller.abort();
+          if (options?.signal) {
+            if (options.signal.aborted) {
+              controller.abort();
+            } else {
+              options.signal.addEventListener("abort", abortFromCaller, { once: true });
+            }
+          }
           const sessions = await withTimeout(
             client.listImportableSessions!({
               limit: options?.limit,
               query: options?.query,
               scanLimit: options?.scanLimit,
               cwd: options?.cwd,
+              includePreviews,
+              signal: controller.signal,
             }),
             IMPORTABLE_SESSION_LIST_TIMEOUT_MS,
             `Timed out listing importable sessions for provider '${provider}' after ${IMPORTABLE_SESSION_LIST_TIMEOUT_MS}ms`,
-          );
+          ).finally(() => {
+            controller.abort();
+            options?.signal?.removeEventListener("abort", abortFromCaller);
+          });
           return {
             sessions: sessions
               .filter((session) => matchesImportableSessionQuery(session, options?.query))
               .map((session) => Object.assign(session, { provider })),
             error: null,
+            previewsUnavailable: !includePreviews,
           };
         } catch (error) {
           this.logger.warn(
@@ -1220,6 +1283,10 @@ export class AgentManager {
               provider,
               message: error instanceof Error ? error.message : String(error),
             },
+            // A failed listing produced no rows at all, so it says nothing about
+            // previews. Claiming otherwise would blame the search for an error
+            // the provider reported.
+            previewsUnavailable: false,
           };
         }
       }),
@@ -1232,6 +1299,9 @@ export class AgentManager {
         .sort((a, b) => b.lastActivityAt.getTime() - a.lastActivityAt.getTime())
         .slice(0, limit),
       providerErrors: providerResults.flatMap((result) => (result.error ? [result.error] : [])),
+      ...(providerResults.some((result) => result.previewsUnavailable)
+        ? { previewsUnavailable: true }
+        : {}),
     };
   }
 
@@ -1391,6 +1461,25 @@ export class AgentManager {
   listProviderSubagents(parentAgentId: string): ProviderSubagentDescriptor[] {
     this.requirePublicAgent(parentAgentId);
     return this.providerSubagents.list(parentAgentId);
+  }
+
+  /**
+   * Reads the queue a provider keeps for later turns.
+   *
+   * The provider answers this on request, which is what makes a queued message
+   * visible after a reconnect: it does not replay its queue notifications.
+   * A provider without a queue reports `supported: false` instead of an empty
+   * list, so "no queue here" is not read as "nothing is waiting".
+   */
+  async fetchProviderQueue(
+    agentId: string,
+  ): Promise<{ supported: boolean; items: ProviderQueueItemReport[] }> {
+    this.requirePublicAgent(agentId);
+    const session = this.agents.get(agentId)?.session;
+    if (!session?.getProviderQueue) {
+      return { supported: false, items: [] };
+    }
+    return { supported: true, items: await session.getProviderQueue() };
   }
 
   listAgentBackgroundWork(agentId: string): AgentBackgroundWorkItem[] {
@@ -3512,6 +3601,25 @@ export class AgentManager {
     return this.runForegroundMutation(agentId, () => this.cancelAgentRunNow(agentId));
   }
 
+  /**
+   * Stops the turn that runs a provider's delegation tree, and with it every task
+   * delegated under it.
+   *
+   * The provider owns those children: their sessions cannot be opened and their
+   * ids are not turns, so there is nothing to cancel one by one. A provider that
+   * does not advertise the delegation stop is reported as unsupported instead of
+   * being approximated with a plain interruption that would leave the children
+   * running.
+   */
+  async stopProviderDelegations(agentId: string): Promise<ProviderDelegationStopResult> {
+    const agent = this.requireSessionAgent(agentId);
+    const session = agent.session;
+    if (!session.stopProviderDelegations) {
+      throw new Error(`${agent.provider} does not support stopping delegated tasks`);
+    }
+    return session.stopProviderDelegations();
+  }
+
   private async cancelAgentRunNow(agentId: string): Promise<AgentRunCancellationResult> {
     const agent = this.requireSessionAgent(agentId);
     const run =
@@ -3801,29 +3909,17 @@ export class AgentManager {
 
     const immediatePermission = this.peekPendingPermission(snapshot);
     if (immediatePermission) {
-      return {
-        status: snapshot.lifecycle,
-        permission: immediatePermission,
-        lastMessage: await this.getLastAssistantMessage(agentId),
-      };
+      return await this.settledWaitResult(agentId, snapshot.lifecycle, immediatePermission);
     }
 
     const initialStatus = snapshot.lifecycle;
     const initialBusy = isAgentBusy(initialStatus) || hasForegroundTurn;
     const waitForActive = options?.waitForActive ?? false;
     if (!waitForActive && !initialBusy) {
-      return {
-        status: initialStatus,
-        permission: null,
-        lastMessage: await this.getLastAssistantMessage(agentId),
-      };
+      return await this.settledWaitResult(agentId, initialStatus);
     }
     if (waitForActive && !initialBusy && !hasForegroundTurn) {
-      return {
-        status: initialStatus,
-        permission: null,
-        lastMessage: await this.getLastAssistantMessage(agentId),
-      };
+      return await this.settledWaitResult(agentId, initialStatus);
     }
 
     if (options?.signal?.aborted) {
@@ -3878,13 +3974,9 @@ export class AgentManager {
         }
         finished = true;
         cleanup();
-        void this.getLastAssistantMessage(agentId)
-          .then((lastMessage) => {
-            resolvePromise({
-              status: currentStatus,
-              permission,
-              lastMessage,
-            });
+        void this.settledWaitResult(agentId, currentStatus, permission)
+          .then((result) => {
+            resolvePromise(result);
             return;
           })
           .catch(reject);
@@ -3938,6 +4030,11 @@ export class AgentManager {
               hasStarted = true;
             }
             if (event.event.type === "turn_canceled") {
+              hasStarted = true;
+            }
+            // The queued message runs later inside the provider, without a Paseo turn
+            // for it, so this agent is not going to look busy again on our side.
+            if (event.event.type === "turn_queued") {
               hasStarted = true;
             }
           }
@@ -4745,6 +4842,9 @@ export class AgentManager {
         options?.fromHistory === true,
       );
     }
+    // What a turn leaves behind outlives its run: a queued handoff has no result, so a
+    // waiter that reads the agent afterwards must not be served the previous answer.
+    if (!options?.fromHistory) this.rememberQueuedHandoff(agent, event);
 
     const flags: StreamEventFlags = { shouldDispatchEvent: true, shouldNotifyWaiters: true };
 
@@ -4919,6 +5019,9 @@ export class AgentManager {
           terminalDisposition,
           options,
         });
+        return undefined;
+      case "turn_queued":
+        this.onStreamTurnQueued({ agent, eventTurnId, isForegroundEvent, terminalDisposition });
         return undefined;
       case "turn_started":
         this.onStreamTurnStarted({ agent, eventTurnId, isForegroundEvent, flags });
@@ -5100,6 +5203,83 @@ export class AgentManager {
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       this.emitState(agent);
     }
+  }
+
+  /**
+   * A queued turn is neither a failure nor a cancellation: the message is safe in the
+   * provider's queue, so there is nothing to report and nothing to apologize for. Only
+   * the agent's own view of the turn has to end - otherwise Paseo would keep claiming a
+   * foreground turn the provider never accepted, and the next prompt would be rejected
+   * as "already has an active run" instead of reaching the queue again.
+   */
+  private onStreamTurnQueued(params: {
+    agent: ActiveManagedAgent;
+    eventTurnId: string | undefined;
+    isForegroundEvent: boolean;
+    terminalDisposition: ActiveTurnTerminalDisposition;
+  }): void {
+    const { agent, eventTurnId, isForegroundEvent, terminalDisposition } = params;
+    this.logger.trace(
+      {
+        agentId: agent.id,
+        provider: agent.provider,
+        sessionId: agent.persistence?.sessionId ?? undefined,
+        turnId: eventTurnId,
+        lifecycle: agent.lifecycle,
+        activeForegroundTurnId: agent.activeForegroundTurnId,
+        eventTurnId,
+      },
+      "agent.manager.turn.queued",
+    );
+    if (terminalDisposition === "stale") return;
+    // The provider still runs its own turn; this agent just has no turn of its own.
+    if (!isForegroundEvent && !agent.activeForegroundTurnId && !agent.pendingReplacement) {
+      agent.lifecycle = "idle";
+    }
+    agent.lastError = undefined;
+    if (!isForegroundEvent && !agent.activeForegroundTurnId) {
+      this.emitState(agent);
+    }
+  }
+
+  /**
+   * Keeps the "this agent's last turn went into the provider's queue" fact until the
+   * next turn says otherwise. Waiting for a terminal event cannot help here: the
+   * queued message runs inside the provider, so Paseo never sees it finish.
+   */
+  private rememberQueuedHandoff(agent: ActiveManagedAgent, event: AgentStreamEvent): void {
+    if (event.type === "turn_queued") {
+      this.queuedHandoffs.add(agent);
+      return;
+    }
+    if (
+      event.type === "turn_started" ||
+      event.type === "turn_completed" ||
+      event.type === "turn_failed" ||
+      event.type === "turn_canceled"
+    ) {
+      this.queuedHandoffs.delete(agent);
+    }
+  }
+
+  private hasQueuedHandoff(agentId: string): boolean {
+    const agent = this.agents.get(agentId);
+    return agent ? this.queuedHandoffs.has(agent) : false;
+  }
+
+  /**
+   * The settled answer to a wait. A queued handoff has no result of its own, and the
+   * last assistant message belongs to the turn before it.
+   */
+  private async settledWaitResult(
+    agentId: string,
+    status: AgentLifecycleStatus,
+    permission: AgentPermissionRequest | null = null,
+  ): Promise<WaitForAgentResult> {
+    if (this.hasQueuedHandoff(agentId)) {
+      return { status, permission, lastMessage: null, queued: true };
+    }
+    return { status, permission, lastMessage: await this.getLastAssistantMessage(agentId) };
   }
 
   private onStreamTurnStarted(params: {

@@ -1614,6 +1614,7 @@ export function reduceStreamUpdate(
     case "turn_completed":
     case "turn_failed":
     case "turn_canceled":
+    case "turn_queued":
     case "permission_requested":
     case "permission_resolved":
     case "attention_required":
@@ -1702,6 +1703,9 @@ const STREAM_COMPLETION_EVENTS = new Set<AgentStreamEventPayload["type"]>([
   "turn_completed",
   "turn_failed",
   "turn_canceled",
+  // A queued turn is over for the session: the provider holds the message and
+  // runs it later. Leaving the stream open would keep the composer waiting.
+  "turn_queued",
 ]);
 
 function applyCompletionToTail(

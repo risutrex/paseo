@@ -6,7 +6,7 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
-import type { AgentProviderNotice } from "./agent-sdk-types.js";
+import type { AgentProviderNotice, ProviderDelegationStopResult } from "./agent-sdk-types.js";
 
 export type LifecycleAgentSnapshot = Pick<ManagedAgent, "id" | "cwd" | "lifecycle" | "internal">;
 
@@ -24,6 +24,11 @@ export interface LifecycleAgentManager {
     live: boolean;
     previousParentAgentId: string | null;
   }>;
+  /**
+   * Optional: only providers that own a delegation tree implement it. A manager
+   * without it answers for every other provider.
+   */
+  stopProviderDelegations?(agentId: string): Promise<ProviderDelegationStopResult>;
   notifyAgentState(agentId: string): void;
   setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null>;
   updateAgentMetadata(
@@ -205,6 +210,24 @@ export async function detachAgentCommand(
     agentId,
     ...result,
   };
+}
+
+/**
+ * Stops the parent turn and every delegated task of a provider-owned tree.
+ *
+ * The result is the provider's answer, not a report of what stopped: the caller
+ * reads the delegation rows for that, because a receipt calls the root stopped
+ * even when the tree was idle.
+ */
+export async function stopProviderDelegationsCommand(
+  dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager">,
+  agentId: string,
+): Promise<ProviderDelegationStopResult> {
+  const stop = dependencies.agentManager.stopProviderDelegations;
+  if (!stop) {
+    throw new Error(`Agent ${agentId} does not support stopping delegated tasks`);
+  }
+  return stop.call(dependencies.agentManager, agentId);
 }
 
 export async function setAgentModeCommand(

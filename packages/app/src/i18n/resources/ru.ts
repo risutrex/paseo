@@ -167,6 +167,8 @@ export const ru: TranslationResources = {
       dropFilesHere: "Переместите файлы сюда",
       editQueuedMessage: "Изменить сообщение из очереди",
       sendQueuedMessageNow: "Отправить сообщение из очереди сейчас",
+      providerQueueLabel: "В очереди провайдера - здесь не редактируется",
+      providerQueueStatus: "{{status}}",
       openImage: "Открыть прикрепленное изображение",
       removeImage: "Удалить прикрепленное изображение",
       removeFile: "Удалить прикрепленный файл",
@@ -446,6 +448,11 @@ export const ru: TranslationResources = {
       refresh: "Обновить список сессий",
       showAll: "Показать все",
       loadMore: "Загрузить ещё",
+      scopeToWorkspace: "Это рабочее пространство",
+    },
+    previews: {
+      unavailable:
+        "Некоторые провайдеры искались только по названию и папке — текст их промптов не загружался.",
     },
     preview: {
       untitledSession: "Сессия без названия",
@@ -457,6 +464,21 @@ export const ru: TranslationResources = {
       alreadyImported: "Все недавние сессии уже импортированы.",
       noProviderSessions: "Сессии провайдера {{provider}} не найдены.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "Загрузка истории может занять несколько минут и много памяти",
+      body: "Перед открытием сессии провайдер заново собирает всю переписку. Большие сессии могут занять гигабайты памяти.",
+      confirm: "Всё равно импортировать",
+      cancel: "Отмена",
+    },
+    progress: {
+      title: "Импортируем историю…",
+      body: "Провайдер всё ещё собирает эту сессию.",
+      elapsed: "{{seconds}} с",
+      cancel: "Остановить импорт",
+    },
+    cancelled: "Импорт прерван. В рабочее пространство ничего не добавлено.",
     row: {
       importing: "Импортируется...",
     },
@@ -2054,6 +2076,19 @@ export const ru: TranslationResources = {
     archiveTooltip: "Архивировать субагента",
     archiveFinishedAction: "Архивировать завершенные субагенты",
     archiveFinishedRetry: "Повторить ({{failed}}/{{total}})",
+    providerInternalTask: "Внутренняя задача {{provider}}",
+    providerLogUnavailable: "Провайдер не делится журналом этой задачи. Показан только её статус.",
+    stopProviderDelegationsAction: "Остановить родителя и делегированные задачи",
+    stopProviderDelegationsRequesting: "Останавливаем...",
+    stopProviderDelegationsDialogTitle: "Остановить {{provider}}?",
+    stopProviderDelegationsDialogMessage:
+      "Это остановит родительский ход и все задачи, делегированные {{provider}} (сейчас в работе: {{count}}). Сообщения, которые провайдер поставил в очередь на потом, отзываются, если он это позволяет; иначе они могут выполниться позже.",
+    stopProviderDelegationsConfirm: "Остановить всё",
+    stopProviderDelegationsStopped: "Остановлено: ни одна делегированная задача не выполняется",
+    stopProviderDelegationsPartial: "Ещё выполняется делегированных задач: {{count}}",
+    stopProviderDelegationsUnknown:
+      "Результат остановки неизвестен: провайдер её не подтвердил. Проверьте статусы задач.",
+    stopProviderDelegationsFailed: "Не удалось остановить делегированные задачи: {{message}}",
   },
   panels: {
     draft: {

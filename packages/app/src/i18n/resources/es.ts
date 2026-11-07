@@ -167,6 +167,8 @@ export const es: TranslationResources = {
       dropFilesHere: "Drop files here",
       editQueuedMessage: "Editar mensaje en cola",
       sendQueuedMessageNow: "Enviar mensaje en cola ahora",
+      providerQueueLabel: "En la cola del proveedor - no editable aquí",
+      providerQueueStatus: "{{status}}",
       openImage: "Abrir imagen adjunta",
       removeImage: "Quitar imagen adjunta",
       removeFile: "Remove file attachment",
@@ -447,6 +449,11 @@ export const es: TranslationResources = {
       refresh: "Actualizar sesiones",
       showAll: "Mostrar todo",
       loadMore: "Cargar más",
+      scopeToWorkspace: "Este espacio de trabajo",
+    },
+    previews: {
+      unavailable:
+        "Algunos proveedores se buscaron solo por título y carpeta: no se cargó el texto de sus mensajes.",
     },
     preview: {
       untitledSession: "Sesión sin título",
@@ -458,6 +465,21 @@ export const es: TranslationResources = {
       alreadyImported: "Todas las sesiones recientes ya están importadas.",
       noProviderSessions: "No se encontraron sesiones{{provider}}.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "Cargar el historial puede tardar varios minutos y mucha memoria",
+      body: "El proveedor reconstruye toda la conversación antes de abrir la sesión. Las sesiones grandes pueden usar gigabytes de memoria.",
+      confirm: "Importar de todos modos",
+      cancel: "Cancelar",
+    },
+    progress: {
+      title: "Importando el historial…",
+      body: "El proveedor sigue reconstruyendo esta sesión.",
+      elapsed: "{{seconds}} s",
+      cancel: "Detener la importación",
+    },
+    cancelled: "Importación detenida. No se añadió nada a tu espacio de trabajo.",
     row: {
       importing: "Importador...",
     },
@@ -2069,6 +2091,20 @@ export const es: TranslationResources = {
     archiveTooltip: "Subagente de archivo",
     archiveFinishedAction: "Archivar subagentes finalizados",
     archiveFinishedRetry: "Reintentar ({{failed}}/{{total}})",
+    providerInternalTask: "Tarea interna de {{provider}}",
+    providerLogUnavailable:
+      "El proveedor no comparte el registro de esta tarea. Solo se muestra su estado.",
+    stopProviderDelegationsAction: "Detener al padre y sus tareas delegadas",
+    stopProviderDelegationsRequesting: "Deteniendo...",
+    stopProviderDelegationsDialogTitle: "¿Detener {{provider}}?",
+    stopProviderDelegationsDialogMessage:
+      "Esto detiene el turno del padre y todas las tareas que {{provider}} delegó ({{count}} en ejecución). Los mensajes que el proveedor puso en cola se retiran si lo permite; si no, pueden ejecutarse más tarde.",
+    stopProviderDelegationsConfirm: "Detener todo",
+    stopProviderDelegationsStopped: "Detenido: no hay tareas delegadas en ejecución",
+    stopProviderDelegationsPartial: "{{count}} tareas delegadas siguen en ejecución",
+    stopProviderDelegationsUnknown:
+      "Resultado de la detención desconocido: el proveedor no lo confirmó. Revisa el estado de las tareas.",
+    stopProviderDelegationsFailed: "No se pudieron detener las tareas delegadas: {{message}}",
   },
   panels: {
     draft: {

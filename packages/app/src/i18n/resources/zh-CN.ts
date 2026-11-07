@@ -166,6 +166,8 @@ export const zhCN: TranslationResources = {
       dropFilesHere: "Drop files here",
       editQueuedMessage: "编辑排队消息",
       sendQueuedMessageNow: "立即发送排队消息",
+      providerQueueLabel: "在提供方队列中 - 此处无法编辑",
+      providerQueueStatus: "{{status}}",
       openImage: "打开图片附件",
       removeImage: "移除图片附件",
       removeFile: "Remove file attachment",
@@ -442,6 +444,10 @@ export const zhCN: TranslationResources = {
       refresh: "刷新会话",
       showAll: "显示全部",
       loadMore: "加载更多",
+      scopeToWorkspace: "此 workspace",
+    },
+    previews: {
+      unavailable: "部分 Provider 仅按标题和文件夹搜索 — 未加载它们的提示词正文。",
     },
     preview: {
       untitledSession: "未命名会话",
@@ -453,6 +459,21 @@ export const zhCN: TranslationResources = {
       alreadyImported: "所有最近会话都已导入。",
       noProviderSessions: "没有找到 {{provider}} 会话。",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "加载历史可能需要几分钟，并占用大量内存",
+      body: "打开会话前，提供方会重新构建整段对话。大型会话可能占用数 GB 内存。",
+      confirm: "仍然导入",
+      cancel: "取消",
+    },
+    progress: {
+      title: "正在导入历史…",
+      body: "提供方仍在重新构建此会话。",
+      elapsed: "{{seconds}} 秒",
+      cancel: "停止导入",
+    },
+    cancelled: "导入已停止，工作区中未添加任何内容。",
     row: {
       importing: "正在导入...",
     },
@@ -1997,6 +2018,18 @@ export const zhCN: TranslationResources = {
     archiveTooltip: "归档 subagent",
     archiveFinishedAction: "归档已完成的 subagent",
     archiveFinishedRetry: "重试 ({{failed}}/{{total}})",
+    providerInternalTask: "{{provider}} 内部任务",
+    providerLogUnavailable: "提供方不共享此任务的记录，只显示状态。",
+    stopProviderDelegationsAction: "停止父代理和所有委派任务",
+    stopProviderDelegationsRequesting: "正在停止...",
+    stopProviderDelegationsDialogTitle: "停止 {{provider}}？",
+    stopProviderDelegationsDialogMessage:
+      "这会停止父代理的这一轮以及 {{provider}} 委派的全部任务（{{count}} 个运行中）。提供方允许时会撤回它排入队列等待后续执行的消息，否则这些消息仍可能稍后运行。",
+    stopProviderDelegationsConfirm: "全部停止",
+    stopProviderDelegationsStopped: "已停止：没有正在运行的委派任务",
+    stopProviderDelegationsPartial: "仍有 {{count}} 个委派任务在运行",
+    stopProviderDelegationsUnknown: "停止结果未知：提供方未确认。请检查任务状态。",
+    stopProviderDelegationsFailed: "无法停止委派任务：{{message}}",
   },
   panels: {
     draft: {

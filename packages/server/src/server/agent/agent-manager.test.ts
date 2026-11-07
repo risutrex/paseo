@@ -53,6 +53,7 @@ import type {
   AgentTimelineItem,
   ImportProviderSessionInput,
   ImportProviderSessionContext,
+  ListImportableSessionsOptions,
   ResolveAgentDefaultModeInput,
 } from "./agent-sdk-types.js";
 import type { PaseoToolCatalog } from "./tools/types.js";
@@ -12119,6 +12120,128 @@ test("listImportableSessions skips providers that lack supportsSessionListing ev
   expect(result.sessions.map((d) => d.provider)).toEqual(["claude"]);
 });
 
+test("listImportableSessions skips previews for providers that cannot load them cheaply", async () => {
+  const expensiveClient = new RecordingPersistedAgentsClient("minimax-code");
+  // A preview here means a full session restore inside the provider process, so
+  // the manager must not ask for one at all.
+  Object.defineProperty(expensiveClient, "capabilities", {
+    value: { ...TEST_CAPABILITIES, importSessionPreviewsAreCheap: false },
+  });
+  const received: Array<ListImportableSessionsOptions | undefined> = [];
+  expensiveClient.listImportableSessions = async (options) => {
+    received.push(options);
+    return [
+      {
+        providerHandleId: "huge-session",
+        cwd: "/tmp/recent",
+        title: "Release notes for 2.0",
+        firstPromptPreview: null,
+        lastPromptPreview: null,
+        lastActivityAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ];
+  };
+  const manager = new AgentManager({
+    clients: { "minimax-code": expensiveClient },
+    providerDefinitions: {
+      "minimax-code": { enabled: true, derivedFromProviderId: null },
+    },
+    logger,
+  });
+
+  const result = await manager.listImportableSessions({ query: "release notes" });
+
+  expect(received[0]?.includePreviews).toBe(false);
+  // Without previews the descriptor still answers a query, because the title
+  // survives the cheap listing.
+  expect(result.sessions.map((session) => session.providerHandleId)).toEqual(["huge-session"]);
+  expect(result.previewsUnavailable).toBe(true);
+});
+
+test("listImportableSessions keeps requesting previews from providers that did not opt out", async () => {
+  const cheapClient = new RecordingPersistedAgentsClient("claude");
+  const received: Array<ListImportableSessionsOptions | undefined> = [];
+  cheapClient.listImportableSessions = async (options) => {
+    received.push(options);
+    return [
+      {
+        providerHandleId: "claude-session",
+        cwd: "/tmp/recent",
+        title: "Cheap preview",
+        firstPromptPreview: "first prompt",
+        lastPromptPreview: "last prompt",
+        lastActivityAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ];
+  };
+  const manager = new AgentManager({
+    clients: { claude: cheapClient },
+    providerDefinitions: {
+      claude: { enabled: true, derivedFromProviderId: null },
+    },
+    logger,
+  });
+
+  const result = await manager.listImportableSessions();
+
+  expect(received[0]?.includePreviews).toBe(true);
+  expect(result.sessions[0]?.firstPromptPreview).toBe("first prompt");
+  // Nothing is missing, so the flag stays off the result.
+  expect(result.previewsUnavailable).toBeUndefined();
+  expect("previewsUnavailable" in result).toBe(false);
+});
+
+test("listImportableSessions does not start a provider the caller already gave up on", async () => {
+  const client = new RecordingPersistedAgentsClient("claude");
+  let called = false;
+  client.listImportableSessions = async () => {
+    called = true;
+    return [];
+  };
+  const manager = new AgentManager({
+    clients: { claude: client },
+    providerDefinitions: {
+      claude: { enabled: true, derivedFromProviderId: null },
+    },
+    logger,
+  });
+
+  const controller = new AbortController();
+  controller.abort();
+
+  const result = await manager.listImportableSessions({ signal: controller.signal });
+
+  // The client stopped waiting before the provider was reached, so the
+  // provider was never asked to work.
+  expect(called).toBe(false);
+  expect(result.sessions).toEqual([]);
+});
+
+test("listImportableSessions does not blame previews for a provider that failed", async () => {
+  const failingClient = new RecordingPersistedAgentsClient("minimax-code");
+  Object.defineProperty(failingClient, "capabilities", {
+    value: { ...TEST_CAPABILITIES, importSessionPreviewsAreCheap: false },
+  });
+  failingClient.listImportableSessions = async () => {
+    throw new Error("minimax-code listing failed");
+  };
+  const manager = new AgentManager({
+    clients: { "minimax-code": failingClient },
+    providerDefinitions: {
+      "minimax-code": { enabled: true, derivedFromProviderId: null },
+    },
+    logger,
+  });
+
+  const result = await manager.listImportableSessions();
+
+  // The provider answered with an error and no rows at all, so saying that its
+  // previews were missing would point the search at the wrong reason.
+  expect(result.providerErrors).toHaveLength(1);
+  expect(result.previewsUnavailable).toBeUndefined();
+  expect("previewsUnavailable" in result).toBe(false);
+});
+
 test("listImportableSessions returns healthy rows alongside thrown and timed-out provider errors", async () => {
   vi.useFakeTimers();
   try {
@@ -12162,6 +12285,35 @@ test("listImportableSessions returns healthy rows alongside thrown and timed-out
         },
       ],
     });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("listImportableSessions aborts the provider when the listing times out", async () => {
+  vi.useFakeTimers();
+  try {
+    const hangingClient = new RecordingPersistedAgentsClient("pi");
+    let receivedSignal: AbortSignal | undefined;
+    hangingClient.listImportableSessions = async (options) => {
+      receivedSignal = options?.signal;
+      return await new Promise(() => undefined);
+    };
+    const manager = new AgentManager({
+      clients: { pi: hangingClient },
+      providerDefinitions: {
+        pi: { enabled: true, derivedFromProviderId: null },
+      },
+      logger,
+    });
+
+    const resultPromise = manager.listImportableSessions();
+    await vi.advanceTimersByTimeAsync(90_000);
+    await resultPromise;
+
+    // The provider must learn that nobody is waiting any more, so it can stop
+    // the work it started instead of running on in the background.
+    expect(receivedSignal?.aborted).toBe(true);
   } finally {
     vi.useRealTimers();
   }
@@ -13192,6 +13344,269 @@ test("an out-of-band command racing idle cleanup waits for the resumed runtime",
   expect(await command).toEqual({ disposition: "out_of_band" });
   expect(h.commands).toEqual(["/maintenance"]);
   expect(h.prompts).toEqual([]);
+});
+
+test("a queued turn reports an unknown result instead of the previous answer", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-queued-wait-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const releaseQueuedEvent = Promise.withResolvers<void>();
+
+  // The first turn answers normally, the second ends in the provider's queue. A waiter
+  // that treats that handoff as a finish would hand the first answer over as the result
+  // of a request the provider has not even started.
+  class QueuedHandoffSession extends TestAgentSession {
+    startCount = 0;
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      const index = ++this.startCount;
+      const turnId = `queued-handoff-${index}`;
+      void (async () => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        if (index === 1) {
+          this.pushEvent({
+            type: "timeline",
+            provider: this.provider,
+            turnId,
+            item: { type: "assistant_message", text: "Previous answer" },
+          });
+          this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+          return;
+        }
+        await releaseQueuedEvent.promise;
+        this.pushEvent({
+          type: "turn_queued",
+          provider: this.provider,
+          turnId,
+          reason: "The provider took the message into its queue while it was busy",
+        });
+      })();
+      return { turnId };
+    }
+  }
+
+  class QueuedHandoffClient extends TestAgentClient {
+    session: QueuedHandoffSession | null = null;
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.session = new QueuedHandoffSession(config);
+      return this.session;
+    }
+  }
+
+  const client = new QueuedHandoffClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000902",
+  });
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    const firstEvents: AgentStreamEvent[] = [];
+    for await (const event of manager.streamAgent(snapshot.id, "first prompt")) {
+      firstEvents.push(event);
+    }
+    expect(firstEvents.map((event) => event.type)).toEqual([
+      "turn_started",
+      "timeline",
+      "turn_completed",
+    ]);
+    expect(await manager.getLastAssistantMessage(snapshot.id)).toBe("Previous answer");
+
+    const secondRun = (async () => {
+      for await (const _event of manager.streamAgent(snapshot.id, "second prompt")) {
+        // Drain the run so the manager applies its lifecycle.
+      }
+    })();
+    await manager.waitForAgentRunStart(snapshot.id);
+    const waiting = manager.waitForAgentEvent(snapshot.id, { waitForActive: true });
+
+    releaseQueuedEvent.resolve();
+    const result = await waiting;
+    expect(result).toMatchObject({ status: "idle", queued: true, lastMessage: null });
+    await secondRun;
+
+    // A waiter that arrives after the handoff gets the same honest answer.
+    const late = await manager.waitForAgentEvent(snapshot.id, { waitForActive: true });
+    expect(late).toMatchObject({ status: "idle", queued: true, lastMessage: null });
+  } finally {
+    await manager.closeAgent(manager.listAgents()[0]!.id).catch(() => undefined);
+    await manager.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("turn_queued ends the foreground run and frees the agent for the next prompt", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-queued-turn-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class QueuedTurnSession extends TestAgentSession {
+    startCount = 0;
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = `queued-turn-${++this.startCount}`;
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "turn_queued",
+          provider: this.provider,
+          turnId,
+          reason: "The provider took the message into its queue while it was busy",
+        });
+      }, 0);
+      return { turnId };
+    }
+  }
+
+  class QueuedTurnClient extends TestAgentClient {
+    session: QueuedTurnSession | null = null;
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.session = new QueuedTurnSession(config);
+      return this.session;
+    }
+  }
+
+  const client = new QueuedTurnClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000901",
+  });
+  const states: Array<{ lifecycle: string; activeForegroundTurnId: string | null }> = [];
+  manager.subscribe(
+    (event) => {
+      if (event.type === "agent_state") {
+        states.push({
+          lifecycle: event.agent.lifecycle,
+          activeForegroundTurnId: event.agent.activeForegroundTurnId,
+        });
+      }
+    },
+    { replayState: false },
+  );
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    const firstEvents: AgentStreamEvent[] = [];
+    // A queued turn is terminal for the run: the busy provider will never send a
+    // turn_completed for it, so draining must finish on turn_queued itself.
+    const firstRun = (async () => {
+      for await (const event of manager.streamAgent(snapshot.id, "first prompt")) {
+        firstEvents.push(event);
+      }
+    })();
+    await Promise.race([
+      firstRun,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("streamAgent hung on a queued turn")), 1_000),
+      ),
+    ]);
+
+    expect(firstEvents.map((event) => event.type)).toEqual(["turn_started", "turn_queued"]);
+    expect(manager.getAgent(snapshot.id)?.activeForegroundTurnId).toBeNull();
+    expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("idle");
+    expect(states.at(-1)).toEqual({ lifecycle: "idle", activeForegroundTurnId: null });
+    // Queued is neither a failure nor a cancellation, so nothing is reported as one.
+    expect(manager.getAgent(snapshot.id)?.lastError).toBeUndefined();
+    expect(firstEvents.some((event) => event.type === "turn_canceled")).toBe(false);
+
+    // The provider still owns its own turn, so the next prompt has to go back into its
+    // queue instead of failing with "already has an active run".
+    const secondEvents: AgentStreamEvent[] = [];
+    for await (const event of manager.streamAgent(snapshot.id, "second prompt")) {
+      secondEvents.push(event);
+    }
+    expect(secondEvents.map((event) => event.type)).toEqual(["turn_started", "turn_queued"]);
+    expect(client.session?.startCount).toBe(2);
+  } finally {
+    await manager.closeAgent(manager.listAgents()[0]!.id);
+    await manager.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+class ProviderDelegationStopClient extends TestAgentClient {
+  readonly stop = vi.fn(async () => ({ acknowledged: true }));
+  private readonly supportsStop: boolean;
+
+  constructor(provider: AgentProvider = "minimax-code", supportsStop = true) {
+    super(provider);
+    this.supportsStop = supportsStop;
+  }
+
+  override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+    const session = new TestAgentSession(config);
+    if (!this.supportsStop) {
+      return session;
+    }
+    return Object.assign(session, { stopProviderDelegations: this.stop });
+  }
+}
+
+test("stopProviderDelegations asks the session that owns the tree to stop it", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-delegation-stop-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new ProviderDelegationStopClient();
+  const manager = new AgentManager({
+    clients: { "minimax-code": client },
+    registry: storage,
+    logger,
+  });
+
+  try {
+    const agent = await manager.createAgent(
+      { provider: "minimax-code", cwd: workdir, title: "Parent" },
+      undefined,
+      { workspaceId: undefined },
+    );
+
+    await expect(manager.stopProviderDelegations(agent.id)).resolves.toEqual({
+      acknowledged: true,
+    });
+    expect(client.stop).toHaveBeenCalledTimes(1);
+  } finally {
+    await manager.closeAgent(manager.listAgents()[0]!.id);
+    await manager.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("stopProviderDelegations rejects a provider that cannot stop its delegations", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-delegation-stop-unsupported-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new ProviderDelegationStopClient("minimax-code", false);
+  const manager = new AgentManager({
+    clients: { "minimax-code": client },
+    registry: storage,
+    logger,
+  });
+
+  try {
+    const agent = await manager.createAgent(
+      { provider: "minimax-code", cwd: workdir, title: "Parent" },
+      undefined,
+      { workspaceId: undefined },
+    );
+
+    // A plain interruption would leave the provider's children running, so the
+    // request is refused instead of approximated.
+    await expect(manager.stopProviderDelegations(agent.id)).rejects.toThrow(
+      "does not support stopping delegated tasks",
+    );
+  } finally {
+    await manager.closeAgent(manager.listAgents()[0]!.id);
+    await manager.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("folds provider background work and clears it when the agent closes", async () => {

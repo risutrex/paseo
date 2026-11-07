@@ -171,6 +171,12 @@ export interface AgentCapabilityFlags {
   supportsStreaming: boolean;
   supportsSessionPersistence: boolean;
   supportsSessionListing?: boolean;
+  /**
+   * Whether listing importable sessions can load each session's prompt preview
+   * at a bearable cost. `false` means the preview costs a full session restore
+   * on the provider side; `true` or `undefined` means previews are cheap.
+   */
+  importSessionPreviewsAreCheap?: boolean;
   supportsDynamicModes: boolean;
   supportsMcpServers: boolean;
   supportsNativePaseoTools?: boolean;
@@ -179,6 +185,12 @@ export interface AgentCapabilityFlags {
   supportsRewindConversation?: boolean;
   supportsRewindFiles?: boolean;
   supportsRewindBoth?: boolean;
+  /**
+   * Whether the provider can stop its own delegation tree - the parent turn and
+   * every task delegated under it. Undefined means it cannot: only a provider
+   * that advertises the stop method accepts one.
+   */
+  supportsProviderDelegationStop?: boolean;
 }
 
 export interface AgentPersistenceHandle {
@@ -439,6 +451,16 @@ export type AgentStreamEvent =
     }
   | { type: "turn_canceled"; provider: AgentProvider; reason: string; turnId?: string }
   | {
+      /**
+       * The provider holds the message for a later turn. It is not lost: the
+       * agent picks it up once it is done with the turn it is running.
+       */
+      type: "turn_queued";
+      provider: AgentProvider;
+      reason: string;
+      turnId?: string;
+    }
+  | {
       type: "timeline";
       item: AgentTimelineItem;
       provider: AgentProvider;
@@ -565,6 +587,19 @@ export interface ListImportableSessionsOptions {
    * sessions by working directory should do so before doing expensive work.
    */
   cwd?: string;
+  /**
+   * Whether the caller wants prompt previews on the returned sessions.
+   * Defaults to `true`. When `false`, a provider whose previews are expensive
+   * must not load them and reports `null` previews instead.
+   */
+  includePreviews?: boolean;
+  /**
+   * Aborts the listing. Providers that support it (currently the ACP adapter)
+   * must stop their work and release every resource they acquired for it, so
+   * an abandoned listing cannot leave a provider process running. Providers
+   * that do not support the signal may ignore it.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ImportableProviderSession {
@@ -737,6 +772,44 @@ export interface AgentSession {
   tryHandleOutOfBand?(prompt: AgentPromptInput): {
     run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
   } | null;
+  /**
+   * Stops the parent turn and every task the provider delegated under it.
+   *
+   * A provider that keeps its own delegation tree has no addressable turn per
+   * child, so a stop is a root-session operation. Only providers that advertise
+   * the extension implement this; the absence of the method is the answer for
+   * every other provider.
+   */
+  stopProviderDelegations?(): Promise<ProviderDelegationStopResult>;
+  /**
+   * The messages the provider holds for a later turn, as it reports them now.
+   *
+   * Only a provider that keeps its own queue implements this; the absence of the
+   * method is the answer for every other provider.
+   */
+  getProviderQueue?(): Promise<ProviderQueueItemReport[]>;
+}
+
+/**
+ * One message a provider holds for a later turn, as the provider reports it.
+ */
+export interface ProviderQueueItemReport {
+  itemId: string;
+  text: string;
+  status: string;
+  createdAt: string | null;
+}
+
+/**
+ * What a provider's delegation stop reported back.
+ *
+ * `acknowledged` says the provider answered the request, nothing more: its
+ * receipt calls the root stopped even for an idle tree and can leave a child it
+ * really stopped out of the list. The delegation tree is the only report of what
+ * actually stopped, so callers read the rows instead of the receipt.
+ */
+export interface ProviderDelegationStopResult {
+  acknowledged: boolean;
 }
 
 export type FetchCatalogOptions = { providerOptions?: ProviderOptions } & (

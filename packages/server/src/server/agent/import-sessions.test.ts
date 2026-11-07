@@ -16,11 +16,13 @@ import type { WorkspaceProvisioningService } from "../session/workspace-provisio
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import {
   type ImportSessionAgentManager,
+  ImportCancelledError,
   ImportSessionsRequestError,
   importProviderSession,
   listImportableProviderSessions,
   normalizeImportAgentRequest,
 } from "./import-sessions.js";
+import { registerInFlightImportProcess } from "./import-session-cancellation.js";
 
 const directorySymlinkType = process.platform === "win32" ? "junction" : "dir";
 const importTestDirectories: string[] = [];
@@ -379,6 +381,34 @@ test("listImportableProviderSessions requests a bounded deep scan for search res
   ]);
 });
 
+test("listImportableProviderSessions reports that previews were unavailable", async () => {
+  const expensiveSession = makeImportableSession({
+    provider: "minimax-code",
+    sessionId: "huge-session",
+    title: "Release notes for 2.0",
+    lastActivityAt: "2026-04-30T12:00:00.000Z",
+  });
+
+  const result = await listImportableProviderSessions({
+    request: makeRequest({ providers: ["minimax-code"], limit: 5 }),
+    agentManager: {
+      listAgents: () => [],
+      listImportableSessions: async () => ({
+        ...makeImportableSessionsResult([expensiveSession]),
+        // The provider listed its descriptors without paying for a
+        // session/load per session.
+        previewsUnavailable: true,
+      }),
+    },
+    agentStorage: { listAll: async () => [] },
+    providerSnapshotManager: { getProviderLabel: (provider) => provider },
+  });
+
+  // The client needs to know why these rows have no prompt text.
+  expect(result.previewsUnavailable).toBe(true);
+  expect(result.entries.map((entry) => entry.providerHandleId)).toEqual(["huge-session"]);
+});
+
 test("listImportableProviderSessions includes a provider session after its Paseo agent is archived", async () => {
   const cwd = "/tmp/project";
   const archivedSession = makeImportableSession({
@@ -621,6 +651,8 @@ class ProviderImportHarness {
   resumeAttempts = 0;
   private unarchiveWait: Promise<void> | null = null;
   private releaseUnarchive: (() => void) | null = null;
+  private importWait: Promise<void> | null = null;
+  private releaseImport: (() => void) | null = null;
 
   private constructor(input: { storage: AgentStorage; snapshot: ManagedAgent }) {
     this.storage = input.storage;
@@ -628,6 +660,9 @@ class ProviderImportHarness {
     this.manager = {
       importProviderSession: async (request: unknown) => {
         this.freshImports.push(request);
+        if (this.importWait) {
+          await this.importWait;
+        }
         this.activeAgent = this.snapshot;
         return this.snapshot;
       },
@@ -724,6 +759,18 @@ class ProviderImportHarness {
     await this.storage.upsert(record);
   }
 
+  /** Holds the provider import open, like a session/load that is still running. */
+  blockImport(): () => void {
+    this.importWait = new Promise<void>((resolve) => {
+      this.releaseImport = resolve;
+    });
+    return () => {
+      this.releaseImport?.();
+      this.importWait = null;
+      this.releaseImport = null;
+    };
+  }
+
   blockUnarchive(): () => void {
     this.unarchiveWait = new Promise<void>((resolve) => {
       this.releaseUnarchive = resolve;
@@ -735,7 +782,12 @@ class ProviderImportHarness {
     };
   }
 
-  import(input: { providerHandleId: string; cwd?: string; labels?: Record<string, string> }) {
+  import(input: {
+    providerHandleId: string;
+    cwd?: string;
+    labels?: Record<string, string>;
+    signal?: AbortSignal;
+  }) {
     return importProviderSession({
       request: {
         requestId: "import-thread",
@@ -748,6 +800,7 @@ class ProviderImportHarness {
       agentManager: this.manager,
       agentStorage: this.storage,
       logger: createTestLogger(),
+      signal: input.signal,
     });
   }
 }
@@ -779,6 +832,81 @@ test("importProviderSession uses the provider import path with the requested lab
     timelineSize: 2,
     createdWorkspace: null,
   });
+});
+
+test("importProviderSession stops the provider process when the client cancels", async () => {
+  const harness = await ProviderImportHarness.create();
+  const releaseImport = harness.blockImport();
+  const controller = new AbortController();
+  const stopped: string[] = [];
+  // Stands in for the ACP session: the process registers how to end itself, and
+  // cancelling has to reach that registration instead of only dropping a promise.
+  const unregister = registerInFlightImportProcess("codex", "thread-imported", () => {
+    stopped.push("codex:thread-imported");
+  });
+
+  try {
+    const importing = harness.import({
+      providerHandleId: "thread-imported",
+      cwd: "/tmp/imported-agent",
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(harness.freshImports).toHaveLength(1));
+
+    controller.abort();
+
+    await expect(importing).rejects.toBeInstanceOf(ImportCancelledError);
+    await vi.waitFor(() => {
+      expect(stopped).toEqual(["codex:thread-imported"]);
+    });
+  } finally {
+    unregister();
+    releaseImport();
+  }
+});
+
+test("importProviderSession rolls back an agent the cancelled import registered anyway", async () => {
+  const harness = await ProviderImportHarness.create();
+  const releaseImport = harness.blockImport();
+  const controller = new AbortController();
+  const unregister = registerInFlightImportProcess("codex", "thread-imported", () => {});
+
+  try {
+    const importing = harness.import({
+      providerHandleId: "thread-imported",
+      cwd: "/tmp/imported-agent",
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(harness.freshImports).toHaveLength(1));
+
+    controller.abort();
+    await expect(importing).rejects.toBeInstanceOf(ImportCancelledError);
+
+    // The provider ignored the stop long enough to finish: the agent it
+    // registered belongs to an import nobody waits for any more.
+    releaseImport();
+    await vi.waitFor(() => {
+      expect(harness.closedAgentIds).toEqual([harness.snapshot.id]);
+    });
+  } finally {
+    unregister();
+    releaseImport();
+  }
+});
+
+test("importProviderSession never starts the provider for an already aborted import", async () => {
+  const harness = await ProviderImportHarness.create();
+  const controller = new AbortController();
+  controller.abort();
+
+  await expect(
+    harness.import({
+      providerHandleId: "thread-imported",
+      cwd: "/tmp/imported-agent",
+      signal: controller.signal,
+    }),
+  ).rejects.toBeInstanceOf(ImportCancelledError);
+  expect(harness.freshImports).toEqual([]);
 });
 
 test("importProviderSession rejects a provider session with an active stored owner", async () => {

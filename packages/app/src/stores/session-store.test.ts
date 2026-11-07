@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
@@ -847,5 +847,67 @@ describe("removeWorkspace", () => {
     expect(after.sessions).toBe(before.sessions);
     expect(after.session).toBe(before.session);
     expect(after.workspaces).toBe(before.workspaces);
+  });
+});
+
+describe("provider queue", () => {
+  const SERVER = "provider-queue-server";
+
+  afterEach(() => {
+    useSessionStore.getState().clearSession(SERVER);
+  });
+
+  it("keeps the queue the host reports, per agent", async () => {
+    // The provider owns its queue, so the app never derives one: it stores what
+    // the host answered, which is also what makes the position survive a resume.
+    const getProviderQueue = vi.fn(async () => ({
+      requestId: "request-1",
+      agentId: "agent-1",
+      supported: true,
+      items: [{ itemId: "item-1", text: "second thought", status: "queued", createdAt: null }],
+      error: null,
+    }));
+    useSessionStore
+      .getState()
+      .initializeSession(SERVER, { getProviderQueue } as unknown as DaemonClient);
+
+    await useSessionStore.getState().refreshProviderQueue(SERVER, "agent-1");
+
+    expect(useSessionStore.getState().sessions[SERVER]?.providerQueues.get("agent-1")).toEqual({
+      supported: true,
+      items: [{ itemId: "item-1", text: "second thought", status: "queued", createdAt: null }],
+    });
+    expect(getProviderQueue).toHaveBeenCalledWith("agent-1");
+  });
+
+  it("clears the rows when the queue cannot be read", async () => {
+    // Showing a position the host no longer stands behind would be a guess.
+    const getProviderQueue = vi.fn(async () => {
+      throw new Error("host refused");
+    });
+    useSessionStore
+      .getState()
+      .initializeSession(SERVER, { getProviderQueue } as unknown as DaemonClient);
+    useSessionStore.getState().setProviderQueue(SERVER, "agent-1", {
+      supported: true,
+      items: [{ itemId: "item-1", text: "second thought", status: "queued", createdAt: null }],
+    });
+
+    await useSessionStore.getState().refreshProviderQueue(SERVER, "agent-1");
+
+    expect(
+      useSessionStore.getState().sessions[SERVER]?.providerQueues.get("agent-1"),
+    ).toBeUndefined();
+  });
+
+  it("does nothing when the host cannot report a queue", async () => {
+    // An older host keeps the composer exactly as it was: the local queue is
+    // still the whole story there.
+    useSessionStore.getState().initializeSession(SERVER, {} as unknown as DaemonClient);
+
+    await expect(
+      useSessionStore.getState().refreshProviderQueue(SERVER, "agent-1"),
+    ).resolves.toBeUndefined();
+    expect(useSessionStore.getState().sessions[SERVER]?.providerQueues.size).toBe(0);
   });
 });

@@ -3719,6 +3719,56 @@ test("fetch_recent_provider_sessions_request forwards providerFilter to agent ma
   ]);
 });
 
+test("cancel_recent_provider_sessions_request stops a listing the client abandoned", async () => {
+  const emitted: Array<{ type: string; payload: unknown }> = [];
+  const session = createSessionForWorkspaceTests();
+  session.emit = (message) => emitted.push(message as { type: string; payload: unknown });
+  session.agentManager.listAgents = () => [];
+  session.agentStorage.list = async () => [];
+
+  let providerSignal: AbortSignal | undefined;
+  let providerAborted = false;
+  session.agentManager.listImportableSessions = async (options?: unknown) => {
+    providerSignal = (options as { signal?: AbortSignal } | undefined)?.signal;
+    // The provider is still working when the client gives up.
+    await new Promise<void>((resolve) => {
+      if (providerSignal?.aborted) {
+        providerAborted = true;
+        resolve();
+        return;
+      }
+      providerSignal?.addEventListener(
+        "abort",
+        () => {
+          providerAborted = true;
+          resolve();
+        },
+        { once: true },
+      );
+    });
+    return { sessions: [], providerErrors: [] };
+  };
+
+  const pending = session.handleMessage({
+    type: "fetch_recent_provider_sessions_request",
+    requestId: "req-cancelled-listing",
+    providers: ["codex"],
+  });
+
+  await session.handleMessage({
+    type: "cancel_recent_provider_sessions_request",
+    requestId: "req-cancelled-listing",
+  });
+
+  await pending;
+
+  // The provider stopped instead of keeping a session process alive for an
+  // answer nobody reads.
+  expect(providerAborted).toBe(true);
+  // And the abandoned answer was not put back into the client's cache.
+  expect(emitted).toEqual([]);
+});
+
 test("fetch_recent_provider_sessions_request reports filteredAlreadyImportedCount when all candidates are already imported", async () => {
   const emitted: Array<{ type: string; payload: unknown }> = [];
   const session = createSessionForWorkspaceTests();

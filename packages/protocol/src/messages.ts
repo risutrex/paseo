@@ -418,6 +418,8 @@ const AgentCapabilityFlagsSchema: z.ZodType<AgentCapabilityFlags> = z
     supportsStreaming: z.boolean(),
     supportsSessionPersistence: z.boolean(),
     supportsSessionListing: z.boolean().optional(),
+    // Additive: older daemons omit it, older clients ignore it.
+    importSessionPreviewsAreCheap: z.boolean().optional(),
     supportsDynamicModes: z.boolean(),
     supportsMcpServers: z.boolean(),
     supportsReasoningStream: z.boolean(),
@@ -428,6 +430,10 @@ const AgentCapabilityFlagsSchema: z.ZodType<AgentCapabilityFlags> = z
     supportsRewindFiles: z.boolean().optional().default(false),
     // COMPAT(rewind): added in v0.1.X, drop when floor >= v0.1.X.
     supportsRewindBoth: z.boolean().optional().default(false),
+    // COMPAT(providerDelegationStop): added after v0.13.0, remove gate after 2027-05-01.
+    // A provider that keeps its own delegation tree answers the stop; any other
+    // provider leaves it absent, so the app offers no stop it cannot carry out.
+    supportsProviderDelegationStop: z.boolean().optional(),
   })
   .catchall(z.boolean());
 
@@ -795,6 +801,14 @@ export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("turn_canceled"),
+    provider: AgentProviderSchema,
+    turnId: z.string().optional(),
+    reason: z.string(),
+  }),
+  z.object({
+    // The provider holds the message for a later turn instead of running it
+    // now. The message is not lost; the agent picks it up when it is done.
+    type: z.literal("turn_queued"),
     provider: AgentProviderSchema,
     turnId: z.string().optional(),
     reason: z.string(),
@@ -1432,6 +1446,24 @@ export const FetchRecentProviderSessionsRequestMessageSchema = z.object({
   query: z.string().optional(),
 });
 
+// A client that no longer wants the answer (the user typed another character, or
+// the sheet was closed) tells the daemon to stop the listing. Without it the
+// provider keeps working on a request nobody reads, and every keystroke in the
+// import search leaves another provider process behind.
+export const CancelRecentProviderSessionsRequestMessageSchema = z.object({
+  type: z.literal("cancel_recent_provider_sessions_request"),
+  requestId: z.string(),
+});
+
+// Importing a provider session can make the provider rebuild a whole
+// conversation (ACP session/load). A client that no longer waits for it asks
+// for the import to stop, so the daemon can kill the provider process instead
+// of leaving it loading a session nobody will open.
+export const CancelImportAgentRequestMessageSchema = z.object({
+  type: z.literal("cancel_import_agent_request"),
+  requestId: z.string(),
+});
+
 export const FetchAgentRequestMessageSchema = z.object({
   type: z.literal("fetch_agent_request"),
   requestId: z.string(),
@@ -2003,6 +2035,25 @@ export const ProviderSubagentListRequestMessageSchema = z.object({
   requestId: z.string(),
 });
 
+// The messages a provider holds for a later turn. A provider that keeps its own
+// queue runs them on its own schedule, so the only honest report is the list it
+// gives on request: it is also the only way to see a position after reconnecting,
+// because the provider does not replay its queue notifications.
+export const ProviderQueueItemPayloadSchema = z.object({
+  itemId: z.string(),
+  // The message itself, not a summary: the composer shows what is waiting.
+  text: z.string(),
+  // The provider's own state name (e.g. "queued"). It is displayed as reported.
+  status: z.string(),
+  createdAt: z.string().nullable(),
+});
+
+export const ProviderQueueRequestMessageSchema = z.object({
+  type: z.literal("agent.provider_queue.get.request"),
+  agentId: z.string(),
+  requestId: z.string(),
+});
+
 export const AgentBackgroundWorkListRequestMessageSchema = z.object({
   type: z.literal("agent.background_work.list.request"),
   agentId: z.string(),
@@ -2139,6 +2190,33 @@ export const AgentDetachRequestMessageSchema = z.object({
 export const AgentDetachResponseMessageSchema = z.object({
   type: z.literal("agent.detach.response"),
   payload: AgentActionResponsePayloadSchema,
+});
+
+/**
+ * Stops the parent turn of a provider that owns its delegation tree, together
+ * with every task delegated under it.
+ *
+ * There is no per-child stop: a provider sub-agent has no addressable turn.
+ * This is a root-session operation, which is why it hangs off the parent agent.
+ */
+export const AgentProviderDelegationsStopRequestMessageSchema = z.object({
+  type: z.literal("agent.provider_delegations.stop.request"),
+  agentId: z.string(),
+  requestId: z.string(),
+});
+
+export const AgentProviderDelegationsStopResponseMessageSchema = z.object({
+  type: z.literal("agent.provider_delegations.stop.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    accepted: z.boolean(),
+    // The provider answered the stop. It is not a claim that anything stopped:
+    // its receipt reports the root as stopped even for an idle tree. The
+    // delegation rows say what really happened, so the app reads those.
+    acknowledged: z.boolean(),
+    error: z.string().nullable(),
+  }),
 });
 
 export const AgentRewindModeSchema = z.enum(["conversation", "files", "both"]);
@@ -3369,6 +3447,8 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   FetchAgentsRequestMessageSchema,
   FetchAgentHistoryRequestMessageSchema,
   FetchRecentProviderSessionsRequestMessageSchema,
+  CancelRecentProviderSessionsRequestMessageSchema,
+  CancelImportAgentRequestMessageSchema,
   FetchWorkspacesRequestMessageSchema,
   ProjectListRequestMessageSchema,
   ProjectSuggestionsRequestSchema,
@@ -3453,6 +3533,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   AgentTimelineSearchRequestMessageSchema,
   AgentTimelineListPromptsRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
+  ProviderQueueRequestMessageSchema,
   AgentBackgroundWorkListRequestMessageSchema,
   AgentBackgroundWorkStopRequestMessageSchema,
   ProviderSubagentTimelineRequestMessageSchema,
@@ -3464,6 +3545,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentFeatureRequestMessageSchema,
   AgentConfigApplyRequestMessageSchema,
   AgentDetachRequestMessageSchema,
+  AgentProviderDelegationsStopRequestMessageSchema,
   AgentRewindRequestMessageSchema,
   AgentPermissionResponseMessageSchema,
   CheckoutStatusRequestSchema,
@@ -3882,12 +3964,18 @@ export const ServerInfoStatusPayloadSchema = z
         agentForkContextCursor: z.boolean().optional(),
         // COMPAT(providerSubagents): added in v0.1.107, remove gate after 2027-01-12.
         providerSubagents: z.boolean().optional(),
+        // COMPAT(providerDelegationStop): added after v0.13.0, remove gate after 2027-05-01.
+        // The daemon accepts a stop for a provider-owned delegation tree.
+        providerDelegationStop: z.boolean().optional(),
         // COMPAT(agentBackgroundWork): added after v0.11.0-beta.5, remove gate after 2027-04-06.
         agentBackgroundWork: z.boolean().optional(),
         // COMPAT(agentBackgroundWorkStop): added after v0.15.0, remove after 2027-05-03.
         agentBackgroundWorkStop: z.boolean().optional(),
         // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gates after 2027-03-14; retain wire field.
         projectedSubagentTimeline: z.boolean().optional(),
+        // COMPAT(providerQueue): added after v0.8.0, remove gates after 2027-06-01; retain wire field.
+        // The daemon can report the queue a provider keeps for later turns.
+        providerQueue: z.boolean().optional(),
         wholeTurnTimeline: z.boolean().optional(),
         // COMPAT(providerSubagentNesting): added in v0.7, remove gate after 2027-03-04.
         providerSubagentNesting: z.boolean().optional(),
@@ -4428,6 +4516,10 @@ export const FetchRecentProviderSessionsResponseMessageSchema = z.object({
         }),
       )
       .optional(),
+    // Additive: true when at least one provider listed sessions without loading
+    // their prompt previews, so the client can tell the user why sessions show
+    // no prompt text. Omitted by older daemons, ignored by older clients.
+    previewsUnavailable: z.boolean().optional(),
   }),
 });
 
@@ -4972,6 +5064,19 @@ export const ProviderSubagentListResponseMessageSchema = z.object({
     requestId: z.string(),
     parentAgentId: z.string(),
     subagents: z.array(ProviderSubagentDescriptorPayloadSchema),
+    error: z.string().nullable(),
+  }),
+});
+
+export const ProviderQueueResponseMessageSchema = z.object({
+  type: z.literal("agent.provider_queue.get.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    // False when the provider has no queue at all, so an empty list is never
+    // mistaken for "nothing is waiting".
+    supported: z.boolean(),
+    items: z.array(ProviderQueueItemPayloadSchema),
     error: z.string().nullable(),
   }),
 });
@@ -7278,6 +7383,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentTimelineSearchResponseMessageSchema,
   AgentTimelineListPromptsResponseMessageSchema,
   ProviderSubagentListResponseMessageSchema,
+  ProviderQueueResponseMessageSchema,
   ProviderSubagentTimelineResponseMessageSchema,
   ProviderSubagentUpdateMessageSchema,
   AgentBackgroundWorkListResponseMessageSchema,
@@ -7315,6 +7421,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentFeatureResponseMessageSchema,
   AgentConfigApplyResponseMessageSchema,
   AgentDetachResponseMessageSchema,
+  AgentProviderDelegationsStopResponseMessageSchema,
   AgentRewindResponseMessageSchema,
   UpdateAgentResponseMessageSchema,
   ProjectRenameResponseSchema,

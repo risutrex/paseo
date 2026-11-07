@@ -31,6 +31,12 @@ export interface SessionsQueryResult {
         entries: FetchRecentProviderSessionEntry[];
         filteredAlreadyImportedCount?: number;
         providerErrors?: Array<{ provider: string; message: string }>;
+        /**
+         * Set when the host answered without reading prompt previews, so the
+         * listing carries names and folders only. Optional because hosts older
+         * than the flag never send it and their answers are complete.
+         */
+        previewsUnavailable?: boolean;
       }
     | undefined;
   isError: boolean;
@@ -93,6 +99,16 @@ export function sumFilteredAlreadyImportedCount(
     total += query.data?.filteredAlreadyImportedCount ?? 0;
   }
   return total;
+}
+
+/**
+ * True when at least one provider answered without loading prompt previews.
+ * The search then only matched titles and directories, which the sheet has to
+ * say out loud: a session whose prompt would have matched still reads as
+ * missing. Providers differ per answer, so one flag is enough to warn.
+ */
+export function hasUnavailablePreviews(queries: ReadonlyArray<SessionsQueryResult>): boolean {
+  return queries.some((query) => query.data?.previewsUnavailable === true);
 }
 
 /**

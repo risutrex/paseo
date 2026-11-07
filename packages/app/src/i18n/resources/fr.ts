@@ -168,6 +168,8 @@ export const fr: TranslationResources = {
       dropFilesHere: "Déposez des fichiers ici",
       editQueuedMessage: "Modifier le message en file d’attente",
       sendQueuedMessageNow: "Envoyer maintenant le message en file d’attente",
+      providerQueueLabel: "Dans la file du fournisseur - non modifiable ici",
+      providerQueueStatus: "{{status}}",
       openImage: "Ouvrir l’image jointe",
       removeImage: "Retirer l’image jointe",
       removeFile: "Retirer le fichier joint",
@@ -447,6 +449,11 @@ export const fr: TranslationResources = {
       refresh: "Actualiser les sessions",
       showAll: "Tout afficher",
       loadMore: "Charger plus",
+      scopeToWorkspace: "Cet espace de travail",
+    },
+    previews: {
+      unavailable:
+        "Certains fournisseurs ont été recherchés uniquement par titre et dossier — le texte de leurs invites n’a pas été chargé.",
     },
     preview: {
       untitledSession: "Session sans titre",
@@ -458,6 +465,21 @@ export const fr: TranslationResources = {
       alreadyImported: "Toutes les sessions récentes sont déjà importées.",
       noProviderSessions: "Aucune session {{provider}} trouvée.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "Le chargement de l’historique peut prendre plusieurs minutes et beaucoup de mémoire",
+      body: "Le fournisseur reconstruit toute la conversation avant d’ouvrir la session. Les grosses sessions peuvent occuper plusieurs gigaoctets de mémoire.",
+      confirm: "Importer quand même",
+      cancel: "Annuler",
+    },
+    progress: {
+      title: "Importation de l’historique…",
+      body: "Le fournisseur reconstruit toujours cette session.",
+      elapsed: "{{seconds}} s",
+      cancel: "Arrêter l’importation",
+    },
+    cancelled: "Importation arrêtée. Rien n’a été ajouté à votre espace de travail.",
     row: {
       importing: "Importation…",
     },
@@ -2068,6 +2090,20 @@ export const fr: TranslationResources = {
     archiveTooltip: "Archiver le sous-agent",
     archiveFinishedAction: "Archiver les sous-agents terminés",
     archiveFinishedRetry: "Réessayer ({{failed}}/{{total}})",
+    providerInternalTask: "Tâche interne de {{provider}}",
+    providerLogUnavailable:
+      "Le fournisseur ne partage pas le journal de cette tâche. Seul son état est affiché.",
+    stopProviderDelegationsAction: "Arrêter le parent et les tâches déléguées",
+    stopProviderDelegationsRequesting: "Arrêt en cours...",
+    stopProviderDelegationsDialogTitle: "Arrêter {{provider}} ?",
+    stopProviderDelegationsDialogMessage:
+      "Cela arrête le tour du parent et toutes les tâches déléguées par {{provider}} ({{count}} en cours). Les messages mis en file d'attente par le fournisseur sont retirés s'il le permet ; sinon ils peuvent encore s'exécuter.",
+    stopProviderDelegationsConfirm: "Tout arrêter",
+    stopProviderDelegationsStopped: "Arrêté : aucune tâche déléguée en cours",
+    stopProviderDelegationsPartial: "{{count}} tâches déléguées sont encore en cours",
+    stopProviderDelegationsUnknown:
+      "Résultat de l'arrêt inconnu : le fournisseur ne l'a pas confirmé. Vérifiez l'état des tâches.",
+    stopProviderDelegationsFailed: "Impossible d'arrêter les tâches déléguées : {{message}}",
   },
   panels: {
     draft: {

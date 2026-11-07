@@ -479,6 +479,8 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     revertFiles: inner.revertFiles?.bind(inner),
     revertBoth: inner.revertBoth?.bind(inner),
     tryHandleOutOfBand: inner.tryHandleOutOfBand?.bind(inner),
+    stopProviderDelegations: inner.stopProviderDelegations?.bind(inner),
+    getProviderQueue: inner.getProviderQueue?.bind(inner),
   } satisfies ForwardedAgentSession;
 }
 

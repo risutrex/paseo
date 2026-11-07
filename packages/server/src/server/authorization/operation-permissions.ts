@@ -19,9 +19,15 @@ const INBOUND_PERMISSION = {
   "agent.detach.request": "workspace.write",
   "agent.fork_context.request": "workspace.read",
   "agent.provider_subagents.list.request": "workspace.read",
+  // Reading the queue only reports work the provider already holds.
+  "agent.provider_queue.get.request": "workspace.read",
+
   "agent.background_work.list.request": "workspace.read",
   "agent.background_work.stop.request": ["workspace.write", "hub.execute"],
   "agent.provider_subagents.timeline.get.request": "workspace.read",
+  // Stopping a provider's delegation tree stops work the caller is watching, so
+  // it takes the same grant as any other cancellation.
+  "agent.provider_delegations.stop.request": ["workspace.write", "hub.execute"],
   "agent.rewind.request": "workspace.write",
   "agent.skills.get_status.request": "daemon.read",
   "agent.skills.import_legacy_selection.request": "daemon.manage",
@@ -93,6 +99,8 @@ const INBOUND_PERMISSION = {
   fetch_agent_timeline_request: ["workspace.read", "hub.execute"],
   fetch_agents_request: ["workspace.read", "hub.execute"],
   fetch_recent_provider_sessions_request: "workspace.read",
+  // Cancelling a listing needs no more authority than asking for one.
+  cancel_recent_provider_sessions_request: "workspace.read",
   fetch_workspaces_request: ["workspace.read", "hub.execute"],
   "file.upload.request": "workspace.write",
   file_download_token_request: "workspace.read",
@@ -116,6 +124,9 @@ const INBOUND_PERMISSION = {
   "hub.management.daemon.get_status.request": "tunnel.manage",
   "hub.management.daemon.permissions.update.request": "access.manage",
   import_agent_request: "workspace.write",
+  // Same authority as cancelling a listing: stopping work the caller started
+  // must not need a stronger grant than watching it.
+  cancel_import_agent_request: "workspace.read",
   kill_terminal_request: "workspace.write",
   list_available_editors_request: "workspace.read",
   list_available_providers_request: "daemon.read",
@@ -251,8 +262,11 @@ const OUTBOUND_PERMISSION = {
   "agent.detach.response": "workspace.write",
   "agent.fork_context.response": "workspace.read",
   "agent.provider_subagents.list.response": "workspace.read",
+  "agent.provider_queue.get.response": "workspace.read",
   "agent.provider_subagents.timeline.get.response": "workspace.read",
   "agent.provider_subagents.update": "workspace.read",
+  "agent.provider_delegations.stop.response": ["workspace.write", "hub.execute"],
+
   "agent.background_work.list.response": "workspace.read",
   "agent.background_work.stop.response": ["workspace.write", "hub.execute"],
   "agent.background_work.update": "workspace.read",

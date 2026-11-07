@@ -166,6 +166,8 @@ export const ko: TranslationResources = {
       dropFilesHere: "여기에 파일을 끌어다 놓으세요",
       editQueuedMessage: "대기 중인 메시지 편집",
       sendQueuedMessageNow: "대기 중인 메시지 지금 보내기",
+      providerQueueLabel: "프로바이더 대기열에 있음 - 여기서는 편집할 수 없습니다",
+      providerQueueStatus: "{{status}}",
       openImage: "이미지 첨부 열기",
       removeImage: "이미지 첨부 제거",
       removeFile: "파일 첨부 제거",
@@ -443,6 +445,11 @@ export const ko: TranslationResources = {
       refresh: "세션 새로고침",
       showAll: "전체 표시",
       loadMore: "더 보기",
+      scopeToWorkspace: "이 워크스페이스",
+    },
+    previews: {
+      unavailable:
+        "일부 프로바이더는 제목과 폴더만으로 검색되었습니다. 프롬프트 본문은 불러오지 않았습니다.",
     },
     preview: {
       untitledSession: "제목 없는 세션",
@@ -454,6 +461,21 @@ export const ko: TranslationResources = {
       alreadyImported: "최근 세션이 모두 이미 가져와졌습니다.",
       noProviderSessions: "{{provider}} 세션을 찾을 수 없습니다.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "기록을 불러오는 데 몇 분과 많은 메모리가 필요할 수 있습니다",
+      body: "세션을 열기 전에 프로바이더가 대화 전체를 다시 구성합니다. 큰 세션은 메모리를 몇 기가바이트까지 사용할 수 있습니다.",
+      confirm: "그래도 가져오기",
+      cancel: "취소",
+    },
+    progress: {
+      title: "기록을 가져오는 중…",
+      body: "프로바이더가 아직 이 세션을 다시 구성하고 있습니다.",
+      elapsed: "{{seconds}}초",
+      cancel: "가져오기 중지",
+    },
+    cancelled: "가져오기를 중지했습니다. 작업 공간에 아무것도 추가되지 않았습니다.",
     row: {
       importing: "가져오는 중...",
     },
@@ -2031,6 +2053,19 @@ export const ko: TranslationResources = {
     archiveTooltip: "서브에이전트 보관",
     archiveFinishedAction: "완료된 하위 에이전트 보관",
     archiveFinishedRetry: "다시 시도 ({{failed}}/{{total}})",
+    providerInternalTask: "{{provider}} 내부 작업",
+    providerLogUnavailable: "공급자가 이 작업의 기록을 공유하지 않습니다. 상태만 표시됩니다.",
+    stopProviderDelegationsAction: "부모와 위임된 작업 모두 중지",
+    stopProviderDelegationsRequesting: "중지하는 중...",
+    stopProviderDelegationsDialogTitle: "{{provider}}을(를) 중지할까요?",
+    stopProviderDelegationsDialogMessage:
+      "부모 턴과 {{provider}}이(가) 위임한 모든 작업(실행 중 {{count}}개)을 중지합니다. 공급자가 허용하면 나중에 실행하려고 대기열에 넣은 메시지가 철회되고, 허용하지 않으면 나중에 실행될 수 있습니다.",
+    stopProviderDelegationsConfirm: "모두 중지",
+    stopProviderDelegationsStopped: "중지됨: 실행 중인 위임 작업이 없습니다",
+    stopProviderDelegationsPartial: "위임된 작업 {{count}}개가 아직 실행 중입니다",
+    stopProviderDelegationsUnknown:
+      "중지 결과를 알 수 없습니다: 공급자가 확인하지 않았습니다. 작업 상태를 확인하세요.",
+    stopProviderDelegationsFailed: "위임된 작업을 중지하지 못했습니다: {{message}}",
   },
   panels: {
     draft: {

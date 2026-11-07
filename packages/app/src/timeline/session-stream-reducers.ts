@@ -1818,7 +1818,10 @@ export function deriveAgentStreamTurnLiveness(
     } else if (
       event.type === "turn_completed" ||
       event.type === "turn_failed" ||
-      event.type === "turn_canceled"
+      event.type === "turn_canceled" ||
+      // The provider took the message into its queue; the session is free for
+      // the next turn even though this one never ran.
+      event.type === "turn_queued"
     ) {
       transitions.push({ type: "stream_close", turnId: event.turnId ?? null });
     }

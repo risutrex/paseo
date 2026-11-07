@@ -8,6 +8,7 @@ import { createHostObservationResolver, type ToolHosts } from "../../host-operat
 import { openFinishObservation } from "./observation-stream.js";
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
+import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
 import type { FinishObservation } from "../index.js";
 
 export function createFinishObservation(input: {
@@ -44,6 +45,22 @@ export function createFinishObservation(input: {
           waitForActive: true,
         });
         const current = agentManager.getAgent(agentId);
+        if (result.queued) {
+          // The provider took the message for a later turn: this turn has no result,
+          // and the manager's last message belongs to the turn before it. The buffer
+          // turns this baseline into the queued outcome; `wait_for_finish` keeps the
+          // client-facing status it already knows and sees no message.
+          const baseline: WaitForFinishResult & { queued?: boolean } = {
+            status: "idle",
+            final: current
+              ? await serializeSnapshotWithMetadata(agentStorage, current, input.logger)
+              : null,
+            lastMessage: null,
+            error: null,
+            queued: true,
+          };
+          return baseline;
+        }
         const status = result.permission ? "permission" : result.status;
         return {
           status: status === "permission" || status === "error" ? status : "idle",
@@ -78,6 +95,7 @@ export function createFinishObservation(input: {
                 "turn_started",
                 "turn_completed",
                 "turn_canceled",
+                "turn_queued",
                 "turn_failed",
               ].includes(event.event.type)
             ) {
