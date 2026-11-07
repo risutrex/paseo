@@ -408,6 +408,7 @@ export const zhCN: TranslationResources = {
     scope: {
       host: "{{host}} 上的会话",
       workspace: "此 workspace",
+      widenedBySearch: "正在所有目录中搜索，以查找来自其他项目的会话。",
     },
     filters: {
       all: "全部",
@@ -424,6 +425,10 @@ export const zhCN: TranslationResources = {
       refresh: "刷新会话",
       showAll: "显示全部",
       loadMore: "加载更多",
+      scopeToWorkspace: "此 workspace",
+    },
+    previews: {
+      unavailable: "部分 Provider 仅按标题和文件夹搜索 — 未加载它们的提示词正文。",
     },
     preview: {
       untitledSession: "未命名会话",

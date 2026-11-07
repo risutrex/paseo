@@ -13,6 +13,7 @@ import {
   RequestError,
   ndJsonStream,
   type Agent,
+  type Client as ACPClient,
   type CreateTerminalRequest,
   PermissionOption,
   PromptResponse,
@@ -99,11 +100,25 @@ describe("buildACPClientCapabilities", () => {
 
 interface ACPSessionInternals {
   sessionId: string | null;
-  connection: { prompt: (...args: unknown[]) => Promise<PromptResponse> };
+  connection: {
+    prompt: (...args: unknown[]) => Promise<PromptResponse>;
+    cancel?: (...args: unknown[]) => Promise<void>;
+    extMethod?: (
+      method: string,
+      params: Record<string, unknown>,
+    ) => Promise<Record<string, unknown>>;
+  };
+  agentMeta: Record<string, unknown> | null;
   activeForegroundTurnId: string | null;
+  foregroundPrompts: Map<string, unknown>;
   configOptions: SessionConfigOption[];
   translateSessionUpdate(update: SessionUpdate): AgentStreamEvent[];
   acpMcpServers(): unknown[];
+  handleProviderExit(
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    stderrChunks: string[],
+  ): void;
 }
 
 interface ACPModelSelectionInternals {
@@ -2363,11 +2378,26 @@ describe("ACPAgentClient fetchCatalog", () => {
 });
 
 describe("ACPAgentClient listImportableSessions", () => {
-  function makeClient(args: { listSessions: ReturnType<typeof vi.fn>; supportsList?: boolean }) {
+  function makeClient(args: {
+    listSessions: ReturnType<typeof vi.fn>;
+    supportsList?: boolean;
+    terminateProcess?: (child: unknown, options: unknown) => Promise<void>;
+    child?: unknown;
+  }) {
+    const kill = vi.fn();
+    const defaultChild = {
+      kill,
+      exitCode: 0,
+      signalCode: null,
+      once: vi.fn(),
+      stdin: { destroy: vi.fn() },
+      stdout: { destroy: vi.fn() },
+      stderr: { destroy: vi.fn() },
+    };
     class TestACPAgentClient extends ACPAgentClient {
       protected override async spawnProcess(): Promise<SpawnedACPProcess> {
         return {
-          child: { kill: vi.fn(), exitCode: 0, signalCode: null, once: vi.fn() },
+          child: (args.child ?? defaultChild) as never,
           connection: { listSessions: args.listSessions },
           initialize: {
             agentCapabilities:
@@ -2384,6 +2414,7 @@ describe("ACPAgentClient listImportableSessions", () => {
       logger: createTestLogger(),
       defaultCommand: ["kimi", "acp"],
       defaultModes: [],
+      ...(args.terminateProcess ? { terminateProcess: args.terminateProcess as never } : {}),
     });
   }
 
@@ -2462,6 +2493,798 @@ describe("ACPAgentClient listImportableSessions", () => {
       cwd: "/Users/moonshot",
     });
   });
+
+  test("terminates the probe process when the listing is aborted", async () => {
+    // The provider answers the first page and then stops answering. Without an
+    // abort signal the probe keeps running for as long as the provider needs
+    // to finish the requests it already received.
+    let rejectSecondPage!: (error: Error) => void;
+    const secondPage = new Promise<never>((_resolve, reject) => {
+      rejectSecondPage = reject;
+    });
+    const listSessions = vi
+      .fn()
+      .mockResolvedValueOnce({
+        sessions: [{ sessionId: "s1", cwd: "/Users/moonshot", title: null, updatedAt: null }],
+        nextCursor: "cursor-2",
+      })
+      .mockReturnValue(secondPage);
+    const terminateProcess = vi.fn().mockImplementation(async () => {
+      rejectSecondPage(new Error("probe terminated"));
+    });
+    const client = makeClient({ listSessions, terminateProcess });
+    const controller = new AbortController();
+
+    const listing = client.listImportableSessions({
+      cwd: "/Users/moonshot",
+      signal: controller.signal,
+    });
+    // let the first page resolve so the listing is waiting on the second one
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    controller.abort();
+
+    await expect(listing).rejects.toThrow();
+    expect(terminateProcess).toHaveBeenCalledTimes(1);
+  });
+
+  test("bounds session/list so a provider that never answers cannot hang the listing", async () => {
+    vi.useFakeTimers();
+    try {
+      const listSessions = vi.fn().mockImplementation(() => new Promise<never>(() => {}));
+      const client = makeClient({ listSessions });
+
+      const assertion = expect(
+        client.listImportableSessions({ cwd: "/Users/moonshot" }),
+      ).rejects.toThrow(/session\/list timed out/);
+      await vi.advanceTimersByTimeAsync(20_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("ACPAgentClient listImportableSessions while the probe handshake stalls", () => {
+  // The probe is only useful once its handshake finished, but the child exists
+  // earlier than that. A provider that never answers `initialize` used to leave
+  // a process nobody could reach: the abort handler only saw the probe after
+  // the handshake, and nothing bounded the handshake itself.
+  function makeClient(args: {
+    initialize: () => Promise<{ agentCapabilities: Record<string, unknown> }>;
+    terminateProcess?: ProcessTerminator;
+  }) {
+    const children: ChildProcessWithoutNullStreams[] = [];
+    class TestACPAgentClient extends ACPAgentClient {
+      // Only the transport is faked, so the real `spawnProcess` keeps its
+      // handshake timeout and its cleanup path.
+      protected override async spawnTransport() {
+        const child = createProbeChildStub();
+        children.push(child);
+        return {
+          child,
+          connection: { initialize: args.initialize } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => {}),
+        };
+      }
+    }
+
+    const client = new TestACPAgentClient({
+      provider: "kimi",
+      logger: createTestLogger(),
+      defaultCommand: ["kimi", "acp"],
+      defaultModes: [],
+      ...(args.terminateProcess ? { terminateProcess: args.terminateProcess } : {}),
+    });
+    return { client, children };
+  }
+
+  test("fails the listing and kills the probe when the handshake never finishes", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      const { client, children } = makeClient({
+        initialize: () => new Promise<never>(() => {}),
+        terminateProcess,
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      const assertion = expect(listing).rejects.toThrow(/ACP initialize timed out/);
+
+      // The provider is still in `initialize`: the listing waits, but not
+      // forever.
+      await vi.advanceTimersByTimeAsync(14_000);
+      expect(terminateProcess).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await assertion;
+
+      // The stalled probe is gone instead of lingering as an orphan.
+      expect(children).toHaveLength(1);
+      expect(terminateProcess).toHaveBeenCalledTimes(1);
+      expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("kills the probe child when the listing is aborted during the handshake", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      let finishHandshake: (() => void) | undefined;
+      const { client, children } = makeClient({
+        initialize: () =>
+          new Promise<{ agentCapabilities: Record<string, unknown> }>((resolve) => {
+            finishHandshake = () => resolve({ agentCapabilities: {} });
+          }),
+        terminateProcess,
+      });
+
+      const controller = new AbortController();
+      const listing = client.listImportableSessions({
+        cwd: "/Users/moonshot",
+        signal: controller.signal,
+      });
+      const assertion = expect(listing).rejects.toThrow(/aborted/);
+
+      // The child exists while the handshake is still running - this is the
+      // window in which an abort used to reach nothing.
+      await vi.waitFor(() => expect(children).toHaveLength(1));
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(terminateProcess).toHaveBeenCalled();
+      expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
+
+      // The caller already gave up, so the late handshake must not hand out a
+      // probe that nobody waits for any more.
+      finishHandshake?.();
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("ACPAgentClient listImportableSessions with a busy provider", () => {
+  // Providers answer ACP requests one at a time. A session/load that never
+  // finishes therefore blocks every later request on the same connection -
+  // including the next session/list page, which used to time out and fail the
+  // whole listing.
+  function makeClient(args: {
+    listSessions: ReturnType<typeof vi.fn>;
+    loadSession: ReturnType<typeof vi.fn>;
+    terminateProcess: (child: unknown, options: unknown) => Promise<void>;
+    onSpawn?: (index: number, client: ACPClient | undefined) => void;
+    now?: () => number;
+  }) {
+    const children: unknown[] = [];
+    class TestACPAgentClient extends ACPAgentClient {
+      protected override async spawnProcess(
+        _launchEnv?: Record<string, string>,
+        options?: { client?: ACPClient },
+      ): Promise<SpawnedACPProcess> {
+        const child = {
+          kill: vi.fn(),
+          exitCode: 0,
+          signalCode: null,
+          once: vi.fn(),
+          stdin: { destroy: vi.fn() },
+          stdout: { destroy: vi.fn() },
+          stderr: { destroy: vi.fn() },
+        };
+        children.push(child);
+        args.onSpawn?.(children.length - 1, options?.client);
+        return {
+          child: child as never,
+          connection: { listSessions: args.listSessions, loadSession: args.loadSession },
+          initialize: {
+            agentCapabilities: { sessionCapabilities: { list: {} }, loadSession: true },
+          },
+        } as unknown as SpawnedACPProcess;
+      }
+    }
+
+    const client = new TestACPAgentClient({
+      provider: "kimi",
+      logger: createTestLogger(),
+      defaultCommand: ["kimi", "acp"],
+      defaultModes: [],
+      terminateProcess: args.terminateProcess as never,
+      ...(args.now ? { now: args.now } : {}),
+    });
+    return { client, children };
+  }
+
+  function userMessage(text: string): SessionUpdate {
+    return {
+      sessionUpdate: "user_message_chunk",
+      messageId: "user-1",
+      content: { type: "text", text },
+    } as SessionUpdate;
+  }
+
+  test("reads the next list page from a fresh probe after the provider got stuck", async () => {
+    vi.useFakeTimers();
+    try {
+      let probeClient: ACPClient | undefined;
+      let probeIndex = 0;
+      const listProbes: number[] = [];
+      const loadProbes: number[] = [];
+      let page = 0;
+      const listSessions = vi.fn(async () => {
+        listProbes.push(probeIndex);
+        page += 1;
+        return page === 1
+          ? {
+              sessions: [
+                {
+                  sessionId: "stuck",
+                  cwd: "/Users/moonshot",
+                  title: "huge",
+                  updatedAt: "2026-06-13T00:00:00.000Z",
+                },
+              ],
+              nextCursor: "cursor-2",
+            }
+          : {
+              sessions: [
+                {
+                  sessionId: "next",
+                  cwd: "/Users/moonshot",
+                  title: "next",
+                  updatedAt: "2026-06-14T00:00:00.000Z",
+                },
+              ],
+              nextCursor: null,
+            };
+      });
+      let loads = 0;
+      const loadSession = vi.fn(async (params: { sessionId: string }) => {
+        loadProbes.push(probeIndex);
+        loads += 1;
+        // The first history never finishes: the provider is busy with it.
+        if (loads === 1) return await new Promise<never>(() => {});
+        await probeClient?.sessionUpdate({
+          sessionId: params.sessionId,
+          update: userMessage("hello"),
+        });
+      });
+
+      const { client } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess: async () => {},
+        onSpawn: (index, spawned) => {
+          probeIndex = index;
+          probeClient = spawned;
+        },
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await listing;
+
+      expect(result.map((session) => session.providerHandleId)).toEqual(["stuck", "next"]);
+      // The stuck provider answers no request, so the next page has to come
+      // from the replacement probe.
+      expect(listProbes).toEqual([0, 1]);
+      expect(loadProbes).toEqual([0, 1]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("replaces a probe whose provider is stuck on a session history", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      let probeClient: ACPClient | undefined;
+      const listSessions = vi.fn(async () => ({
+        sessions: [
+          {
+            sessionId: "stuck",
+            cwd: "/Users/moonshot",
+            title: "huge",
+            updatedAt: "2026-06-13T00:00:00.000Z",
+          },
+          {
+            sessionId: "fast",
+            cwd: "/Users/moonshot",
+            title: "small",
+            updatedAt: "2026-06-14T00:00:00.000Z",
+          },
+        ],
+        nextCursor: null,
+      }));
+      let loads = 0;
+      const loadSession = vi.fn(async (params: { sessionId: string }) => {
+        loads += 1;
+        // The first history never finishes: the provider is busy with it.
+        if (loads === 1) return await new Promise<never>(() => {});
+        await probeClient?.sessionUpdate({
+          sessionId: params.sessionId,
+          update: userMessage("hello"),
+        });
+      });
+
+      const { client, children } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+        onSpawn: (_index, spawned) => {
+          probeClient = spawned;
+        },
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await listing;
+
+      // The stuck session stays visible, the rest of the listing still works.
+      expect(result.map((session) => session.providerHandleId)).toEqual(["stuck", "fast"]);
+      expect(result[0].firstPromptPreview).toBeNull();
+      expect(result[1].firstPromptPreview).toBe("hello");
+      // The stuck provider was killed and replaced by a fresh probe.
+      expect(children).toHaveLength(2);
+      expect(terminateProcess).toHaveBeenCalledTimes(2);
+      expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
+      expect(terminateProcess.mock.calls[1]?.[0]).toBe(children[1]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("replaces the probe when the provider never answers a history load", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      let probeIndex = 0;
+      const listProbes: number[] = [];
+      const listSessions = vi.fn(async () => {
+        listProbes.push(probeIndex);
+        return {
+          sessions: [
+            {
+              sessionId: "mute",
+              cwd: "/Users/moonshot",
+              title: "mute",
+              updatedAt: "2026-06-13T00:00:00.000Z",
+            },
+          ],
+          nextCursor: null,
+        };
+      });
+      // The provider never answers, so the request stays pending on its side
+      // and the connection never becomes free again.
+      const loadSession = vi.fn(() => new Promise<never>(() => {}));
+
+      const { client, children } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+        onSpawn: (index) => {
+          probeIndex = index;
+        },
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      // Inside the slow threshold the probe is still considered usable.
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(children).toHaveLength(1);
+
+      // Once the threshold passes the probe is replaced, not kept.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(children).toHaveLength(2);
+      // The follow-up list page comes from the replacement probe instead of
+      // queueing behind the load the provider is still working on.
+      expect(listProbes).toEqual([0, 1]);
+
+      const result = await listing;
+      expect(result.map((session) => session.providerHandleId)).toEqual(["mute"]);
+      expect(result[0].firstPromptPreview).toBeNull();
+      expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("stops asking for previews when the listing budget is nearly spent", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      // The history budget is measured with the client clock. Moving it
+      // forward leaves less than the slow-load threshold for the load, so a
+      // load could only be abandoned by the guard - and the probe that would
+      // be replaced afterwards would cost a fresh process for a result nobody
+      // waits for.
+      let clock = 0;
+      const listSessions = vi.fn(async () => {
+        clock = 41_000;
+        return {
+          sessions: [
+            {
+              sessionId: "slow",
+              cwd: "/Users/moonshot",
+              title: "slow",
+              updatedAt: "2026-06-13T00:00:00.000Z",
+            },
+          ],
+          nextCursor: null,
+        };
+      });
+      const loadSession = vi.fn(() => new Promise<never>(() => {}));
+
+      const { client, children } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+        now: () => clock,
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+
+      // The session stays visible, without a preview, and no replacement
+      // probe is started for a load that the budget cannot pay for.
+      await expect(listing).resolves.toHaveLength(1);
+      expect(loadSession).not.toHaveBeenCalled();
+      expect(children).toHaveLength(1);
+      // Only the cleanup of the one probe that was started - no replacement
+      // probe was spawned for a load the budget cannot pay for.
+      expect(terminateProcess).toHaveBeenCalledTimes(1);
+      expect(terminateProcess.mock.calls[0]?.[0]).toBe(children[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("kills the live probe when the listing is aborted after a recycle", async () => {
+    vi.useFakeTimers();
+    try {
+      // The provider connection breaks when its process is killed, so the
+      // pending request rejects the same way it does in a real run.
+      let rejectPending: ((error: Error) => void) | undefined;
+      const terminateProcess = vi.fn(async () => {
+        rejectPending?.(new Error("probe terminated"));
+      });
+      let page = 0;
+      const listSessions = vi.fn(async () => {
+        page += 1;
+        return page === 1
+          ? {
+              sessions: [
+                {
+                  sessionId: "s1",
+                  cwd: "/Users/moonshot",
+                  title: "one",
+                  updatedAt: "2026-06-13T00:00:00.000Z",
+                },
+              ],
+              nextCursor: "cursor-2",
+            }
+          : {
+              sessions: [
+                {
+                  sessionId: "s2",
+                  cwd: "/Users/moonshot",
+                  title: "two",
+                  updatedAt: "2026-06-14T00:00:00.000Z",
+                },
+              ],
+              nextCursor: null,
+            };
+      });
+      // Every history stays unanswered: the provider is stuck on each of them.
+      const loadSession = vi.fn(
+        async () =>
+          await new Promise<never>((_resolve, reject) => {
+            rejectPending = reject;
+          }),
+      );
+
+      const { client, children } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+      });
+
+      const controller = new AbortController();
+      const listing = client.listImportableSessions({
+        cwd: "/Users/moonshot",
+        signal: controller.signal,
+      });
+      // The first history times out as slow and the probe is replaced.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(children).toHaveLength(2);
+      const killsBeforeAbort = terminateProcess.mock.calls.length;
+      controller.abort();
+
+      await expect(listing).rejects.toThrow(/aborted/);
+      // The probe that was alive at the moment of the abort is the one that
+      // gets killed, not the replaced one.
+      const killsAfterAbort = terminateProcess.mock.calls.slice(killsBeforeAbort);
+      expect(killsAfterAbort[0]?.[0]).toBe(children[1]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("stops asking a stuck probe for previews once the recycle budget is spent", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      const stuckSessions = Array.from({ length: 5 }, (_value, index) => ({
+        sessionId: `s${index + 1}`,
+        cwd: "/Users/moonshot",
+        title: `session ${index + 1}`,
+        updatedAt: "2026-06-13T00:00:00.000Z",
+      }));
+      const listSessions = vi.fn(async () => ({
+        sessions: stuckSessions,
+        nextCursor: null,
+      }));
+      const loadSession = vi.fn(async () => await new Promise<never>(() => {}));
+
+      const { client, children } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      await vi.advanceTimersByTimeAsync(20_000);
+      const result = await listing;
+
+      // The probe is replaced a bounded number of times; the last replacement
+      // only lists, so it is never asked for another preview.
+      expect(children).toHaveLength(5);
+      expect(loadSession).toHaveBeenCalledTimes(4);
+      // Every session stays visible, the ones without a preview included.
+      expect(result.map((session) => session.providerHandleId)).toEqual([
+        "s1",
+        "s2",
+        "s3",
+        "s4",
+        "s5",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("reads the later pages from a free probe once the recycle budget is spent", async () => {
+    vi.useFakeTimers();
+    try {
+      const terminateProcess = vi.fn(async () => {});
+      const firstPage = Array.from({ length: 5 }, (_value, index) => ({
+        sessionId: `s${index + 1}`,
+        cwd: "/Users/moonshot",
+        title: `session ${index + 1}`,
+        updatedAt: "2026-06-13T00:00:00.000Z",
+      }));
+      const secondPage = Array.from({ length: 3 }, (_value, index) => ({
+        sessionId: `s${index + 6}`,
+        cwd: "/Users/moonshot",
+        title: `session ${index + 6}`,
+        updatedAt: "2026-06-14T00:00:00.000Z",
+      }));
+      // A provider answers one request at a time, so a probe that still owes
+      // the provider an unanswered session/load never answers the next
+      // session/list either: the request only queues behind that load. Mocking
+      // an instant answer here would hide exactly the defect under test.
+      const busyProbes = new Set<number>();
+      let activeProbe = 0;
+      const listSessions = vi.fn(async (params?: { cursor?: string }) => {
+        if (busyProbes.has(activeProbe)) return await new Promise<never>(() => {});
+        return params?.cursor
+          ? { sessions: secondPage, nextCursor: null }
+          : { sessions: firstPage, nextCursor: "cursor-2" };
+      });
+      const loadSession = vi.fn(async () => {
+        busyProbes.add(activeProbe);
+        return await new Promise<never>(() => {});
+      });
+
+      const { client, children } = makeClient({
+        listSessions,
+        loadSession,
+        terminateProcess,
+        onSpawn: (index) => {
+          activeProbe = index;
+        },
+      });
+
+      const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
+      // Every history load stays unanswered, so the probe is replaced until the
+      // recycle budget is spent, and the page that follows still has to be
+      // read. Advancing past the session/list timeout as well proves that the
+      // scan does not wait on a probe it already knows to be stuck.
+      await vi.advanceTimersByTimeAsync(40_000);
+      const result = await listing;
+
+      expect(result.map((session) => session.providerHandleId)).toEqual([
+        "s1",
+        "s2",
+        "s3",
+        "s4",
+        "s5",
+        "s6",
+        "s7",
+        "s8",
+      ]);
+      // The sessions of the later page stay visible without a preview instead
+      // of the whole listing failing on a queued session/list.
+      expect(result.slice(5).every((session) => session.firstPromptPreview === null)).toBe(true);
+      // The stuck probe is closed, and the free one lists the rest.
+      expect(children).toHaveLength(5);
+      expect(terminateProcess.mock.calls.some((call) => call[0] === children[3])).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("aborts immediately when the signal is already aborted", async () => {
+    const terminateProcess = vi.fn(async () => {});
+    const listSessions = vi.fn(async () => ({
+      sessions: [
+        {
+          sessionId: "s1",
+          cwd: "/Users/moonshot",
+          title: "one",
+          updatedAt: "2026-06-13T00:00:00.000Z",
+        },
+      ],
+      nextCursor: null,
+    }));
+    const loadSession = vi.fn(async () => await new Promise<never>(() => {}));
+
+    const { client, children } = makeClient({
+      listSessions,
+      loadSession,
+      terminateProcess,
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      client.listImportableSessions({
+        cwd: "/Users/moonshot",
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow(/aborted/);
+    expect(listSessions).not.toHaveBeenCalled();
+    // The caller gave up before the probe existed, so no process is started
+    // at all - there is nothing left to terminate.
+    expect(children).toHaveLength(0);
+    expect(terminateProcess).not.toHaveBeenCalled();
+  });
+});
+
+describe("ACPAgentClient listImportableSessions without previews", () => {
+  // ACP has no cheap transcript read, so a preview costs a session/load - and
+  // minimax-code answers that by restoring the whole session: 322 MB of
+  // snapshots become 2.7 GB of RAM and a pinned CPU core. The import list still
+  // has to show those sessions, so the preview is the only thing it drops.
+  function makeClient(args: {
+    listSessions: ReturnType<typeof vi.fn>;
+    loadSession: ReturnType<typeof vi.fn>;
+    onSpawn?: (client: ACPClient | undefined) => void;
+  }) {
+    class TestACPAgentClient extends ACPAgentClient {
+      protected override async spawnProcess(
+        _launchEnv?: Record<string, string>,
+        options?: { client?: ACPClient },
+      ): Promise<SpawnedACPProcess> {
+        args.onSpawn?.(options?.client);
+        return {
+          child: {
+            kill: vi.fn(),
+            exitCode: 0,
+            signalCode: null,
+            once: vi.fn(),
+            stdin: { destroy: vi.fn() },
+            stdout: { destroy: vi.fn() },
+            stderr: { destroy: vi.fn() },
+          } as never,
+          connection: { listSessions: args.listSessions, loadSession: args.loadSession },
+          initialize: {
+            agentCapabilities: { sessionCapabilities: { list: {} }, loadSession: true },
+          },
+        } as unknown as SpawnedACPProcess;
+      }
+
+      protected override async closeProbe(): Promise<void> {}
+    }
+
+    return new TestACPAgentClient({
+      provider: "minimax-code",
+      logger: createTestLogger(),
+      defaultCommand: ["minimax-code", "acp"],
+      defaultModes: [],
+      terminateProcess: (async () => {}) as never,
+    });
+  }
+
+  test("lists descriptors without a single history load when previews are excluded", async () => {
+    const listSessions = vi.fn(async () => ({
+      sessions: [
+        {
+          sessionId: "huge",
+          cwd: "/Users/moonshot",
+          title: "Release notes for 2.0",
+          updatedAt: "2026-06-13T00:00:00.000Z",
+        },
+      ],
+      nextCursor: null,
+    }));
+    const loadSession = vi.fn(async () => {
+      throw new Error("session/load must not run when previews are excluded");
+    });
+
+    const client = makeClient({ listSessions, loadSession });
+
+    const result = await client.listImportableSessions({
+      cwd: "/Users/moonshot",
+      query: "release notes",
+      includePreviews: false,
+    });
+
+    // The provider is never asked to restore a session for the listing.
+    expect(loadSession).not.toHaveBeenCalled();
+    // The descriptor alone still describes the session, title included, so the
+    // manager can match a query against it without any preview text.
+    expect(result).toEqual([
+      {
+        providerHandleId: "huge",
+        cwd: "/Users/moonshot",
+        title: "Release notes for 2.0",
+        firstPromptPreview: null,
+        lastPromptPreview: null,
+        lastActivityAt: new Date("2026-06-13T00:00:00.000Z"),
+      },
+    ]);
+  });
+
+  test("loads prompt previews when the caller does not exclude them", async () => {
+    let probeClient: ACPClient | undefined;
+    const listSessions = vi.fn(async () => ({
+      sessions: [
+        {
+          sessionId: "small",
+          cwd: "/Users/moonshot",
+          title: "small",
+          updatedAt: "2026-06-13T00:00:00.000Z",
+        },
+      ],
+      nextCursor: null,
+    }));
+    const loadSession = vi.fn(async (params: { sessionId: string }) => {
+      await probeClient?.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "user_message_chunk",
+          messageId: "user-1",
+          content: { type: "text", text: "hello" },
+        } as SessionUpdate,
+      });
+    });
+
+    const client = makeClient({
+      listSessions,
+      loadSession,
+      onSpawn: (spawned) => {
+        probeClient = spawned;
+      },
+    });
+
+    const result = await client.listImportableSessions({ cwd: "/Users/moonshot", limit: 20 });
+
+    expect(loadSession).toHaveBeenCalledTimes(1);
+    expect(result[0].firstPromptPreview).toBe("hello");
+  });
 });
 
 describe("ACP providers advertise session listing", () => {
@@ -2480,6 +3303,24 @@ describe("ACP providers advertise session listing", () => {
   test("Copilot ACP client reports supportsSessionListing", () => {
     const client = new CopilotACPAgentClient({ logger: createTestLogger() });
     expect(client.capabilities.supportsSessionListing).toBe(true);
+  });
+
+  test("generic ACP clients report that import previews are not cheap", () => {
+    // The import list only skips previews for providers that say so, so this
+    // flag is what keeps a big minimax-code session from being restored into
+    // memory on every keystroke in the import search.
+    const client = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: ["minimax-code", "acp"],
+    });
+    expect(client.capabilities.importSessionPreviewsAreCheap).toBe(false);
+  });
+
+  test("Copilot ACP client reports that import previews are not cheap", () => {
+    // Copilot replaces the ACP capabilities wholesale, so without the flag it
+    // would keep loading every session to read its first prompt.
+    const client = new CopilotACPAgentClient({ logger: createTestLogger() });
+    expect(client.capabilities.importSessionPreviewsAreCheap).toBe(false);
   });
 });
 
@@ -2973,6 +3814,239 @@ describe("ACPAgentSession", () => {
         },
       },
     ]);
+  });
+
+  test("retries the prompt when the provider still owns the previous turn", async () => {
+    // A provider that just answered a cancelled prompt frees the session a
+    // moment later and refuses the next prompt in that window.
+    const session = createSession();
+    const turnIdDuringRetry: (string | null)[] = [];
+    const prompt = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      )
+      .mockImplementation(async () => {
+        turnIdDuringRetry.push(asInternals<ACPSessionInternals>(session).activeForegroundTurnId);
+        return { stopReason: "end_turn" };
+      });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt };
+
+    const { turnId } = await session.startTurn("hello");
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+
+    expect(prompt).toHaveBeenCalledTimes(2);
+    // The retried prompt carries the same message, so the run stays one run.
+    expect(prompt.mock.calls[1]?.[0]).toEqual(prompt.mock.calls[0]?.[0]);
+    // The foreground turn stays owned by the same run across the retry.
+    expect(turnIdDuringRetry).toEqual([turnId]);
+  });
+
+  test("does not deliver the prompt again after the turn was interrupted", async () => {
+    const session = createSession();
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+
+    // The user stops the turn while the busy retry waits for its pause.
+    const interruption = session.interrupt();
+    await interruption.catch(() => undefined);
+
+    // Give the retry its full pause, then let the interruption settle.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledWith({ sessionId: "session-1" });
+  });
+
+  test("does not retry a prompt that failed for another reason", async () => {
+    const session = createSession();
+    const prompt = vi.fn().mockRejectedValue(new Error("Internal error: something else"));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt };
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalled());
+
+    expect(prompt).toHaveBeenCalledTimes(1);
+  });
+
+  test("steers the running turn through the provider extension", async () => {
+    const session = createSession();
+    const extMethod = vi.fn().mockResolvedValue({ turnId: "native-turn-1", mode: "steered" });
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        version: 1,
+        methods: ["mcode/session/steer"],
+      },
+    };
+
+    const { turnId } = await session.startTurn("work");
+    const result = await session.steerActiveTurn!("answer with one word", {
+      expectedTurnId: turnId,
+      clientMessageId: "steer-1",
+    });
+
+    expect(result).toEqual({ status: "accepted" });
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/steer", {
+      sessionId: "session-1",
+      text: "answer with one word",
+      clientRequestId: "steer-1",
+    });
+  });
+
+  test("reports steering as unavailable when the provider never advertised the extension", async () => {
+    const session = createSession();
+    const extMethod = vi.fn();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+    const result = await session.steerActiveTurn!("follow up", { expectedTurnId: turnId });
+
+    expect(result).toEqual({ status: "unavailable" });
+    expect(extMethod).not.toHaveBeenCalled();
+  });
+
+  test("reports steering as unavailable when the provider does not implement the method", async () => {
+    const session = createSession();
+    const extMethod = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error("Method not found"), { code: -32601 }));
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+    const result = await session.steerActiveTurn!("follow up", { expectedTurnId: turnId });
+
+    expect(result).toEqual({ status: "unavailable" });
+  });
+
+  test("surfaces an ambiguous steer failure instead of retrying it", async () => {
+    const session = createSession();
+    const extMethod = vi.fn().mockRejectedValue(new Error("steer transport failed"));
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+
+    await expect(session.steerActiveTurn!("follow up", { expectedTurnId: turnId })).rejects.toThrow(
+      "steer transport failed",
+    );
+    expect(extMethod).toHaveBeenCalledOnce();
+  });
+
+  test("does not steer a prompt with attachments, because the extension carries text only", async () => {
+    const session = createSession();
+    const extMethod = vi.fn();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+    const result = await session.steerActiveTurn!(
+      [
+        { type: "text", text: "look at this" },
+        { type: "image", data: "AAAA", mimeType: "image/png" },
+      ],
+      { expectedTurnId: turnId },
+    );
+
+    expect(result).toEqual({ status: "unavailable" });
+    expect(extMethod).not.toHaveBeenCalled();
+  });
+
+  test("rejects a steer that the provider turned into a new turn", async () => {
+    const session = createSession();
+    const extMethod = vi.fn().mockResolvedValue({ turnId: "native-turn-2", mode: "activated" });
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+
+    await expect(session.steerActiveTurn!("follow up", { expectedTurnId: turnId })).rejects.toThrow(
+      "activated a new turn",
+    );
+  });
+
+  test("rejects a steer with an unknown disposition", async () => {
+    const session = createSession();
+    const extMethod = vi.fn().mockResolvedValue({ turnId: "native-turn-1", mode: "queued" });
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    const { turnId } = await session.startTurn("work");
+
+    await expect(session.steerActiveTurn!("follow up", { expectedTurnId: turnId })).rejects.toThrow(
+      "unknown steer disposition",
+    );
+  });
+
+  test("does not steer a turn that is no longer the active one", async () => {
+    const session = createSession();
+    const extMethod = vi.fn();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
+    };
+
+    await session.startTurn("work");
+    const result = await session.steerActiveTurn!("follow up", { expectedTurnId: "other-turn" });
+
+    expect(result).toEqual({ status: "unavailable" });
+    expect(extMethod).not.toHaveBeenCalled();
   });
 
   test("startTurn returns before the ACP prompt settles and completes later via subscribers", async () => {
@@ -4724,5 +5798,178 @@ describe("custom ACP provider with configured models", () => {
     const created = await createSessionOnModel(registry, "stale/removed-model");
 
     expect((await created.getRuntimeInfo()).model).toBe("advertised-default");
+  });
+});
+
+describe("ACP interruption contract — interruption waits for the provider to release the session", () => {
+  test("keeps a single foreground prompt, so a late answer cannot settle another turn", async () => {
+    const session = createSession();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    const internals = asInternals<ACPSessionInternals>(session);
+    internals.sessionId = "session-1";
+    internals.connection = { prompt, cancel };
+
+    await session.startTurn("hello");
+
+    // Only one foreground prompt may be in flight, so the map the
+    // interruption waits on holds exactly one entry. A late answer of an
+    // older prompt therefore cannot settle a newer turn.
+    await expect(session.startTurn("second")).rejects.toThrow(/already active/);
+    expect(internals.foregroundPrompts.size).toBe(1);
+  });
+
+  test("interrupt() does not resolve while the provider still owns the foreground turn", async () => {
+    const session = createSession();
+    let resolvePrompt!: (value: PromptResponse) => void;
+    const prompt = vi.fn(
+      () =>
+        new Promise<PromptResponse>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+
+    await session.startTurn("hello");
+
+    let interruptResolved = false;
+    const interrupt = session.interrupt().then(() => {
+      interruptResolved = true;
+      return;
+    });
+
+    // Let the cancellation notification and every pending microtask settle, so
+    // an implementation that resolves the interruption too early is observable.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(cancel).toHaveBeenCalledWith({ sessionId: "session-1" });
+
+    // The provider still owns the turn, so the interruption must not resolve
+    // yet: a caller that replaces the turn would otherwise send its prompt
+    // into a busy session.
+    expect(interruptResolved).toBe(false);
+
+    resolvePrompt({ stopReason: "cancelled", usage: { outputTokens: 0 } });
+    await interrupt;
+
+    expect(interruptResolved).toBe(true);
+  });
+
+  test("interrupt() rejects when the provider keeps the turn past the release timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const session = createSession();
+      const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+      const cancel = vi.fn().mockResolvedValue(undefined);
+
+      asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+      asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+
+      await session.startTurn("hello");
+
+      const assertion = expect(session.interrupt()).rejects.toThrow(
+        /still owns the foreground turn/,
+      );
+      await vi.advanceTimersByTimeAsync(2_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("interrupt() waits for the cancelled turn and not for a turn that starts later", async () => {
+    const session = createSession();
+    let resolvePrompt!: (value: PromptResponse) => void;
+    const prompt = vi.fn(
+      () =>
+        new Promise<PromptResponse>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+    // The provider answers the cancelled turn and starts another one while
+    // the cancellation notification is still in flight. The interruption must
+    // follow the turn it cancelled, not the newer one.
+    const cancel = vi.fn(async () => {
+      resolvePrompt({ stopReason: "cancelled", usage: { outputTokens: 0 } });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await session.startTurn("second");
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+
+    await session.startTurn("hello");
+
+    const interrupt = session.interrupt();
+    const outcome = await Promise.race([
+      interrupt.then(
+        () => "resolved",
+        (error: Error) => `rejected: ${error.message}`,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 500)),
+    ]);
+
+    expect(outcome).toBe("resolved");
+  });
+
+  test("interrupt() rejects when the provider never confirms the end of the turn", async () => {
+    const session = createSession();
+    let rejectPrompt!: (error: Error) => void;
+    const prompt = vi.fn(
+      () =>
+        new Promise<PromptResponse>((_resolve, reject) => {
+          rejectPrompt = reject;
+        }),
+    );
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+
+    await session.startTurn("hello");
+
+    const interrupt = session.interrupt();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // A rejected prompt never confirms that the provider released the session,
+    // so the interruption has to fail instead of reporting a free session.
+    rejectPrompt(new Error("provider rejected the prompt"));
+
+    await expect(interrupt).rejects.toThrow(/did not confirm the end of the foreground turn/);
+  });
+
+  test("interrupt() resolves when the provider process exits before it answers", async () => {
+    const session = createSession();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+
+    await session.startTurn("hello");
+
+    const interrupt = session.interrupt();
+
+    // A confirmed process exit ends the turn: the provider can no longer own
+    // the session, so waiting for its answer would hang forever.
+    asInternals<ACPSessionInternals>(session).handleProviderExit(1, null, []);
+
+    await expect(interrupt).resolves.toBeUndefined();
+  });
+
+  test("interrupt() resolves immediately when no foreground turn is running", async () => {
+    const session = createSession();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+
+    await expect(session.interrupt()).resolves.toBeUndefined();
+    expect(cancel).not.toHaveBeenCalled();
   });
 });

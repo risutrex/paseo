@@ -171,6 +171,12 @@ export interface AgentCapabilityFlags {
   supportsStreaming: boolean;
   supportsSessionPersistence: boolean;
   supportsSessionListing?: boolean;
+  /**
+   * Whether listing importable sessions can load each session's prompt preview
+   * at a bearable cost. `false` means the preview costs a full session restore
+   * on the provider side; `true` or `undefined` means previews are cheap.
+   */
+  importSessionPreviewsAreCheap?: boolean;
   supportsDynamicModes: boolean;
   supportsMcpServers: boolean;
   supportsNativePaseoTools?: boolean;
@@ -555,6 +561,19 @@ export interface ListImportableSessionsOptions {
    * sessions by working directory should do so before doing expensive work.
    */
   cwd?: string;
+  /**
+   * Whether the caller wants prompt previews on the returned sessions.
+   * Defaults to `true`. When `false`, a provider whose previews are expensive
+   * must not load them and reports `null` previews instead.
+   */
+  includePreviews?: boolean;
+  /**
+   * Aborts the listing. Providers that support it (currently the ACP adapter)
+   * must stop their work and release every resource they acquired for it, so
+   * an abandoned listing cannot leave a provider process running. Providers
+   * that do not support the signal may ignore it.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ImportableProviderSession {

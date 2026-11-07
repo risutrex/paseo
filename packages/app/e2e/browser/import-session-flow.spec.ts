@@ -49,6 +49,8 @@ interface ImportFlowScenario {
   worktreeDirectory: string;
   unrelatedDirectory: string;
   importSessionId: string;
+  /** A fixture session seeded outside the project, reachable only host-wide. */
+  unrelatedSessionId: string;
   importSessionTimestamp: number;
   repoCleanup(): Promise<void>;
   unrelatedCleanup(): Promise<void>;
@@ -95,11 +97,13 @@ test.beforeAll(async () => {
   };
   const reuseTarget = await openProjectViaDaemon(client, unrelated.path);
   const importSessionId = "fixture-custom-title";
+  const unrelatedSessionId = "fixture-unrelated";
   const importSessionTimestamp = await seedClaudeSessions({
     projectRoot: repo.path,
     worktreeDirectory,
     unrelatedDirectory: unrelated.path,
     importSessionId,
+    unrelatedSessionId,
   });
   scenario = {
     project: openedProject,
@@ -109,6 +113,7 @@ test.beforeAll(async () => {
     worktreeDirectory,
     unrelatedDirectory: unrelated.path,
     importSessionId,
+    unrelatedSessionId,
     importSessionTimestamp,
     repoCleanup: repo.cleanup,
     unrelatedCleanup: unrelated.cleanup,
@@ -189,6 +194,22 @@ test("captures the compact import-session journey", async ({ page }, testInfo) =
   await test.step("workspace actions start scoped and can widen to the host", async () => {
     await flow.openFromWorkspaceHeader();
     await capture(page, testInfo, "09-mobile-workspace-scoped.png");
+
+    await test.step("a search widens the scoped sheet to every project", async () => {
+      await flow.revealSession("fixture-root-01");
+      await expect(
+        page.getByTestId(`import-session-session-claude-${scenario.unrelatedSessionId}`),
+      ).toHaveCount(0);
+
+      await flow.searchAcrossHost("unrelated", scenario.unrelatedSessionId);
+      await flow.expectScope("Sessions on", false);
+      await capture(page, testInfo, "09b-mobile-search-widened.png");
+
+      // Clearing the text hands the scope back to the workspace.
+      await flow.clearSearch();
+      await flow.expectScope("This workspace");
+    });
+
     await flow.showAll();
     await flow.expectRows({
       folders: [["fixture-unrelated", scenario.reuseTarget.projectDisplayName]],
@@ -377,6 +398,7 @@ async function seedClaudeSessions(input: {
   worktreeDirectory: string;
   unrelatedDirectory: string;
   importSessionId: string;
+  unrelatedSessionId: string;
 }): Promise<number> {
   const sessions = [
     {
@@ -394,7 +416,7 @@ async function seedClaudeSessions(input: {
     },
     {
       cwd: input.unrelatedDirectory,
-      id: "fixture-unrelated",
+      id: input.unrelatedSessionId,
       title: "Unrelated directory notes",
       prompt: "Review the unrelated directory",
     },

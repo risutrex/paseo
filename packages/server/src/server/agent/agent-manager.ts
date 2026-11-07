@@ -283,6 +283,12 @@ export interface ImportableSessionProviderError {
 export interface ManagedImportableSessionsResult {
   sessions: ManagedImportableProviderSession[];
   providerErrors: ImportableSessionProviderError[];
+  /**
+   * True when at least one provider listed its sessions without prompt
+   * previews, because loading them would have cost a full session restore on
+   * the provider side.
+   */
+  previewsUnavailable?: boolean;
 }
 
 export type AgentAttentionCallback = (params: {
@@ -1116,22 +1122,37 @@ export class AgentManager {
     );
     const providerResults = await Promise.all(
       providerEntries.map(async ([provider, client]) => {
+        // A preview is only "cheap" when the provider can read it out of a
+        // descriptor or a transcript. ACP agents have to session/load, which
+        // makes the provider rebuild the whole conversation in memory (2.7 GB
+        // of RAM for one large minimax-code session), so the import list asks
+        // them for descriptors only.
+        const includePreviews = client.capabilities.importSessionPreviewsAreCheap !== false;
         try {
+          // The provider does expensive work for a listing (loading session
+          // histories). Give it an abort signal so an abandoned listing stops
+          // the provider instead of leaving it running in the background.
+          const controller = new AbortController();
           const sessions = await withTimeout(
             client.listImportableSessions!({
               limit: options?.limit,
               query: options?.query,
               scanLimit: options?.scanLimit,
               cwd: options?.cwd,
+              includePreviews,
+              signal: controller.signal,
             }),
             IMPORTABLE_SESSION_LIST_TIMEOUT_MS,
             `Timed out listing importable sessions for provider '${provider}' after ${IMPORTABLE_SESSION_LIST_TIMEOUT_MS}ms`,
-          );
+          ).finally(() => {
+            controller.abort();
+          });
           return {
             sessions: sessions
               .filter((session) => matchesImportableSessionQuery(session, options?.query))
               .map((session) => Object.assign(session, { provider })),
             error: null,
+            previewsUnavailable: !includePreviews,
           };
         } catch (error) {
           this.logger.warn(
@@ -1144,6 +1165,10 @@ export class AgentManager {
               provider,
               message: error instanceof Error ? error.message : String(error),
             },
+            // A failed listing produced no rows at all, so it says nothing about
+            // previews. Claiming otherwise would blame the search for an error
+            // the provider reported.
+            previewsUnavailable: false,
           };
         }
       }),
@@ -1156,6 +1181,9 @@ export class AgentManager {
         .sort((a, b) => b.lastActivityAt.getTime() - a.lastActivityAt.getTime())
         .slice(0, limit),
       providerErrors: providerResults.flatMap((result) => (result.error ? [result.error] : [])),
+      ...(providerResults.some((result) => result.previewsUnavailable)
+        ? { previewsUnavailable: true }
+        : {}),
     };
   }
 

@@ -1,0 +1,64 @@
+name: PR-Agent (Trinity)
+
+# Issues were enabled in this fork on 2026-10-31: GitHub does not deliver
+# issue_comment events while the repository has Issues turned off.
+# This workflow is intentionally limited to Lucian's fork and account.
+# Comment /review or /ask <question> in a PR's Conversation tab.
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: pr-agent-trinity-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  pr_agent:
+    if: >-
+      github.repository == 'risutrex/paseo' &&
+      github.event.sender.id == 346105760 &&
+      github.event.comment.user.id == 346105760 &&
+      github.event.issue.pull_request &&
+      (github.event.comment.body == '/review' ||
+       startsWith(github.event.comment.body, '/review ') ||
+       startsWith(github.event.comment.body, '/ask '))
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      # PR-Agent v0.49.0; its action wrapper otherwise pulls a mutable image.
+      - name: Run PR-Agent
+        uses: docker://pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.TRINITY_API_KEY }}
+          # LiteLLM appends /v1/messages unless it is already present.
+          ANTHROPIC_API_BASE: https://gate.trinity.guru/omni
+          CONFIG__MODEL: anthropic/deepseek-v4.1-flash
+          CONFIG__MODEL_WEAK: anthropic/deepseek-v4.1-flash
+          CONFIG__FALLBACK_MODELS: "[]"
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"
+          CONFIG__MAX_MODEL_TOKENS: "128000"
+          CONFIG__MAX_OUTPUT_TOKENS: "32000"
+          CONFIG__USE_REPO_SETTINGS_FILE: "false"
+          CONFIG__USE_GLOBAL_SETTINGS_FILE: "false"
+          CONFIG__ENABLE_PER_DIRECTORY_SETTINGS: "false"
+          CONFIG__REPO_CONTEXT_FILES: "[]"
+          CONFIG__LOG_LEVEL: INFO
+          CONFIG__PUBLISH_OUTPUT_PROGRESS: "false"
+          CONFIG__OUTPUT_RUN_DETAILS: "false"
+          CONFIG__RESTRICTED_MODE: "true"
+          CONFIG__ENABLE_AUTO_APPROVAL: "false"
+          CONFIG__NUM_RETRIES: "0"
+          CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: "false"
+          PR_REVIEWER__ENABLE_REVIEW_LABELS_SECURITY: "false"
+          PR_REVIEWER__ENABLE_REVIEW_LABELS_EFFORT: "false"
+          PR_QUESTIONS__RESOLVE_THREADS: "false"
+          GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "false"
+          GITHUB_ACTION_CONFIG__AUTO_REVIEW: "false"
+          GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "false"
+          GITHUB_ACTION_CONFIG__FAIL_ON_TOOL_ERRORS: "true"

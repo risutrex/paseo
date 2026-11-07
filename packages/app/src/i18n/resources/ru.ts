@@ -412,6 +412,7 @@ export const ru: TranslationResources = {
     scope: {
       host: "Сессии на {{host}}",
       workspace: "Это рабочее пространство",
+      widenedBySearch: "Ищем во всех каталогах, чтобы найти сессию из другого проекта.",
     },
     filters: {
       all: "Все",
@@ -428,6 +429,11 @@ export const ru: TranslationResources = {
       refresh: "Обновить список сессий",
       showAll: "Показать все",
       loadMore: "Загрузить ещё",
+      scopeToWorkspace: "Это рабочее пространство",
+    },
+    previews: {
+      unavailable:
+        "Некоторые провайдеры искались только по названию и папке — текст их промптов не загружался.",
     },
     preview: {
       untitledSession: "Сессия без названия",

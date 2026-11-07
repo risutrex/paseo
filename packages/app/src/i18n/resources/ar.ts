@@ -408,6 +408,7 @@ export const ar: TranslationResources = {
     scope: {
       host: "الجلسات على {{host}}",
       workspace: "مساحة العمل هذه",
+      widenedBySearch: "جارٍ البحث في كل المجلدات للعثور على جلسة من مشروع آخر.",
     },
     filters: {
       all: "الجميع",
@@ -424,6 +425,11 @@ export const ar: TranslationResources = {
       refresh: "تحديث الجلسات",
       showAll: "عرض الكل",
       loadMore: "تحميل المزيد",
+      scopeToWorkspace: "مساحة العمل هذه",
+    },
+    previews: {
+      unavailable:
+        "تم البحث في بعض المزوّدين حسب العنوان والمجلد فقط — لم يتم تحميل نص الطلبات الخاصة بها.",
     },
     preview: {
       untitledSession: "جلسة بلا عنوان",

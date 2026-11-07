@@ -418,6 +418,8 @@ const AgentCapabilityFlagsSchema: z.ZodType<AgentCapabilityFlags> = z
     supportsStreaming: z.boolean(),
     supportsSessionPersistence: z.boolean(),
     supportsSessionListing: z.boolean().optional(),
+    // Additive: older daemons omit it, older clients ignore it.
+    importSessionPreviewsAreCheap: z.boolean().optional(),
     supportsDynamicModes: z.boolean(),
     supportsMcpServers: z.boolean(),
     supportsReasoningStream: z.boolean(),
@@ -4328,6 +4330,10 @@ export const FetchRecentProviderSessionsResponseMessageSchema = z.object({
         }),
       )
       .optional(),
+    // Additive: true when at least one provider listed sessions without loading
+    // their prompt previews, so the client can tell the user why sessions show
+    // no prompt text. Omitted by older daemons, ignored by older clients.
+    previewsUnavailable: z.boolean().optional(),
   }),
 });
 

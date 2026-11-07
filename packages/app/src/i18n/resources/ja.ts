@@ -413,6 +413,8 @@ export const ja: TranslationResources = {
     scope: {
       host: "{{host}} のセッション",
       workspace: "このワークスペース",
+      widenedBySearch:
+        "別のプロジェクトのセッションを探すため、すべてのディレクトリを検索しています。",
     },
     filters: {
       all: "すべて",
@@ -429,6 +431,11 @@ export const ja: TranslationResources = {
       refresh: "セッションを更新",
       showAll: "すべて表示",
       loadMore: "さらに読み込む",
+      scopeToWorkspace: "このワークスペース",
+    },
+    previews: {
+      unavailable:
+        "一部のプロバイダーはタイトルとフォルダのみで検索されました。プロンプト本文は読み込まれていません。",
     },
     preview: {
       untitledSession: "無題のセッション",

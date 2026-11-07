@@ -409,6 +409,7 @@ export const ko: TranslationResources = {
     scope: {
       host: "{{host}}의 세션",
       workspace: "이 워크스페이스",
+      widenedBySearch: "다른 프로젝트의 세션을 찾기 위해 모든 디렉터리에서 검색 중입니다.",
     },
     filters: {
       all: "전체",
@@ -425,6 +426,11 @@ export const ko: TranslationResources = {
       refresh: "세션 새로고침",
       showAll: "전체 표시",
       loadMore: "더 보기",
+      scopeToWorkspace: "이 워크스페이스",
+    },
+    previews: {
+      unavailable:
+        "일부 프로바이더는 제목과 폴더만으로 검색되었습니다. 프롬프트 본문은 불러오지 않았습니다.",
     },
     preview: {
       untitledSession: "제목 없는 세션",
