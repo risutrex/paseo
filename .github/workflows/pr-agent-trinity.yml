@@ -35,11 +35,12 @@ jobs:
         uses: docker://pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The key and the endpoint of the model gateway are repository secrets,
-          # so a public fork does not publish either of them.
+          # The key is a repository secret, the endpoint of the model gateway
+          # is a repository variable: the key never leaves the runner, and the
+          # endpoint stays out of the workflow file of a public fork.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # LiteLLM appends /v1/messages unless it is already present.
-          ANTHROPIC_API_BASE: ${{ secrets.ANTHROPIC_API_BASE }}
+          ANTHROPIC_API_BASE: ${{ vars.ANTHROPIC_API_BASE }}
           CONFIG__MODEL: anthropic/deepseek-v4.1-flash
           CONFIG__MODEL_WEAK: anthropic/deepseek-v4.1-flash
           CONFIG__FALLBACK_MODELS: "[]"
