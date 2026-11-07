@@ -1,0 +1,120 @@
+name: AI Review (Gemini)
+
+# Бесплатный AI-ревьюер для PR в этом форке: тот же код, что будет работать в
+# upstream, чтобы проверять изменения до отправки PR туда.
+#
+# Безопасность:
+# - ключ GEMINI_API_KEY доступен только PR из веток этого же репозитория
+#   (ветки чужих форков отсекаются проверкой head.repo.full_name);
+# - pull_request_target не используется, код PR не исполняется с правами workflow;
+# - сторонние action'ы запинены на конкретный коммит;
+# - расширение code-review ставится из зафиксированного коммита, а не из ветки
+#   по умолчанию (см. шаг установки), версия Gemini CLI тоже зафиксирована;
+# - контейнер github-mcp-server запускается по digest, а не по тегу;
+# - у workflow нет права создавать релизы и деплоить.
+
+on:
+  pull_request:
+    # ready_for_review: черновики не ревьюятся при открытии, но получают ревью
+    # в момент, когда автор переводит PR в готовность.
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Ревьюер только читает PR и оставляет к нему комментарии. Право issues: write
+  # не нужно: комментарии идут через Review API, а MCP-инструменты ограничены
+  # списком includeTools ниже. Поэтому доступ сужен до минимума.
+  pull-requests: write
+
+jobs:
+  review:
+    # Только свои ветки: секрет не должен попасть к коду из чужого форка.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # ratchet:actions/checkout@v6
+        with:
+          persist-credentials: 'false'
+
+      # Расширение code-review раньше подтягивалось через with.extensions как
+      # https://github.com/gemini-cli-extensions/code-review, то есть из ветки по
+      # умолчанию. У run-gemini-cli нет способа передать --ref, поэтому при
+      # изменении ветки чужой код расширения выполнился бы в этой джобе с
+      # GITHUB_TOKEN (pull-requests: write) и GEMINI_API_KEY, минуя ревью.
+      # Теперь расширение ставится из зафиксированного коммита (тегов в
+      # репозитории расширения нет), а Gemini CLI — той же версией, что
+      # использует action ниже, чтобы шаги не разъехались.
+      - name: Install the pinned code-review extension
+        env:
+          GEMINI_CLI_VERSION: '0.67.0'
+          CODE_REVIEW_EXTENSION_REF: 'dd1a10d2c9d07b2ebade866590fdfa59cd8f9d04'
+        run: |
+          set -euo pipefail
+          npm install --silent --no-audit --prefer-offline --global "@google/gemini-cli@${GEMINI_CLI_VERSION}"
+          gemini extensions install \
+            https://github.com/gemini-cli-extensions/code-review \
+            --ref "${CODE_REVIEW_EXTENSION_REF}" \
+            --consent
+          gemini extensions list
+
+      - name: Run Gemini pull request review
+        uses: google-github-actions/run-gemini-cli@f77273f4c914e4bf38440cf36a0369cb64a37489 # ratchet:google-github-actions/run-gemini-cli@v0.1.22
+        env:
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REPOSITORY: ${{ github.repository }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+          ADDITIONAL_CONTEXT: 'Focus on correctness, races and resource leaks in the ACP provider code.'
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          # Версия зафиксирована: 'latest' — тоже изменяемая зависимость, а
+          # расширение выше ставится ровно этой версией CLI.
+          gemini_cli_version: '0.67.0'
+          gemini_model: '${{ vars.GEMINI_MODEL }}'
+          github_pr_number: ${{ github.event.pull_request.number }}
+          workflow_name: 'ai-review'
+          # Расширения здесь нет намеренно: расширение ставится шагом выше из
+          # зафиксированного коммита.
+          settings: |-
+            {
+              "model": {
+                "maxSessionTurns": 8
+              },
+              "telemetry": {
+                "enabled": true,
+                "target": "local",
+                "outfile": ".gemini/telemetry.log"
+              },
+              "mcpServers": {
+                "github": {
+                  "command": "docker",
+                  "args": [
+                    "run",
+                    "-i",
+                    "--rm",
+                    "-e",
+                    "GITHUB_PERSONAL_ACCESS_TOKEN",
+                    "ghcr.io/github/github-mcp-server@sha256:a1d43076a36638ee24520fd6e83c3905ae41bc9850179081df1de2ba3a7afae0"
+                  ],
+                  "includeTools": [
+                    "add_comment_to_pending_review",
+                    "pull_request_read",
+                    "pull_request_review_write"
+                  ],
+                  "env": {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+                  }
+                }
+              },
+              "tools": {
+                "core": []
+              }
+            }
+          prompt: '/pr-code-review'
