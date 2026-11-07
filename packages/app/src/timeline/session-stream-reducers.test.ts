@@ -233,6 +233,13 @@ describe("deriveAgentStreamTurnLiveness", () => {
       { type: "turn_completed", provider: "claude" },
       { type: "turn_failed", provider: "claude", error: "failed" },
       { type: "turn_canceled", provider: "claude", reason: "canceled" },
+      // The provider took the message into its queue: the session is free again
+      // even though this turn never streamed.
+      {
+        type: "turn_queued",
+        provider: "claude",
+        reason: "The provider took the message into its queue while it was busy",
+      },
     ] as AgentStreamEventPayload[]) {
       expect(
         deriveAgentStreamTurnLiveness([

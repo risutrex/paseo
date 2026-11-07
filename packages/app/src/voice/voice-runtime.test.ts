@@ -377,6 +377,26 @@ describe("voice runtime", () => {
     expect(engine.play).toHaveBeenCalled();
   });
 
+  it("returns to listening when the provider queues the turn instead of running it", async () => {
+    const adapter = createSessionAdapter();
+    const { runtime } = createRuntime();
+    runtime.registerSession(adapter);
+
+    await runtime.startVoice("server-1", "agent-1");
+    runtime.onTurnEvent("server-1", "agent-1", "turn_started");
+    await vi.waitFor(() => {
+      expect(runtime.getSnapshot().phase).toBe("waiting");
+    });
+
+    // The message sits in the provider's queue, so the session is free again and
+    // the runtime must not stay in its waiting phase.
+    runtime.onTurnEvent("server-1", "agent-1", "turn_queued");
+
+    await vi.waitFor(() => {
+      expect(runtime.getSnapshot().phase).toBe("listening");
+    });
+  });
+
   it("keeps local volume alone non-authoritative for playback interruption", async () => {
     const adapter = createSessionAdapter();
     const { runtime, engine } = createRuntime();

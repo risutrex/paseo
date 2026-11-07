@@ -13,6 +13,7 @@ interface ObservationScope {
 }
 function isTerminal(snapshot: AgentSnapshotPayload, event?: AgentStreamEvent): boolean {
   if (snapshot.status === "closed" || snapshot.status === "error") return true;
+  // A queued handoff is terminal too, but it is reported separately: see observeState.
   return (
     snapshot.status === "idle" &&
     (event?.type === "turn_completed" || event?.type === "turn_canceled")
@@ -33,6 +34,14 @@ function observeState(
     return;
   }
   if (event?.type === "turn_started") return;
+  if (event?.type === "turn_queued") {
+    // The provider owns the message now and will run it after its current turn,
+    // outside any Paseo turn. That turn produced no result, so the outcome is
+    // "queued / unknown": passing the last agent message would hand the previous
+    // answer over as the result of work that has not run yet.
+    buffer.push({ status: "queued", final: snapshot, lastMessage: null, error: null });
+    return;
+  }
   if (event?.type === "permission_requested") {
     buffer.push({
       status: "permission",

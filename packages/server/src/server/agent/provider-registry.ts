@@ -468,6 +468,7 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     respondToPermission: (requestId, response) => inner.respondToPermission(requestId, response),
     describePersistence: () => mapPersistenceHandle(provider, inner.describePersistence()),
     interrupt: () => inner.interrupt(),
+    stopBackgroundWork: inner.stopBackgroundWork?.bind(inner),
     close: () => inner.close(),
     canStopRuntime: inner.canStopRuntime?.bind(inner),
     listCommands: inner.listCommands?.bind(inner),
@@ -478,6 +479,8 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     revertFiles: inner.revertFiles?.bind(inner),
     revertBoth: inner.revertBoth?.bind(inner),
     tryHandleOutOfBand: inner.tryHandleOutOfBand?.bind(inner),
+    stopProviderDelegations: inner.stopProviderDelegations?.bind(inner),
+    getProviderQueue: inner.getProviderQueue?.bind(inner),
   } satisfies ForwardedAgentSession;
 }
 

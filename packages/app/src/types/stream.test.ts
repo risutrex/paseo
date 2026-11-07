@@ -1681,6 +1681,36 @@ describe("turn lifecycle events", () => {
     );
   });
 
+  it("flushes the streaming head when the provider queues the turn", () => {
+    const streaming = applyStreamEvent({
+      tail: [],
+      head: [],
+      event: assistantTimeline("Queued while the agent was busy.", "claude", "msg-queued"),
+      timestamp: new Date("2025-01-01T12:29:59Z"),
+    });
+    expect(streaming.head).toHaveLength(1);
+
+    const queued = applyStreamEvent({
+      tail: streaming.tail,
+      head: streaming.head,
+      event: {
+        type: "turn_queued" as const,
+        provider: "claude" as const,
+        reason: "The provider took the message into its queue while it was busy",
+      },
+      timestamp: new Date("2025-01-01T12:30:00Z"),
+    });
+
+    // The provider owns the message now. Leaving the row in the live head would
+    // keep the composer waiting for a turn that never streams here.
+    assert.deepStrictEqual(queued.head, []);
+    expect(queued.changedHead).toBe(true);
+    assert.deepStrictEqual(
+      queued.tail.map((item) => item.kind),
+      ["assistant_message"],
+    );
+  });
+
   it("hydrates canonical timeline rows without synthetic turn rows", () => {
     const state = hydrateStreamState([
       {

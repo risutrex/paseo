@@ -1,6 +1,6 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { EventEmitter, once } from "node:events";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -25,13 +25,16 @@ import {
 import {
   ACPAgentClient,
   ACPAgentSession,
+  MCODE_CLIENT_CAPABILITY_META,
   type SpawnedACPProcess,
   type SessionStateResponse,
   buildACPClientCapabilities,
   createLoggedNdJsonStream,
   deriveModelDefinitionsFromACP,
   deriveModesFromACP,
+  isMiniMaxCodeProvider,
   mapACPUsage,
+  mergeACPClientCapabilityMeta,
   resolveACPModeSelection,
   resolveACPModelSelection,
   summarizeACPRequestError,
@@ -63,6 +66,10 @@ import { buildProviderRegistry } from "../provider-registry.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { buildStringCommandShellInvocation } from "../../../utils/string-command-shell.js";
 import { asInternals } from "../../test-utils/class-mocks.js";
+import {
+  cancelInFlightImportProcess,
+  countInFlightImportProcesses,
+} from "../import-session-cancellation.js";
 import * as spawnUtils from "../../../utils/spawn.js";
 
 describe("buildACPClientCapabilities", () => {
@@ -107,9 +114,11 @@ interface ACPSessionInternals {
       method: string,
       params: Record<string, unknown>,
     ) => Promise<Record<string, unknown>>;
+    signal: AbortSignal;
   };
   agentMeta: Record<string, unknown> | null;
   activeForegroundTurnId: string | null;
+  foregroundPrompts: Map<string, unknown>;
   configOptions: SessionConfigOption[];
   translateSessionUpdate(update: SessionUpdate): AgentStreamEvent[];
   acpMcpServers(): unknown[];
@@ -118,6 +127,24 @@ interface ACPSessionInternals {
     signal: NodeJS.Signals | null,
     stderrChunks: string[],
   ): void;
+}
+
+function openPromptConnection(
+  prompt: (...args: unknown[]) => Promise<unknown>,
+): ACPSessionInternals["connection"] {
+  return {
+    prompt: prompt as ACPSessionInternals["connection"]["prompt"],
+    signal: new AbortController().signal,
+  };
+}
+
+function terminalEvents(events: AgentStreamEvent[]): AgentStreamEvent[] {
+  return events.filter(
+    (event) =>
+      event.type === "turn_completed" ||
+      event.type === "turn_failed" ||
+      event.type === "turn_canceled",
+  );
 }
 
 interface ACPModelSelectionInternals {
@@ -133,6 +160,7 @@ interface ACPModelSelectionInternals {
 }
 
 interface ACPConfiguredOverrideInternals {
+  applySessionState(response: SessionStateResponse): void;
   sessionId: string | null;
   connection: {
     setSessionMode: (input: { sessionId: string; modeId: string }) => Promise<void>;
@@ -437,6 +465,24 @@ function prepareConfiguredOverrideSession(
     configOptions: options.configOptions ?? [],
   }));
   const internals = asInternals<ACPConfiguredOverrideInternals>(session);
+  const availableModes = options.availableModes ?? [];
+  const modes =
+    availableModes.length > 0
+      ? {
+          currentModeId: options.currentMode ?? availableModes[0]!.id,
+          availableModes: availableModes.map((mode) => ({
+            id: mode.id,
+            label: mode.label,
+            description: mode.description,
+            name: mode.label,
+          })),
+        }
+      : undefined;
+  internals.applySessionState({
+    sessionId: "session-1",
+    modes,
+    configOptions: options.configOptions ?? [],
+  });
   internals.sessionId = "session-1";
   internals.connection = {
     setSessionMode,
@@ -603,6 +649,40 @@ describe("createLoggedNdJsonStream", () => {
 
     await writer.close();
     reader.releaseLock();
+  });
+});
+
+describe("isMiniMaxCodeProvider", () => {
+  test("recognizes the provider's own executable, not a path that mentions it", () => {
+    expect(isMiniMaxCodeProvider("minimax-code", ["minimax-code", "acp"])).toBe(true);
+    expect(isMiniMaxCodeProvider(undefined, ["/opt/tools/mcode", "acp"])).toBe(true);
+
+    // A custom ACP agent that merely lives under a directory called
+    // "minimax-experiments" is not MiniMax Code: sending it the vendor
+    // handshake announces extensions it does not understand.
+    expect(isMiniMaxCodeProvider("custom-acp", ["/Users/x/minimax-experiments/agent", "acp"])).toBe(
+      false,
+    );
+  });
+});
+
+describe("mergeACPClientCapabilityMeta", () => {
+  test("adds the vendor handshake to the user's own client metadata", () => {
+    // The provider answers its extension notifications only when the
+    // handshake carries the vendor key, while a user-supplied metadata object
+    // may still be needed. One must not replace the other.
+    expect(mergeACPClientCapabilityMeta(MCODE_CLIENT_CAPABILITY_META, { source: "user" })).toEqual({
+      "minimax-code/extensions": { version: 1, notifications: true },
+      source: "user",
+    });
+
+    // For the same key the user's fields win, and the rest of the vendor
+    // request survives.
+    expect(
+      mergeACPClientCapabilityMeta(MCODE_CLIENT_CAPABILITY_META, {
+        "minimax-code/extensions": { notifications: false },
+      }),
+    ).toEqual({ "minimax-code/extensions": { version: 1, notifications: false } });
   });
 });
 
@@ -2564,7 +2644,7 @@ describe("ACPAgentClient listImportableSessions while the probe handshake stalls
           connection: { initialize: args.initialize } as unknown as ClientSideConnection,
           stderrChunks: [],
           spawnReady: Promise.resolve(),
-          spawnError: new Promise<never>(() => {}),
+          processError: new Promise<never>(() => {}),
         };
       }
     }
@@ -3036,8 +3116,9 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
       await vi.advanceTimersByTimeAsync(20_000);
       const result = await listing;
 
-      // The probe is replaced a bounded number of times and then left alone.
-      expect(children).toHaveLength(4);
+      // The probe is replaced a bounded number of times; the last replacement
+      // only lists, so it is never asked for another preview.
+      expect(children).toHaveLength(5);
       expect(loadSession).toHaveBeenCalledTimes(4);
       // Every session stays visible, the ones without a preview included.
       expect(result.map((session) => session.providerHandleId)).toEqual([
@@ -3052,7 +3133,7 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
     }
   });
 
-  test("skips the previews of the later pages once the probe is known to be stuck", async () => {
+  test("reads the later pages from a free probe once the recycle budget is spent", async () => {
     vi.useFakeTimers();
     try {
       const terminateProcess = vi.fn(async () => {});
@@ -3068,26 +3149,40 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
         title: `session ${index + 6}`,
         updatedAt: "2026-06-14T00:00:00.000Z",
       }));
-      const listSessions = vi.fn(async (params?: { cursor?: string }) =>
-        params?.cursor
+      // A provider answers one request at a time, so a probe that still owes
+      // the provider an unanswered session/load never answers the next
+      // session/list either: the request only queues behind that load. Mocking
+      // an instant answer here would hide exactly the defect under test.
+      const busyProbes = new Set<number>();
+      let activeProbe = 0;
+      const listSessions = vi.fn(async (params?: { cursor?: string }) => {
+        if (busyProbes.has(activeProbe)) return await new Promise<never>(() => {});
+        return params?.cursor
           ? { sessions: secondPage, nextCursor: null }
-          : { sessions: firstPage, nextCursor: "cursor-2" },
-      );
-      const loadSession = vi.fn(async () => await new Promise<never>(() => {}));
+          : { sessions: firstPage, nextCursor: "cursor-2" };
+      });
+      const loadSession = vi.fn(async () => {
+        busyProbes.add(activeProbe);
+        return await new Promise<never>(() => {});
+      });
 
-      const { client } = makeClient({
+      const { client, children } = makeClient({
         listSessions,
         loadSession,
         terminateProcess,
+        onSpawn: (index) => {
+          activeProbe = index;
+        },
       });
 
       const listing = client.listImportableSessions({ cwd: "/Users/moonshot" });
-      await vi.advanceTimersByTimeAsync(20_000);
+      // Every history load stays unanswered, so the probe is replaced until the
+      // recycle budget is spent, and the page that follows still has to be
+      // read. Advancing past the session/list timeout as well proves that the
+      // scan does not wait on a probe it already knows to be stuck.
+      await vi.advanceTimersByTimeAsync(40_000);
       const result = await listing;
 
-      // The probe is replaced a bounded number of times and then left alone,
-      // so the sessions of the later page are listed without previews.
-      expect(loadSession).toHaveBeenCalledTimes(4);
       expect(result.map((session) => session.providerHandleId)).toEqual([
         "s1",
         "s2",
@@ -3098,7 +3193,12 @@ describe("ACPAgentClient listImportableSessions with a busy provider", () => {
         "s7",
         "s8",
       ]);
+      // The sessions of the later page stay visible without a preview instead
+      // of the whole listing failing on a queued session/list.
       expect(result.slice(5).every((session) => session.firstPromptPreview === null)).toBe(true);
+      // The stuck probe is closed, and the free one lists the rest.
+      expect(children).toHaveLength(5);
+      expect(terminateProcess.mock.calls.some((call) => call[0] === children[3])).toBe(true);
     } finally {
       vi.useRealTimers();
     }
@@ -3301,6 +3401,36 @@ describe("ACP providers advertise session listing", () => {
     const client = new CopilotACPAgentClient({ logger: createTestLogger() });
     expect(client.capabilities.importSessionPreviewsAreCheap).toBe(false);
   });
+
+  test("asks the provider for its extension notifications", () => {
+    // A provider that runs its own sub-agents sends their tree only when the
+    // client asked for extension notifications in the handshake. Without the
+    // request the background work of a session stays invisible.
+    const client = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: ["minimax-code", "acp"],
+    });
+    const meta = asInternals<{ clientCapabilityMeta: Record<string, unknown> }>(
+      client,
+    ).clientCapabilityMeta;
+    expect(meta).toMatchObject({
+      "minimax-code/extensions": { version: 1, notifications: true },
+    });
+  });
+  test("does not offer the MiniMax Code extensions to another ACP provider", () => {
+    // The extension request is a vendor handshake. Another ACP provider has
+    // no business receiving it, and a client that carries it announces
+    // capabilities the provider does not know.
+    const client = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: [process.execPath, "fake-acp-agent.mjs"],
+      providerId: "configured-acp",
+    });
+    const meta = asInternals<{ clientCapabilityMeta?: Record<string, unknown> }>(
+      client,
+    ).clientCapabilityMeta;
+    expect(meta).toBeUndefined();
+  });
 });
 
 describe("transformPiModels", () => {
@@ -3453,6 +3583,72 @@ describe("ACPAgentSession slash commands", () => {
         kind: "command",
       },
     ]);
+  });
+
+  test("lists late command batches through the public ACP client", async () => {
+    const artifacts = path.resolve(".artifacts");
+    await mkdir(artifacts, { recursive: true });
+    const directory = await mkdtemp(path.join(artifacts, "acp-command-inventory-"));
+    const script = path.join(directory, "agent.mjs");
+    await writeFile(
+      script,
+      `
+import { createInterface } from "node:readline";
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+const help = { name: "help", description: "Show available commands" };
+const skill = { name: "xlsx", description: "Work with spreadsheets", input: { hint: "[instructions]" } };
+const publish = (commands) => send({
+  jsonrpc: "2.0", method: "session/update", params: {
+    sessionId: "inventory-session", update: {
+      sessionUpdate: "available_commands_update", availableCommands: commands,
+    },
+  },
+});
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") {
+    send({ jsonrpc: "2.0", id: request.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+  } else if (request.method === "session/new") {
+    // The first batch is already cached when createSession returns.
+    publish([help]);
+    send({ jsonrpc: "2.0", id: request.id, result: { sessionId: "inventory-session" } });
+    setTimeout(() => publish([help]), 100);
+    setTimeout(() => publish([help, skill]), 350);
+  } else if (request.id !== undefined) {
+    send({ jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "Method not found" } });
+  }
+});
+`,
+    );
+    const client = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: [process.execPath, script],
+    });
+    try {
+      const session = await client.createSession({ provider: "acp", cwd: directory });
+      try {
+        const commands = await session.listCommands!();
+        expect(commands).toEqual([
+          {
+            name: "help",
+            description: "Show available commands",
+            argumentHint: "",
+            kind: "command",
+          },
+          {
+            name: "xlsx",
+            description: "Work with spreadsheets",
+            argumentHint: "[instructions]",
+            kind: "command",
+          },
+        ]);
+        expect(await session.listCommands!()).toEqual(commands);
+      } finally {
+        await session.close();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });
 
@@ -3813,7 +4009,10 @@ describe("ACPAgentSession", () => {
       });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      signal: new AbortController().signal,
+    };
 
     const { turnId } = await session.startTurn("hello");
     await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
@@ -3823,6 +4022,733 @@ describe("ACPAgentSession", () => {
     expect(prompt.mock.calls[1]?.[0]).toEqual(prompt.mock.calls[0]?.[0]);
     // The foreground turn stays owned by the same run across the retry.
     expect(turnIdDuringRetry).toEqual([turnId]);
+  });
+
+  test("queues the message when the provider is busy and offers a queue", async () => {
+    // The provider refuses the prompt because it still owns the previous turn.
+    // Its own error points at its queue, so the message goes there instead of
+    // being dropped with an error.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn().mockResolvedValue({ status: "queued", itemId: "item-1" });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(extMethod).toHaveBeenCalled());
+
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/enqueue", {
+      sessionId: "session-1",
+      text: "hello",
+    });
+    // The turn ends as queued, not as a failure: the message is not lost.
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+    expect(events.some((event) => event.type === "turn_queued")).toBe(true);
+    expect(
+      events.some((event) => event.type === "timeline" && event.item.type === "notification"),
+    ).toBe(true);
+  });
+
+  test("queues the message when the provider reports an active prompt", async () => {
+    // A provider that tracks its own prompt refuses the second one with its
+    // own wording instead of the runtime's busy message.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    const prompt = vi.fn().mockRejectedValue({
+      code: -32602,
+      message: "Invalid params: A prompt is already active for this session.",
+    });
+    const extMethod = vi.fn().mockResolvedValue({ status: "queued", itemId: "item-1" });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(extMethod).toHaveBeenCalled());
+
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/enqueue", {
+      sessionId: "session-1",
+      text: "hello",
+    });
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+    expect(events.some((event) => event.type === "turn_queued")).toBe(true);
+  });
+
+  test("does not report a queued turn when the provider answer carries no item id", async () => {
+    // The provider's status alone is not delivery: without an item id the message
+    // cannot be taken back, and no later stop could find it. Saying "queued" would
+    // promise a run that nothing on our side can point at.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string) =>
+      method === "mcode/session/queue/enqueue" ? { status: "queued" } : {},
+    );
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    const hasTurnFailed = (): boolean => events.some((event) => event.type === "turn_failed");
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(hasTurnFailed()).toBe(true));
+
+    expect(events.some((event) => event.type === "turn_queued")).toBe(false);
+    const failed = events.find(
+      (event): event is Extract<AgentStreamEvent, { type: "turn_failed" }> =>
+        event.type === "turn_failed",
+    );
+    expect(failed?.code).toBe("queue_unconfirmed");
+    expect(failed?.error).toMatch(/may still run it in a later turn/);
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    expect(
+      notifications.some(
+        (item) => item.level === "warning" && /did not confirm/.test(item.message),
+      ),
+    ).toBe(true);
+    // One request only: the provider does not deduplicate clientRequestId.
+    expect(
+      extMethod.mock.calls.filter(([method]) => method === "mcode/session/queue/enqueue"),
+    ).toHaveLength(1);
+  });
+
+  test("reports the provider queue when the provider advertises one", async () => {
+    // A queued message has no answer in the session stream, so the list is the
+    // only place its position can be seen - including after a reconnect, when the
+    // provider has already sent (and stopped replaying) its queue notifications.
+    const session = createSession();
+    const extMethod = vi.fn(async (method: string) => {
+      if (method !== "mcode/session/queue/list") {
+        throw new Error(`unexpected method ${method}`);
+      }
+      return {
+        items: [
+          {
+            itemId: "item-1",
+            sessionId: "session-1",
+            status: "queued",
+            content: "second thought",
+            createdAt: 1_700_000_000_000,
+          },
+        ],
+      };
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/list"] },
+    };
+
+    await expect(session.getProviderQueue()).resolves.toEqual([
+      {
+        itemId: "item-1",
+        text: "second thought",
+        status: "queued",
+        createdAt: new Date(1_700_000_000_000).toISOString(),
+      },
+    ]);
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/list", { sessionId: "session-1" });
+  });
+
+  test("does not ask a provider that never advertised a queue list", async () => {
+    // Guessing would turn a missing feature into an error the user cannot act on.
+    const session = createSession();
+    const extMethod = vi.fn();
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    await expect(session.getProviderQueue()).resolves.toEqual([]);
+    expect(extMethod).not.toHaveBeenCalled();
+  });
+
+  test("reports a message leaving the provider queue as a result it never gave", async () => {
+    // Measured against MiniMax Code 0.7.3: a queued message produces no
+    // session/update, so its answer never reaches the timeline. The only honest
+    // report is that the position left the queue and nothing came back.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    const notifications = (): string[] =>
+      events.flatMap((event) =>
+        event.type === "timeline" && event.item.type === "notification" ? [event.item.message] : [],
+      );
+
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-1",
+      items: [{ itemId: "item-1", status: "queued", content: "second thought", createdAt: 1 }],
+    });
+    // Seeing a position for the first time is not a departure.
+    expect(notifications()).toEqual([]);
+
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-1",
+      items: [],
+    });
+
+    expect(notifications().some((message) => /left the provider.s queue/.test(message))).toBe(true);
+  });
+
+  test("ignores a queue notification that belongs to another session", async () => {
+    // The provider may publish the queue of another session on the same client.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-2",
+      items: [{ itemId: "item-9", status: "queued", content: "elsewhere", createdAt: 1 }],
+    });
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-2",
+      items: [],
+    });
+
+    expect(events.some((event) => event.type === "timeline")).toBe(false);
+  });
+
+  test("reports the queue acceptance as unknown when the provider never answers", async () => {
+    // An enqueue that fails on the way back may still have landed. Repeating it could
+    // duplicate the message and calling it queued would invent a run, so the turn says
+    // exactly what is known.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async () => {
+      throw new Error("ACP extension request timed out");
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
+    };
+
+    const hasTurnFailed = (): boolean => events.some((event) => event.type === "turn_failed");
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(hasTurnFailed()).toBe(true));
+
+    expect(events.some((event) => event.type === "turn_queued")).toBe(false);
+    const failed = events.find(
+      (event): event is Extract<AgentStreamEvent, { type: "turn_failed" }> =>
+        event.type === "turn_failed",
+    );
+    expect(failed?.code).toBe("queue_unconfirmed");
+    expect(extMethod).toHaveBeenCalledTimes(1);
+  });
+
+  test("withdraws a message that lands in the queue after the stop", async () => {
+    // The stop arrives while queue/enqueue is still in flight, so there is no item id to
+    // delete yet. The answer has to take the item back itself: otherwise a message the
+    // user stopped waits in the provider's queue with nobody able to find it.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const enqueueStarted = Promise.withResolvers<void>();
+    const enqueueAnswer = Promise.withResolvers<unknown>();
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        enqueueStarted.resolve();
+        return enqueueAnswer.promise;
+      }
+      return { item: { itemId: "item-1", status: "cancelled" } };
+    });
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      cancel,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    await session.startTurn("hello");
+    await enqueueStarted.promise;
+
+    const deleteRequests = (): number =>
+      extMethod.mock.calls.filter(([method]) => method === "mcode/session/queue/delete").length;
+    // The stop finds nothing queued yet: the item only exists once the provider answers.
+    const stopping = session.interrupt();
+    await vi.waitFor(() => expect(deleteRequests()).toBe(0));
+    enqueueAnswer.resolve({ status: "queued", itemId: "item-1" });
+    await stopping;
+
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/delete", {
+      sessionId: "session-1",
+      itemId: "item-1",
+    });
+    // The turn is not reported as queued: its message no longer exists.
+    expect(events.some((event) => event.type === "turn_queued")).toBe(false);
+    expect(events.some((event) => event.type === "turn_canceled")).toBe(true);
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(true);
+    expect(notifications.some((item) => item.level === "warning")).toBe(false);
+  });
+
+  test("keeps a delegation snapshot that arrived before the manager subscribed", async () => {
+    // A session reads its delegation tree while it initializes, and the agent
+    // manager subscribes only afterwards. A child that already finished never
+    // publishes again, so a dropped first snapshot hides the delegated work of
+    // a reopened session for good.
+    const session = createSession();
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: {
+        schemaVersion: 1,
+        rootSessionId: "session-1",
+        members: [
+          {
+            sessionId: "child-1",
+            parentSessionId: "session-1",
+            agentName: "explore",
+            task: "List files",
+            status: "completed",
+            createdAtMs: 1_700_000_000_000,
+            updatedAtMs: 1_700_000_001_000,
+          },
+          {
+            sessionId: "child-2",
+            parentSessionId: "session-1",
+            agentName: "worker",
+            task: "Run the tests",
+            status: "completed",
+            createdAtMs: 1_700_000_000_000,
+            updatedAtMs: 1_700_000_002_000,
+          },
+        ],
+      },
+    });
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const publishedIds = events.map((event) =>
+      event.type === "provider_subagent" ? event.event.id : null,
+    );
+    expect(publishedIds.filter((id) => id !== null)).toEqual(["child-1", "child-2"]);
+
+    // The rows belong to the timeline once: a later subscriber does not get
+    // them a second time.
+    const laterEvents: AgentStreamEvent[] = [];
+    session.subscribe((event) => laterEvents.push(event));
+    expect(laterEvents.some((event) => event.type === "provider_subagent")).toBe(false);
+  });
+
+  test("publishes the provider's delegation tree as sub-agent rows", async () => {
+    // A provider that runs its own sub-agents keeps them out of the session
+    // list. The delegation tree is the only place they exist, and without it
+    // the background work of a session stays invisible.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: {
+        schemaVersion: 1,
+        rootSessionId: "session-1",
+        members: [
+          {
+            sessionId: "child-1",
+            parentSessionId: "session-1",
+            agentName: "explore",
+            task: "List files in the project",
+            status: "running",
+            createdAtMs: 1_700_000_000_000,
+            updatedAtMs: 1_700_000_001_000,
+          },
+        ],
+      },
+    });
+
+    expect(events).toEqual([
+      {
+        type: "provider_subagent",
+        provider: "claude-acp",
+        event: {
+          type: "upsert",
+          id: "child-1",
+          title: "List files in the project",
+          description: "explore",
+          status: "running",
+          // The parent is the session itself, not another sub-agent.
+          parentSubagentId: null,
+          timestamp: new Date(1_700_000_001_000).toISOString(),
+        },
+      },
+    ]);
+  });
+
+  test("keeps a sub-agent that has not started yet out of the finished state", async () => {
+    // Some providers project a child that has not started yet as finished, with
+    // the same timestamp for its creation and its last update. Reporting that
+    // as finished claims the work is done before it began.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    const member = (status: string, updatedAtMs: number) => ({
+      schemaVersion: 1,
+      rootSessionId: "session-1",
+      members: [
+        {
+          sessionId: "child-1",
+          parentSessionId: "session-1",
+          agentName: "explore",
+          task: "List files in the project",
+          status,
+          createdAtMs: 1_700_000_000_000,
+          updatedAtMs,
+        },
+      ],
+    });
+
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: member("completed", 1_700_000_000_000),
+    });
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: member("running", 1_700_000_000_500),
+    });
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: member("completed", 1_700_000_009_000),
+    });
+
+    expect(
+      events.map((event) => (event.type === "provider_subagent" ? event.event.status : undefined)),
+    ).toEqual(["running", "running", "completed"]);
+  });
+
+  test("does not republish an unchanged delegation tree", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    const snapshot = {
+      schemaVersion: 1,
+      rootSessionId: "session-1",
+      members: [
+        {
+          sessionId: "child-1",
+          parentSessionId: "session-1",
+          agentName: "explore",
+          task: "List files",
+          status: "completed",
+          updatedAtMs: 1_700_000_001_000,
+        },
+      ],
+    };
+
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot,
+    });
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot,
+    });
+
+    expect(events).toHaveLength(1);
+  });
+
+  test("maps a stopped delegation to a cancelled sub-agent", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    await session.extNotification("mcode/session/delegation_update", {
+      sessionId: "session-1",
+      snapshot: {
+        schemaVersion: 1,
+        rootSessionId: "session-1",
+        members: [
+          {
+            sessionId: "child-1",
+            parentSessionId: "session-1",
+            agentName: "worker",
+            task: "Background sleep",
+            status: "stopped",
+            updatedAtMs: 1_700_000_001_000,
+          },
+        ],
+      },
+    });
+
+    expect(events[0]).toMatchObject({
+      type: "provider_subagent",
+      event: { type: "upsert", id: "child-1", status: "canceled" },
+    });
+  });
+
+  test("takes the queued message back when the user stops after queueing it", async () => {
+    // The message lives in the provider's queue, not in the turn that queued
+    // it, so a Stop that only cancels the running turn still lets it run.
+    // The provider removes a queued item on request, so the stop has to ask.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      return { item: { itemId: "item-1", status: "cancelled" } };
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    await session.interrupt();
+
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/delete", {
+      sessionId: "session-1",
+      itemId: "item-1",
+    });
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    // The message was withdrawn, so nothing warns that it will still run.
+    expect(notifications.some((item) => item.level === "warning")).toBe(false);
+    expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(true);
+  });
+
+  test("says the queued message stays when the provider already claimed it", async () => {
+    // Once the provider takes the item for a turn, the removal is refused. A
+    // Stop cannot undo that, and telling the user otherwise is a lie.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      throw new Error("Queue item is not editable: session-1/item-1");
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    await session.interrupt();
+
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    const warning = notifications.find((item) => item.level === "warning");
+    expect(warning?.message).toMatch(/cannot be withdrawn/);
+    // The stop is not reported as a withdrawal that did not happen.
+    expect(notifications.some((item) => /will not run/.test(item.message))).toBe(false);
+  });
+
+  test("fails the turn when the provider is busy and offers no queue", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+    });
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn().mockResolvedValue({});
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": { methods: ["mcode/session/steer"] },
+    };
+
+    const hasTurnFailed = (): boolean => events.some((event) => event.type === "turn_failed");
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(hasTurnFailed()).toBe(true));
+
+    // A provider without a queue keeps the old behaviour: the user sees the
+    // failure instead of a promise the provider will not keep.
+    expect(extMethod).not.toHaveBeenCalled();
+    expect(events.some((event) => event.type === "turn_queued")).toBe(false);
+  });
+
+  test("closes the turn when the user stops it while the busy retry waits", async () => {
+    // The retry pause is a window where the turn has no provider answer yet.
+    // A Stop in that window has to end the turn itself: a turn left open keeps
+    // the session busy for good, refusing every later prompt.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      )
+      .mockResolvedValue({ stopReason: "end_turn" });
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
+
+    const { turnId } = await session.startTurn("hello");
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+
+    await session.interrupt().catch(() => undefined);
+
+    const canceledTurnIds = events.flatMap((event) =>
+      event.type === "turn_canceled" ? [event.turnId] : [],
+    );
+    expect(canceledTurnIds).toEqual([turnId]);
+
+    // The stopped session takes the next prompt instead of reporting a
+    // foreground turn that no longer exists.
+    await expect(session.startTurn("again")).resolves.toEqual({ turnId: expect.any(String) });
+    expect(asInternals<ACPSessionInternals>(session).activeForegroundTurnId).toBeNull();
   });
 
   test("does not deliver the prompt again after the turn was interrupted", async () => {
@@ -3837,7 +4763,11 @@ describe("ACPAgentSession", () => {
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
     await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
@@ -3858,7 +4788,10 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn().mockRejectedValue(new Error("Internal error: something else"));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
     await vi.waitFor(() => expect(prompt).toHaveBeenCalled());
@@ -3872,7 +4805,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": {
         version: 1,
@@ -3900,7 +4837,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/queue/enqueue"] },
     };
@@ -3920,7 +4861,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -3937,7 +4882,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -3956,7 +4905,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -3980,7 +4933,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -3998,7 +4955,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -4016,7 +4977,11 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, extMethod };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
     asInternals<ACPSessionInternals>(session).agentMeta = {
       "minimax-code/extensions": { version: 1, methods: ["mcode/session/steer"] },
     };
@@ -4040,7 +5005,7 @@ describe("ACPAgentSession", () => {
     );
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = openPromptConnection(prompt);
 
     session.subscribe((event) => {
       events.push(event as { type: string; turnId?: string });
@@ -4078,7 +5043,7 @@ describe("ACPAgentSession", () => {
     );
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = openPromptConnection(prompt);
 
     session.subscribe((event) => {
       events.push(event);
@@ -4127,7 +5092,7 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = openPromptConnection(prompt);
 
     session.subscribe((event) => {
       events.push(event);
@@ -4154,7 +5119,7 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = openPromptConnection(prompt);
 
     session.subscribe((event) => {
       events.push(event);
@@ -4198,7 +5163,7 @@ describe("ACPAgentSession", () => {
     );
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = openPromptConnection(prompt);
 
     session.subscribe((event) => {
       events.push(event);
@@ -4259,7 +5224,7 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = openPromptConnection(prompt);
 
     session.subscribe((event) => {
       events.push(event);
@@ -4298,7 +5263,7 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = openPromptConnection(prompt);
 
     session.subscribe((event) => {
       events.push(event);
@@ -4351,7 +5316,7 @@ describe("ACPAgentSession", () => {
     const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = openPromptConnection(prompt);
 
     session.subscribe((event) => {
       events.push(event);
@@ -4400,7 +5365,7 @@ describe("ACPAgentSession", () => {
     );
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = openPromptConnection(prompt);
 
     session.subscribe((event) => {
       events.push(event as { type: string; turnId?: string; error?: string });
@@ -4433,7 +5398,7 @@ describe("ACPAgentSession", () => {
     );
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt };
+    asInternals<ACPSessionInternals>(session).connection = openPromptConnection(prompt);
     session.subscribe((event) => events.push(event));
 
     const { turnId } = await session.startTurn([
@@ -4538,6 +5503,148 @@ describe("ACPAgentSession", () => {
       error: expect.not.stringContaining("[object Object]"),
     });
   });
+
+  function fakeACPAgent(prompt: Agent["prompt"]): Agent {
+    return {
+      async initialize() {
+        return { protocolVersion: PROTOCOL_VERSION, agentCapabilities: {} };
+      },
+      async newSession() {
+        return { sessionId: "session-1" };
+      },
+      prompt,
+      async authenticate() {},
+      async cancel() {},
+    };
+  }
+
+  async function connectInMemoryACPAgent(
+    agent: Agent,
+    options: { closeAfterPromptResponse?: boolean } = {},
+  ): Promise<{
+    agentConnection: AgentSideConnection;
+    connection: ClientSideConnection;
+    sessionId: string;
+    closeTransport: () => Promise<void>;
+  }> {
+    const clientToAgent = new TransformStream<Uint8Array, Uint8Array>();
+    const agentToClient = new TransformStream<Uint8Array, Uint8Array>();
+    const agentOutput = agentToClient.writable.getWriter();
+    const decoder = new TextDecoder();
+    const agentConnection = new AgentSideConnection(
+      () => agent,
+      ndJsonStream(
+        new WritableStream<Uint8Array>({
+          async write(chunk) {
+            await agentOutput.write(chunk);
+            if (options.closeAfterPromptResponse && decoder.decode(chunk).includes("stopReason")) {
+              await agentOutput.close();
+            }
+          },
+        }),
+        clientToAgent.readable,
+      ),
+    );
+    const connection = new ClientSideConnection(
+      () => ({
+        async requestPermission() {
+          return { outcome: { outcome: "cancelled" } };
+        },
+        async sessionUpdate() {},
+      }),
+      ndJsonStream(clientToAgent.writable, agentToClient.readable),
+    );
+    await connection.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: {},
+      clientInfo: { name: "Paseo test", version: "dev" },
+    });
+    const { sessionId } = await connection.newSession({
+      cwd: "/tmp/paseo-acp-test",
+      mcpServers: [],
+    });
+    return {
+      agentConnection,
+      connection,
+      sessionId,
+      closeTransport: () => agentOutput.close(),
+    };
+  }
+
+  test("startTurn fails instead of hanging when the ACP connection has closed", async () => {
+    const agent = await connectInMemoryACPAgent(
+      fakeACPAgent(async () => ({ stopReason: "end_turn" })),
+    );
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    asInternals<ACPSessionInternals>(session).sessionId = agent.sessionId;
+    asInternals<ACPSessionInternals>(session).connection = agent.connection;
+
+    await agent.closeTransport();
+    await agent.connection.closed;
+
+    await expect(session.startTurn("second")).rejects.toThrow("ACP agent disconnected");
+    expect(events.some((event) => event.type === "turn_started")).toBe(false);
+    expect(asInternals<ACPSessionInternals>(session).activeForegroundTurnId).toBeNull();
+  }, 2_000);
+
+  test("a prompt whose ACP transport closes mid-turn fails the turn", async () => {
+    let promptReceived!: () => void;
+    const received = new Promise<void>((resolve) => {
+      promptReceived = resolve;
+    });
+    const agent = await connectInMemoryACPAgent(
+      fakeACPAgent(() => {
+        promptReceived();
+        return new Promise(() => {});
+      }),
+    );
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    asInternals<ACPSessionInternals>(session).sessionId = agent.sessionId;
+    asInternals<ACPSessionInternals>(session).connection = agent.connection;
+
+    const { turnId } = await session.startTurn("hello");
+    await received;
+    await agent.closeTransport();
+
+    await vi.waitFor(
+      () =>
+        expect(terminalEvents(events)).toEqual([
+          expect.objectContaining({
+            type: "turn_failed",
+            turnId,
+            error: "ACP agent disconnected",
+          }),
+        ]),
+      { timeout: 1_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(terminalEvents(events)).toHaveLength(1);
+    expect(asInternals<ACPSessionInternals>(session).activeForegroundTurnId).toBeNull();
+  }, 3_000);
+
+  test("a turn answered just before its ACP transport closes still completes", async () => {
+    const agent = await connectInMemoryACPAgent(
+      fakeACPAgent(async () => ({ stopReason: "end_turn" })),
+      { closeAfterPromptResponse: true },
+    );
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    asInternals<ACPSessionInternals>(session).sessionId = agent.sessionId;
+    asInternals<ACPSessionInternals>(session).connection = agent.connection;
+
+    const { turnId } = await session.startTurn("hello");
+    await agent.connection.closed;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(terminalEvents(events)).toEqual([
+      expect.objectContaining({ type: "turn_completed", turnId }),
+    ]);
+  }, 3_000);
 });
 
 interface ACPCloseInternals {
@@ -4625,7 +5732,11 @@ describe("ACPAgentSession close() tree-kill", () => {
       internals.sessionId = "session-1";
       internals.activeForegroundTurnId = "turn-1";
       internals.agentCapabilities = { sessionCapabilities: { close: {} } };
-      internals.connection = { cancel, unstable_closeSession: unstableCloseSession };
+      internals.connection = {
+        cancel,
+        unstable_closeSession: unstableCloseSession,
+        signal: new AbortController().signal,
+      };
 
       let settled = false;
       const closing = (async () => {
@@ -5477,6 +6588,109 @@ describe("ACPAgentSession close() with an unresponsive provider", () => {
   }, 15_000);
 });
 
+const EXITING_ACP_AGENT = `
+import { Readable, Writable } from "node:stream";
+const { AgentSideConnection, PROTOCOL_VERSION, ndJsonStream } = await import(process.env.ACP_SDK_URL);
+new AgentSideConnection(
+  () => ({
+    async initialize() {
+      return { protocolVersion: PROTOCOL_VERSION, agentCapabilities: {} };
+    },
+    async newSession() {
+      return { sessionId: "exiting-session" };
+    },
+    async authenticate() {},
+    async cancel() {},
+    async prompt({ prompt }) {
+      if (prompt[0]?.text === "crash") {
+        process.stderr.write("fixture crash\\n");
+        process.exit(3);
+      }
+      setTimeout(() => process.exit(0), 100);
+      return { stopReason: "end_turn" };
+    },
+  }),
+  ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin)),
+);
+`;
+
+describe("ACPAgentSession after its provider process exits", () => {
+  let dir: string | null = null;
+  let session: ACPAgentSession | null = null;
+
+  afterEach(async () => {
+    await session?.close();
+    session = null;
+    if (dir) await rm(dir, { recursive: true, force: true });
+    dir = null;
+  });
+
+  async function startExitingProvider(): Promise<ACPAgentSession> {
+    dir = await mkdtemp(path.join(tmpdir(), "paseo-acp-exiting-"));
+    const agentScript = path.join(dir, "agent.mjs");
+    await writeFile(agentScript, EXITING_ACP_AGENT);
+    session = new ACPAgentSession(
+      { provider: "exiting-acp", cwd: dir },
+      {
+        provider: "exiting-acp",
+        logger: createTestLogger(),
+        defaultCommand: [process.execPath, agentScript],
+        defaultModes: [],
+        capabilities: { supportsStreaming: true, supportsSessionPersistence: true },
+        launchEnv: {
+          ACP_SDK_URL: pathToFileURL(
+            createRequire(import.meta.url).resolve("@agentclientprotocol/sdk"),
+          ).href,
+        },
+      },
+    );
+    await session.initializeNewSession();
+    return session;
+  }
+
+  test("startTurn after the provider exits while idle fails instead of hanging", async () => {
+    const provider = await startExitingProvider();
+    const events: AgentStreamEvent[] = [];
+    provider.subscribe((event) => events.push(event));
+    const internals = asInternals<{ child: ChildProcess; connection: ClientSideConnection }>(
+      provider,
+    );
+    const { child, connection } = internals;
+
+    const { turnId } = await provider.startTurn("first");
+    await vi.waitFor(() =>
+      expect(terminalEvents(events)).toEqual([
+        expect.objectContaining({ type: "turn_completed", turnId }),
+      ]),
+    );
+    if (child.exitCode === null) await once(child, "exit");
+    await connection.closed;
+
+    await expect(provider.startTurn("second")).rejects.toThrow(
+      "ACP agent disconnected (exit code 0)",
+    );
+    expect(terminalEvents(events)).toHaveLength(1);
+  }, 10_000);
+
+  test("a provider that crashes mid-turn still reports its exit status", async () => {
+    const provider = await startExitingProvider();
+    const events: AgentStreamEvent[] = [];
+    provider.subscribe((event) => events.push(event));
+
+    const { turnId } = await provider.startTurn("crash");
+    await vi.waitFor(() => expect(terminalEvents(events)).toHaveLength(1), { timeout: 3_000 });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(terminalEvents(events)).toEqual([
+      expect.objectContaining({
+        type: "turn_failed",
+        turnId,
+        error: "ACP agent exited unexpectedly (3)",
+      }),
+    ]);
+  }, 10_000);
+});
+
 // An ACP agent that advertises two models (or none, with ACP_ADVERTISE_MODELS=none) but,
 // like Cline, runs any model id it is given.
 const PERMISSIVE_MODEL_ACP_AGENT = `
@@ -5781,6 +6995,24 @@ describe("custom ACP provider with configured models", () => {
 });
 
 describe("ACP interruption contract — interruption waits for the provider to release the session", () => {
+  test("keeps a single foreground prompt, so a late answer cannot settle another turn", async () => {
+    const session = createSession();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    const internals = asInternals<ACPSessionInternals>(session);
+    internals.sessionId = "session-1";
+    internals.connection = { prompt, cancel, signal: new AbortController().signal };
+
+    await session.startTurn("hello");
+
+    // Only one foreground prompt may be in flight, so the map the
+    // interruption waits on holds exactly one entry. A late answer of an
+    // older prompt therefore cannot settle a newer turn.
+    await expect(session.startTurn("second")).rejects.toThrow(/already active/);
+    expect(internals.foregroundPrompts.size).toBe(1);
+  });
+
   test("interrupt() does not resolve while the provider still owns the foreground turn", async () => {
     const session = createSession();
     let resolvePrompt!: (value: PromptResponse) => void;
@@ -5793,7 +7025,11 @@ describe("ACP interruption contract — interruption waits for the provider to r
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
 
@@ -5828,7 +7064,11 @@ describe("ACP interruption contract — interruption waits for the provider to r
       const cancel = vi.fn().mockResolvedValue(undefined);
 
       asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-      asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+      asInternals<ACPSessionInternals>(session).connection = {
+        prompt,
+        cancel,
+        signal: new AbortController().signal,
+      };
 
       await session.startTurn("hello");
 
@@ -5861,7 +7101,11 @@ describe("ACP interruption contract — interruption waits for the provider to r
     });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
 
@@ -5889,7 +7133,11 @@ describe("ACP interruption contract — interruption waits for the provider to r
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
 
@@ -5909,7 +7157,11 @@ describe("ACP interruption contract — interruption waits for the provider to r
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await session.startTurn("hello");
 
@@ -5928,9 +7180,275 @@ describe("ACP interruption contract — interruption waits for the provider to r
     const cancel = vi.fn().mockResolvedValue(undefined);
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
-    asInternals<ACPSessionInternals>(session).connection = { prompt, cancel };
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      cancel,
+      signal: new AbortController().signal,
+    };
 
     await expect(session.interrupt()).resolves.toBeUndefined();
     expect(cancel).not.toHaveBeenCalled();
+  });
+});
+
+describe("ACP import cancellation", () => {
+  const IMPORT_SESSION_ID = "big-history-session";
+
+  function createImportPersistenceHandle(): AgentPersistenceHandle {
+    return {
+      provider: "claude-acp",
+      sessionId: IMPORT_SESSION_ID,
+      metadata: { provider: "claude-acp", cwd: "/tmp/paseo-acp-test" },
+    };
+  }
+
+  /**
+   * Stands in for the provider process. Importing is a session/load, so the
+   * load is what hangs while the user waits; the abort has to end the child.
+   */
+  function makeImportSession(args: {
+    spawn: () => Promise<SpawnedACPProcess>;
+    terminateProcess: ProcessTerminator;
+  }) {
+    class TestSession extends ACPAgentSession {
+      protected override async spawnProcess(): Promise<SpawnedACPProcess> {
+        return await args.spawn();
+      }
+    }
+
+    return new TestSession(
+      { provider: "claude-acp", cwd: "/tmp/paseo-acp-test" },
+      {
+        provider: "claude-acp",
+        logger: createTestLogger(),
+        defaultCommand: ["claude", "--acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+        handle: createImportPersistenceHandle(),
+        terminateProcess: args.terminateProcess,
+      },
+    );
+  }
+
+  function makeSpawned(
+    child: ChildProcessWithoutNullStreams,
+    loadSession: ReturnType<typeof vi.fn>,
+  ) {
+    return {
+      child,
+      connection: {
+        prompt: vi.fn(),
+        loadSession,
+        unstable_resumeSession: vi.fn(),
+      } as unknown as ClientSideConnection,
+      initialize: { agentCapabilities: { loadSession: true } },
+    } as SpawnedACPProcess;
+  }
+
+  test("cancelling an import kills the process that is loading the history", async () => {
+    const terminate = new FakeTerminator();
+    const child = createProbeChildStub();
+    let loadStarted: () => void = () => {};
+    const loadStartedPromise = new Promise<void>((resolve) => {
+      loadStarted = resolve;
+    });
+    const loadSession = vi.fn(() => {
+      loadStarted();
+      // The provider rebuilds the whole conversation and never answers.
+      return new Promise<never>(() => {});
+    });
+    const session = makeImportSession({
+      spawn: async () => makeSpawned(child, loadSession),
+      terminateProcess: terminate.terminate,
+    });
+
+    const resuming = session.initializeResumedSession();
+    await loadStartedPromise;
+    expect(countInFlightImportProcesses("claude-acp", IMPORT_SESSION_ID)).toBe(1);
+
+    await expect(cancelInFlightImportProcess("claude-acp", IMPORT_SESSION_ID)).resolves.toBe(1);
+
+    // The resume ends as cancelled instead of waiting for a history nobody will
+    // look at, and the process that was loading it is gone.
+    await expect(resuming).rejects.toThrow(/session import was cancelled/);
+    expect(terminate.terminated[0]).toBe(child);
+    expect(countInFlightImportProcesses("claude-acp", IMPORT_SESSION_ID)).toBe(0);
+  });
+
+  test("an import cancelled during the handshake stops the process that starts afterwards", async () => {
+    const terminate = new FakeTerminator();
+    const child = createProbeChildStub();
+    let releaseSpawn: (spawned: SpawnedACPProcess) => void = () => {};
+    const session = makeImportSession({
+      spawn: () =>
+        new Promise<SpawnedACPProcess>((resolve) => {
+          releaseSpawn = resolve;
+        }),
+      terminateProcess: terminate.terminate,
+    });
+
+    const resuming = session.initializeResumedSession();
+    await expect(cancelInFlightImportProcess("claude-acp", IMPORT_SESSION_ID)).resolves.toBe(1);
+    await expect(resuming).rejects.toThrow(/session import was cancelled/);
+
+    releaseSpawn(makeSpawned(child, vi.fn()));
+
+    await vi.waitFor(() => {
+      expect(terminate.terminated).toContain(child);
+    });
+  });
+});
+
+describe("provider delegation stop", () => {
+  const STOP_METHOD = "mcode/session/delegation/stop";
+  const GET_METHOD = "mcode/session/delegation/get";
+  const EXTENSIONS_KEY = "minimax-code/extensions";
+
+  function stubDelegationConnection(args: { stopResponse?: unknown; snapshot?: unknown }): {
+    connection: ACPSessionInternals["connection"];
+    extMethod: ReturnType<typeof vi.fn>;
+  } {
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === STOP_METHOD) {
+        return args.stopResponse ?? { receipt: {} };
+      }
+      if (method === GET_METHOD) {
+        return args.snapshot ?? { snapshot: { schemaVersion: 1, members: [] } };
+      }
+      return {};
+    });
+    return {
+      extMethod,
+      connection: { prompt: vi.fn(), extMethod } as unknown as ACPSessionInternals["connection"],
+    };
+  }
+
+  test("calls the stop on the root session and reads what actually stopped from the tree", async () => {
+    // A child is not an addressable turn: only the root id stops the tree. The
+    // receipt comes back with an empty stoppedSessionIds and calls the root
+    // stopped either way, so the answer is `acknowledged` and the rows carry the
+    // statuses the user reads.
+    const session = createSession();
+    const internals = asInternals<ACPSessionInternals>(session);
+    internals.sessionId = "root-1";
+    internals.agentMeta = { [EXTENSIONS_KEY]: { methods: [GET_METHOD, STOP_METHOD] } };
+    const stub = stubDelegationConnection({
+      stopResponse: {
+        receipt: {
+          schemaVersion: 1,
+          rootSessionId: "root-1",
+          rootStopped: true,
+          stoppedSessionIds: [],
+          activeSessionIds: [],
+          failedSessionIds: [],
+        },
+      },
+      snapshot: {
+        snapshot: {
+          schemaVersion: 1,
+          rootSessionId: "root-1",
+          members: [
+            {
+              sessionId: "child-1",
+              parentSessionId: "root-1",
+              agentName: "explore",
+              task: "List files",
+              status: "stopped",
+              createdAtMs: 1_700_000_000_000,
+              updatedAtMs: 1_700_000_002_000,
+            },
+          ],
+        },
+      },
+    });
+    internals.connection = stub.connection;
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await expect(session.stopProviderDelegations()).resolves.toEqual({ acknowledged: true });
+
+    expect(stub.extMethod).toHaveBeenCalledWith(STOP_METHOD, { sessionId: "root-1" });
+    // The tree is read again afterwards, so the rows report the real status.
+    expect(stub.extMethod).toHaveBeenCalledWith(GET_METHOD, { sessionId: "root-1" });
+    const rows = events.flatMap((event) =>
+      event.type === "provider_subagent" && event.event.type === "upsert"
+        ? [{ id: event.event.id, status: event.event.status }]
+        : [],
+    );
+    expect(rows).toEqual([{ id: "child-1", status: "canceled" }]);
+  });
+
+  test("refuses to stop when the provider never advertised the stop method", async () => {
+    const session = createSession();
+    const internals = asInternals<ACPSessionInternals>(session);
+    internals.sessionId = "root-1";
+    internals.agentMeta = { [EXTENSIONS_KEY]: { methods: [GET_METHOD] } };
+    const stub = stubDelegationConnection({});
+    internals.connection = stub.connection;
+
+    await expect(session.stopProviderDelegations()).rejects.toThrow(
+      "does not support stopping delegated tasks",
+    );
+    expect(stub.extMethod).not.toHaveBeenCalled();
+  });
+
+  function makeInitSession(methods: string[] | null) {
+    class TestSession extends ACPAgentSession {
+      protected override async spawnProcess(): Promise<SpawnedACPProcess> {
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            prompt: vi.fn(),
+            newSession: vi.fn().mockResolvedValue({
+              sessionId: "root-1",
+              modes: null,
+              models: null,
+              configOptions: [],
+            }),
+            extMethod: vi.fn().mockResolvedValue({ snapshot: { members: [] } }),
+          } as unknown as ClientSideConnection,
+          initialize: {
+            agentCapabilities: {},
+            ...(methods ? { _meta: { [EXTENSIONS_KEY]: { methods } } } : {}),
+          },
+        } as unknown as SpawnedACPProcess;
+      }
+    }
+
+    return new TestSession(
+      { provider: "minimax-code", cwd: "/tmp/paseo-acp-test" },
+      {
+        provider: "minimax-code",
+        logger: createTestLogger(),
+        defaultCommand: ["mcode", "--acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+      },
+    );
+  }
+
+  test("advertises the stop to the app only after the provider names it", async () => {
+    const advertised = makeInitSession([GET_METHOD, STOP_METHOD]);
+    await advertised.initializeNewSession();
+    expect(advertised.capabilities.supportsProviderDelegationStop).toBe(true);
+
+    const silent = makeInitSession([GET_METHOD]);
+    await silent.initializeNewSession();
+    expect(silent.capabilities.supportsProviderDelegationStop).toBe(false);
   });
 });

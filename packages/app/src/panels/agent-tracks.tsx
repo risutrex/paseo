@@ -1,7 +1,7 @@
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
-import { memo, useCallback, type ReactElement } from "react";
+import { memo, useCallback, useMemo, useState, type ReactElement } from "react";
+import { BackgroundWorkTrack, createHostBackgroundWorkModel } from "@/background-work";
 import { WorkspaceDiffStatPill } from "@/composer/diff-stat-pill";
-import { useWorkspaceHasDiffStat } from "@/composer/workspace-diff-stat";
 import { AgentTaskList } from "@/composer/task-list";
 import { ComposerTrackBar } from "@/composer/tracks";
 import { useIsCompactFormFactor } from "@/constants/layout";
@@ -9,13 +9,24 @@ import { usePaneContext } from "@/panels/pane-context";
 import { useSettings } from "@/hooks/use-settings";
 import { PluginComposerPills } from "@/plugins";
 import { useSessionStore } from "@/stores/session-store";
+import { useToast } from "@/contexts/toast-context";
+import { i18n } from "@/i18n/i18next";
+import { confirmDialog } from "@/utils/confirm-dialog";
+import { toErrorMessage } from "@/utils/error-messages";
 import {
-  type ArchiveFinishedStatus,
+  useArchiveFinishedSubagents,
   useArchiveSubagent,
   useDetachSubagent,
   useSubagentSheetTab,
-  type SubagentRow,
+  useSubagentsForParent,
 } from "@/subagents";
+import {
+  IDLE_PROVIDER_DELEGATION_STOP_STATUS,
+  requestStopProviderDelegations,
+  type ProviderDelegationStopStatus,
+} from "@/subagents/provider-delegation-stop";
+import { countRunningProviderSubagents } from "@/subagents/provider-store";
+import { formatProviderName } from "@/subagents/track-presentation";
 import { ParentAgentPill } from "@/subagents/parent";
 import { SubagentsTrack } from "@/subagents/track";
 import type { TodoEntry } from "@/types/stream";
@@ -36,30 +47,49 @@ export const AgentTracks = memo(function AgentTracks({
   workspaceId,
   agentId,
   parentAgentId,
-  subagentRows,
-  tasks,
-  archiveFinishedStatus,
-  onArchiveFinished,
-  hasPluginComposerPills,
 }: {
   serverId: string;
   workspaceId: string;
   agentId: string;
   parentAgentId: string | null;
-  subagentRows: SubagentRow[];
-  tasks: TodoEntry[] | undefined;
-  archiveFinishedStatus: ArchiveFinishedStatus;
-  onArchiveFinished: () => void;
-  hasPluginComposerPills: boolean;
-}): ReactElement | null {
+}): ReactElement {
+  const subagentRows = useSubagentsForParent({ serverId, parentAgentId: agentId });
+  const tasks = useSessionStore((state): TodoEntry[] | undefined =>
+    state.sessions[serverId]?.agentTasks.get(agentId),
+  );
+  const archiveFinishedSubagents = useArchiveFinishedSubagents({
+    serverId,
+    parentAgentId: agentId,
+    rows: subagentRows,
+  });
   const { tabId } = usePaneContext();
-  const hasWorkspaceDiffStat = useWorkspaceHasDiffStat(serverId, workspaceId);
+  const backgroundWorkCount = useSessionStore((state) => {
+    const session = state.sessions[serverId];
+    const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+    return agent?.backgroundWork?.count ?? 0;
+  });
+  const backgroundModel = useMemo(
+    () => createHostBackgroundWorkModel(serverId, agentId),
+    [serverId, agentId],
+  );
   const isCompact = useIsCompactFormFactor();
   const openInSidePane = useSettings((settings) => settings.openInSidePane);
   const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
   const canDetachSubagents = useSessionStore(
     (state) => state.sessions[serverId]?.serverInfo?.features?.agentDetach === true,
   );
+  // Two things have to hold: the daemon accepts the request, and this agent's
+  // provider advertised the stop. Anything less leaves the rows read-only rather
+  // than offering a stop that cannot be carried out.
+  const canStopProviderDelegations = useSessionStore((state) => {
+    const session = state.sessions[serverId];
+    if (session?.serverInfo?.features?.providerDelegationStop !== true) {
+      return false;
+    }
+    const agent = session.agents.get(agentId) ?? session.agentDetails.get(agentId);
+    return agent?.capabilities.supportsProviderDelegationStop === true;
+  });
+  const toast = useToast();
   const archiveSubagent = useArchiveSubagent();
   const detachSubagent = useDetachSubagent();
   const openSubagentTarget = useCallback(
@@ -90,6 +120,42 @@ export const AgentTracks = memo(function AgentTracks({
     },
     [openSubagentTarget, serverId, workspaceId],
   );
+  const [providerDelegationStopStatus, setProviderDelegationStopStatus] =
+    useState<ProviderDelegationStopStatus>(IDLE_PROVIDER_DELEGATION_STOP_STATUS);
+  const handleStopProviderDelegations = useCallback(async () => {
+    const activeTaskCount = subagentRows.reduce(
+      (count, row) => (row.kind === "provider" && row.status === "running" ? count + 1 : count),
+      0,
+    );
+    const provider = subagentRows.find((row) => row.kind === "provider")?.provider ?? agentId;
+    setProviderDelegationStopStatus({ kind: "requesting" });
+    const status = await requestStopProviderDelegations(
+      {
+        serverId,
+        agentId,
+        providerLabel: formatProviderName(provider),
+        activeTaskCount,
+      },
+      {
+        confirm: confirmDialog,
+        t: (key, options) => i18n.t(key, options as never) as unknown as string,
+        stopProviderDelegations: async ({ serverId: targetServerId, agentId: targetAgentId }) => {
+          const client = useSessionStore.getState().sessions[targetServerId]?.client;
+          if (!client) {
+            throw new Error(i18n.t("workspaceSetup.errors.hostDisconnected"));
+          }
+          return client.stopProviderDelegations(targetAgentId);
+        },
+        // Read after the stop: the daemon refreshes the tree before answering, so
+        // the rows already carry the statuses the user is about to see.
+        countActiveTasks: () => countRunningProviderSubagents(serverId, agentId),
+        reportError: (error) => {
+          toast.error(toErrorMessage(error));
+        },
+      },
+    );
+    setProviderDelegationStopStatus(status);
+  }, [agentId, serverId, subagentRows, toast]);
   const handleOpenProviderSubagent = useCallback(
     (ownerAgentId: string, subagentId: string) => {
       openSubagentTarget({
@@ -112,21 +178,9 @@ export const AgentTracks = memo(function AgentTracks({
     });
   }, [isCompact, openInSidePane, workspaceKey]);
 
-  if (
-    !hasWorkspaceDiffStat &&
-    !hasAgentTracks({
-      parentAgentId,
-      subagentRows,
-      tasks,
-      archiveFinishedStatus,
-      hasPluginComposerPills,
-    })
-  ) {
-    return null;
-  }
-
   return (
     <ComposerTrackBar>
+      <BackgroundWorkTrack model={backgroundModel} count={backgroundWorkCount} />
       {parentAgentId ? <ParentAgentPill serverId={serverId} parentAgentId={parentAgentId} /> : null}
       <AgentTaskList tasks={tasks} />
       <SubagentsTrack
@@ -136,9 +190,13 @@ export const AgentTracks = memo(function AgentTracks({
         onOpenProviderSubagent={handleOpenProviderSubagent}
         sheetTabFor={sheetTabFor}
         onArchiveSubagent={archiveSubagent}
-        onArchiveFinished={onArchiveFinished}
-        archiveFinishedStatus={archiveFinishedStatus}
+        onArchiveFinished={archiveFinishedSubagents.archiveFinished}
+        archiveFinishedStatus={archiveFinishedSubagents.status}
         onDetachSubagent={canDetachSubagents ? detachSubagent : undefined}
+        onStopProviderDelegations={
+          canStopProviderDelegations ? handleStopProviderDelegations : undefined
+        }
+        providerDelegationStopStatus={providerDelegationStopStatus}
       />
       <PluginComposerPills
         serverId={serverId}
@@ -154,25 +212,3 @@ export const AgentTracks = memo(function AgentTracks({
     </ComposerTrackBar>
   );
 });
-
-export function hasAgentTracks({
-  parentAgentId,
-  subagentRows,
-  tasks,
-  archiveFinishedStatus,
-  hasPluginComposerPills = false,
-}: {
-  parentAgentId: string | null;
-  subagentRows: readonly SubagentRow[];
-  tasks: readonly TodoEntry[] | undefined;
-  archiveFinishedStatus: ArchiveFinishedStatus;
-  hasPluginComposerPills?: boolean;
-}): boolean {
-  return (
-    parentAgentId !== null ||
-    subagentRows.length > 0 ||
-    Boolean(tasks?.length) ||
-    archiveFinishedStatus.kind !== "idle" ||
-    hasPluginComposerPills
-  );
-}

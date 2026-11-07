@@ -195,19 +195,27 @@ test("captures the compact import-session journey", async ({ page }, testInfo) =
     await flow.openFromWorkspaceHeader();
     await capture(page, testInfo, "09-mobile-workspace-scoped.png");
 
-    await test.step("a search widens the scoped sheet to every project", async () => {
+    await test.step("a search stays in the workspace until the list is widened by hand", async () => {
+      const unrelatedRow = page.getByTestId(
+        `import-session-session-claude-${scenario.unrelatedSessionId}`,
+      );
       await flow.revealSession("fixture-root-01");
-      await expect(
-        page.getByTestId(`import-session-session-claude-${scenario.unrelatedSessionId}`),
-      ).toHaveCount(0);
+      await expect(unrelatedRow).toHaveCount(0);
 
-      await flow.searchAcrossHost("unrelated", scenario.unrelatedSessionId);
-      await flow.expectScope("Sessions on", false);
-      await capture(page, testInfo, "09b-mobile-search-widened.png");
-
-      // Clearing the text hands the scope back to the workspace.
-      await flow.clearSearch();
+      // Typing does not widen the scope: the other project's session stays out.
+      await flow.typeSearch("unrelated");
       await flow.expectScope("This workspace");
+      await expect(unrelatedRow).toHaveCount(0);
+      await capture(page, testInfo, "09b-mobile-search-stays-scoped.png");
+
+      // Widening is the explicit button, and the query survives it.
+      await flow.showAll();
+      await expect(unrelatedRow).toBeVisible();
+      await capture(page, testInfo, "09c-mobile-show-all-with-query.png");
+
+      // Narrowing back is just as explicit.
+      await flow.clearSearch();
+      await flow.scopeToWorkspace();
     });
 
     await flow.showAll();

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Text, View } from "react-native";
+import { View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import invariant from "tiny-invariant";
 import { useShallow } from "zustand/react/shallow";
@@ -21,6 +21,8 @@ import { ParentAgentCallout } from "@/subagents/parent";
 import { type SubagentRow, useSubagentsForParent } from "@/subagents/select";
 import { useSubagentSheetTab } from "@/subagents/sheet-tab";
 import { SubagentsTrack } from "@/subagents/track";
+import { buildProviderInternalTaskLabel } from "@/subagents/track-presentation";
+import { ProviderSubagentJournalUnavailable } from "@/panels/provider-subagent-journal-unavailable";
 import {
   providerSubagentKey,
   providerSubagentLifecycleStatus,
@@ -31,7 +33,7 @@ import {
 import { useTranslation } from "react-i18next";
 import type { PendingPermission } from "@/types/shared";
 import type { StreamItem } from "@/types/stream";
-import { deriveSidebarStateBucket } from "@/utils/sidebar-agent-state";
+import { deriveSubagentStatusBucket } from "@/subagents";
 import { TIMELINE_FETCH_PAGE_SIZE } from "@/timeline/timeline-fetch-policy";
 import type { TurnPresentation } from "@/timeline/turn-liveness";
 import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
@@ -74,18 +76,11 @@ function ProviderSubagentChildTrack({
   );
 }
 
-function formatProviderLabel(provider: string): string {
-  return provider
-    .split(/[-_\s]+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
 function useProviderSubagentDescriptor(
   target: { kind: "provider_subagent"; parentAgentId: string; subagentId: string },
   context: { serverId: string },
 ): PanelDescriptor {
+  const { t } = useTranslation();
   const descriptor = useProviderSubagentStore((state) =>
     state.descriptors.get(
       providerSubagentKey(context.serverId, target.parentAgentId, target.subagentId),
@@ -98,7 +93,9 @@ function useProviderSubagentDescriptor(
   // The task names the tab; the subagent type is supporting detail beside the provider.
   const subagentType = descriptor?.title?.trim();
   const label = descriptor?.description?.trim() || subagentType || "Subagent";
-  const providerLabel = `${formatProviderLabel(provider)} subagent`;
+  // The panel says what the row says: this is a task inside the provider's own run,
+  // not an agent Paseo started and can open on its own.
+  const providerLabel = buildProviderInternalTaskLabel(t, provider);
   return {
     label,
     subtitle:
@@ -107,16 +104,12 @@ function useProviderSubagentDescriptor(
     titleState: descriptor ? "ready" : "loading",
     icon: useProviderIcon(provider, context.serverId),
     statusBucket: descriptor
-      ? deriveSidebarStateBucket({
-          status: providerSubagentLifecycleStatus(descriptor.status),
-          requiresAttention: descriptor.status === "failed",
-        })
+      ? deriveSubagentStatusBucket(providerSubagentLifecycleStatus(descriptor.status))
       : null,
   };
 }
 
 function ProviderSubagentPanel() {
-  const { t } = useTranslation();
   const { serverId, workspaceId, tabId, target, openFileInWorkspace, openTab } = usePaneContext();
   invariant(target.kind === "provider_subagent", "ProviderSubagentPanel requires provider target");
   const key = providerSubagentKey(serverId, target.parentAgentId, target.subagentId);
@@ -246,11 +239,9 @@ function ProviderSubagentPanel() {
   );
 
   if (serverInfo && !supported) {
-    return (
-      <View style={styles.unsupported} testID="provider-subagent-panel-unsupported">
-        <Text style={styles.unsupportedText}>{t("message.actions.forkUnavailable")}</Text>
-      </View>
-    );
+    // The provider keeps this child's journal to itself, so the panel says so
+    // instead of showing an empty transcript that reads as a broken chat.
+    return <ProviderSubagentJournalUnavailable />;
   }
 
   return (
@@ -284,11 +275,9 @@ function ProviderSubagentPanel() {
   );
 }
 
-const styles = StyleSheet.create((theme) => ({
+const styles = StyleSheet.create(() => ({
   container: { flex: 1, minHeight: 0 },
   stream: { flex: 1, minHeight: 0 },
-  unsupported: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
-  unsupportedText: { color: theme.colors.foregroundMuted, textAlign: "center" },
 }));
 
 export const providerSubagentPanelRegistration = definePanel("provider_subagent", {

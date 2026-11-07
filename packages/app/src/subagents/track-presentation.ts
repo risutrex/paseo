@@ -1,10 +1,26 @@
 import type { TFunction } from "i18next";
 import type { ComposerTrackPillSegment } from "@/composer/tracks";
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
-import { deriveSidebarStateBucket, STATUS_BUCKET_ORDER } from "@/utils/sidebar-agent-state";
+import type { AgentLifecycleStatus } from "@getpaseo/protocol/agent-lifecycle";
+import { STATUS_BUCKET_ORDER } from "@/utils/sidebar-agent-state";
 import type { SubagentRow } from "./select";
 import { isFinishedSubagent } from "./archive-finished";
 import { providerSubagentLifecycleStatus } from "./provider-store";
+import type { ProviderDelegationStopStatus } from "./provider-delegation-stop";
+
+/**
+ * A provider's own name, prepared for a sentence.
+ *
+ * Provider ids are slugs ("minimax-code"); a row that calls the provider by its
+ * wire name reads like a log line instead of a product.
+ */
+export function formatProviderName(provider: string): string {
+  return provider
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
 
 function presentationStatus(row: SubagentRow) {
   if (row.kind === "paseo") {
@@ -12,6 +28,55 @@ function presentationStatus(row: SubagentRow) {
     return row.status === "running" ? "idle" : row.status;
   }
   return providerSubagentLifecycleStatus(row.status);
+}
+
+/**
+ * Whether the track offers the stop that covers a provider's whole tree.
+ *
+ * The stop belongs to the parent, so it shows only while the provider itself can
+ * carry it out and its tree still has work. A finished tree has nothing to stop,
+ * and an offer that stops nothing is a lie.
+ */
+export function resolveProviderDelegationStopPresentation(input: {
+  rows: readonly SubagentRow[];
+  canStop: boolean;
+  status: ProviderDelegationStopStatus;
+}): { activeProviderTaskCount: number; showStop: boolean; showResult: boolean } {
+  const activeProviderTaskCount = input.rows.reduce(
+    (count, row) => (row.kind === "provider" && row.status === "running" ? count + 1 : count),
+    0,
+  );
+  const status = input.status;
+  return {
+    activeProviderTaskCount,
+    showStop: input.canStop && activeProviderTaskCount > 0,
+    showResult:
+      status.kind === "stopped" ||
+      status.kind === "partial" ||
+      status.kind === "unknown" ||
+      status.kind === "failed",
+  };
+}
+
+/**
+ * The line that keeps a provider row honest: it is work inside the provider's own
+ * run, not an agent with a session a user could open, detach or promote.
+ */
+export function buildProviderInternalTaskLabel(t: TFunction, provider: string): string {
+  return t("subagents.providerInternalTask", { provider: formatProviderName(provider) });
+}
+
+/**
+ * A child's mark reports what it is doing, not whether anyone read it: the track is where a
+ * failed child stays visible after the parent's own attention is cleared.
+ */
+export function deriveSubagentStatusBucket(
+  status: AgentLifecycleStatus,
+  backgroundWork?: { count: number } | null,
+): SidebarStateBucket {
+  if (status === "error") return "failed";
+  if (status === "running" || (backgroundWork?.count ?? 0) > 0) return "running";
+  return "done";
 }
 
 export interface SubagentRowPresentationData {
@@ -38,10 +103,10 @@ export function buildSubagentRowPresentationData(row: SubagentRow): SubagentRowP
     label: label ?? "",
     subtitle: subtitle ?? "",
     titleState: label ? "ready" : "loading",
-    statusBucket: deriveSidebarStateBucket({
+    statusBucket: deriveSubagentStatusBucket(
       status,
-      requiresAttention: false,
-    }),
+      row.kind === "paseo" ? row.backgroundWork : undefined,
+    ),
   };
 }
 

@@ -1,8 +1,28 @@
 import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
+import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 
-export type FinishObservationResult = WaitForFinishResult & {
+/**
+ * The provider took the message into its own queue and runs it after the current
+ * turn. Nothing ran for this turn, so it has no result: the previous answer
+ * belongs to an earlier turn and must never stand in for it.
+ */
+export interface QueuedObservationResult {
+  status: "queued";
+  final: AgentSnapshotPayload | null;
+  lastMessage: null;
+  error: null;
+}
+
+export type FinishObservationResult = (WaitForFinishResult | QueuedObservationResult) & {
   reason?: "was canceled" | "host unreachable" | "host removed";
 };
+
+/**
+ * The settled baseline a host wait returns. A host reports a queued handoff on the
+ * client-facing status it already has ("idle") and flags it here, because that wait
+ * result also feeds `wait_for_finish`, which has no queued status of its own.
+ */
+export type FinishObservationBaseline = WaitForFinishResult & { queued?: boolean };
 
 /** Coalesces duplicate checkpoints and retains one terminal result while delivery is pending. */
 export function createObservationBuffer(signal: AbortSignal) {
@@ -27,9 +47,14 @@ export function createObservationBuffer(signal: AbortSignal) {
     wake?.();
   }
   return {
-    pushInitial(result: FinishObservationResult) {
+    pushInitial(result: FinishObservationBaseline) {
       initialPending = false;
-      if (result.status === "permission" && result.final) {
+      if (!terminal && result.queued) {
+        // The wait already saw the provider take the message. Report the queued
+        // handoff as the unknown outcome it is, even when this baseline is the first
+        // thing delivery sees.
+        push({ status: "queued", final: result.final, lastMessage: null, error: null });
+      } else if (result.status === "permission" && result.final) {
         const pendingPermissions = result.final.pendingPermissions.filter(
           (request) => !resolvedBeforeInitial.has(request.id),
         );

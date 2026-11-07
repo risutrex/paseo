@@ -148,23 +148,24 @@ export class ImportSessionFlow {
       this.page.getByTestId("assistant-message").filter({ visible: true }),
     ).toContainText(assistantText);
   }
+  /** Widening to every directory on the host is the user's own button. */
   async showAll() {
     await this.page.getByTestId("import-session-show-all").click();
     await expect(this.page.getByTestId("import-session-scope")).toContainText("Sessions on");
+    await expect(this.page.getByTestId("import-session-show-all")).toHaveCount(0);
   }
-  /**
-   * A query on a workspace-scoped sheet widens the list to every directory by
-   * itself, because the session the user is after usually lives in another
-   * project. The sheet has to say that it did, and offer to narrow back.
-   */
-  async searchAcrossHost(query: string, expectedRowId: string) {
+  /** Narrowing back to the sheet's own workspace is the other button. */
+  async scopeToWorkspace() {
+    await this.page.getByTestId("import-session-scope-workspace").click();
+    await this.expectScope("This workspace");
+    await expect(this.page.getByTestId("import-session-show-all")).toBeVisible();
+  }
+  /** A query never moves the scope; it only narrows the rows in it. */
+  async typeSearch(query: string) {
     await this.page.getByTestId("import-session-search").fill(query);
-    await expect(this.page.getByTestId("import-session-scope-reason")).toBeVisible();
-    await expect(this.page.getByTestId(rowTestId(expectedRowId))).toBeVisible();
   }
   async clearSearch() {
-    await this.page.getByTestId("import-session-search").fill("");
-    await expect(this.page.getByTestId("import-session-scope-reason")).toHaveCount(0);
+    await this.typeSearch("");
   }
   async expectImportedIntoWorkspace(workspaceId: string, userText: string) {
     await expect(this.page).toHaveURL(buildHostWorkspaceRoute(getServerId(), workspaceId), {

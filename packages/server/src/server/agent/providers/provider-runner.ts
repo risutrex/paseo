@@ -65,7 +65,9 @@ export async function runProviderTurn({
       rejectCompletion(new Error(event.error));
       return;
     }
-    if (event.type === "turn_canceled") {
+    // A queued turn also ends this run: the provider holds the message in its own
+    // queue and will never dispatch a completion for the turn it refused.
+    if (event.type === "turn_canceled" || event.type === "turn_queued") {
       settled = true;
       resolveCompletion();
     }

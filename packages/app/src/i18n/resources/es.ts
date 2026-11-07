@@ -167,6 +167,8 @@ export const es: TranslationResources = {
       dropFilesHere: "Drop files here",
       editQueuedMessage: "Editar mensaje en cola",
       sendQueuedMessageNow: "Enviar mensaje en cola ahora",
+      providerQueueLabel: "En la cola del proveedor - no editable aquí",
+      providerQueueStatus: "{{status}}",
       openImage: "Abrir imagen adjunta",
       removeImage: "Quitar imagen adjunta",
       removeFile: "Remove file attachment",
@@ -384,6 +386,24 @@ export const es: TranslationResources = {
       answerPlaceholder: "Escribe tu respuesta...",
       otherPlaceholder: "Otro...",
     },
+    backgroundWork: {
+      pillOne: "1 tarea en segundo plano",
+      pillMany: "{{count}} tareas en segundo plano",
+      notRunning: "Ya no está en ejecución",
+      dismiss: "Cerrar",
+      stop: "Detener",
+      stopping: "Deteniendo…",
+      stopError: "No se pudo confirmar la detención.",
+      label: "Segundo plano",
+      title: "Trabajo en segundo plano",
+      waiting: "Esperando los detalles",
+      error: "No se pudo cargar el trabajo en segundo plano",
+      retry: "Reintentar",
+      running: "Trabajo en segundo plano en curso",
+      shell: "Consola",
+      monitor: "Monitor",
+      other: "Otro trabajo",
+    },
     todo: {
       title: "Tareas",
       empty: "Aún no hay tareas.",
@@ -413,8 +433,6 @@ export const es: TranslationResources = {
     scope: {
       host: "Sesiones en {{host}}",
       workspace: "Este espacio de trabajo",
-      widenedBySearch:
-        "Buscando en todos los directorios para encontrar una sesión de otro proyecto.",
     },
     filters: {
       all: "Todo",
@@ -447,6 +465,21 @@ export const es: TranslationResources = {
       alreadyImported: "Todas las sesiones recientes ya están importadas.",
       noProviderSessions: "No se encontraron sesiones{{provider}}.",
     },
+    // Importing a provider session rebuilds its whole history on the provider
+    // side, so the sheet warns before the expensive part starts.
+    warning: {
+      title: "Cargar el historial puede tardar varios minutos y mucha memoria",
+      body: "El proveedor reconstruye toda la conversación antes de abrir la sesión. Las sesiones grandes pueden usar gigabytes de memoria.",
+      confirm: "Importar de todos modos",
+      cancel: "Cancelar",
+    },
+    progress: {
+      title: "Importando el historial…",
+      body: "El proveedor sigue reconstruyendo esta sesión.",
+      elapsed: "{{seconds}} s",
+      cancel: "Detener la importación",
+    },
+    cancelled: "Importación detenida. No se añadió nada a tu espacio de trabajo.",
     row: {
       importing: "Importador...",
     },
@@ -630,6 +663,7 @@ export const es: TranslationResources = {
     terminal: {
       hostDisconnected: "Hostno está conectado",
       updateHost: "Actualiza el host para usar el renderizador de terminal nativo.",
+      restoreRequiresUpdate: "Actualiza el host para ver las terminales.",
       unableToSubscribe: "No se puede suscribir al terminal",
       fileUploaded: "Archivo subido",
       pasteFileFailed: "No se pudo pegar el archivo: {{reason}}",
@@ -969,6 +1003,9 @@ export const es: TranslationResources = {
         },
       },
       diff: {
+        baseBranch: {
+          title: "Rama base",
+        },
         openChangesTab: "Abrir la pestaña Cambios",
         openDiffTab: "Abrir la pestaña Diferencia",
         closeChangesTab: "Cerrar la pestaña Cambios",
@@ -1275,6 +1312,7 @@ export const es: TranslationResources = {
       hosts: "Hosts",
       settings: "Ajustes",
       closeSidebar: "Cerrar barra lateral",
+      moreActions: "Más acciones",
     },
     footer: {
       usage: "Uso",
@@ -1379,6 +1417,9 @@ export const es: TranslationResources = {
         hostDisconnected: "Hostno está conectado",
         hideFailed: "No se pudo ocultar el espacio de trabajo",
         archiveFailed: "No se pudo archivar el espacio de trabajo",
+        archived: "Espacio de trabajo archivado",
+        undoArchive: "Deshacer",
+        undoArchiveFailed: "No se pudo deshacer el archivado",
       },
     },
   },
@@ -1592,6 +1633,9 @@ export const es: TranslationResources = {
       cli: {
         statusFailed: "No se puede verificar el estado de instalación deCLI.",
         installFailed: "No se puede instalar elPaseoCLI.",
+        uninstallFailed: "No se pudo desinstalar la CLI de Paseo.",
+        keptForeign:
+          "Se conservó un comando paseo que Paseo no instaló. Elimínalo tú mismo para desinstalarlo.",
       },
     },
   },
@@ -1643,6 +1687,7 @@ export const es: TranslationResources = {
     openPath: "Abrir ruta",
   },
   branchSwitcher: {
+    failedToLoad: "No se pudieron cargar las ramas. Vuelve a abrir el selector para reintentarlo.",
     triggerTooltip: "Cambiar rama del espacio de trabajo",
     currentBranch: "Sucursal actual:{{branchName}}. Presione para cambiar de rama.",
     placeholder: "Cambiar de rama...",
@@ -1666,7 +1711,11 @@ export const es: TranslationResources = {
     loadingCommands: "Cargando comandos...",
     noFiles: "No se encontraron archivos ni directorios",
     noCommands: "No se encontraron comandos",
-    failedToLoad: "No se pudo cargar",
+    loadingProviderCommands: "Cargando comandos de {{provider}}...",
+    commandsFailed: "No se pudieron cargar los comandos",
+    providerCommandsFailed: "No se pudieron cargar los comandos de {{provider}}",
+    filesFailed: "No se pudieron buscar archivos",
+    skillTag: "Skill",
     chooseProjectForCommands: "Elige un proyecto para ver los comandos",
     chooseModelForCommands: "Selecciona un modelo para ver los comandos",
   },
@@ -1693,6 +1742,60 @@ export const es: TranslationResources = {
     },
   },
   onboarding: {
+    setup: {
+      title: "Paseo",
+      stepCounter: "Paso {{current}} de {{total}}",
+      skip: "Omitir configuración",
+      continue: "Continuar",
+      finish: "Finalizar",
+      steps: {
+        appearance: {
+          label: "Apariencia",
+          title: "Te damos la bienvenida a Paseo",
+          description: "Empecemos por elegir una apariencia",
+        },
+        providers: {
+          label: "Proveedores",
+          title: "Tus agentes",
+          description: "Paseo usa las CLI de agentes que ya están en este ordenador",
+        },
+        projects: {
+          label: "Proyectos",
+          title: "Añade tus proyectos",
+          description: "Dónde quieres que trabajen tus agentes",
+          addProject: "Añadir proyecto",
+          added: "Añadido",
+          suggestions: {
+            loading: "Buscando carpetas en las que has trabajado",
+            empty: "No se encontraron proyectos recientes",
+            lastUsed: "Último uso {{time}}",
+            addSelected_one: "Añadir {{count}} proyecto",
+            addSelected_other: "Añadir {{count}} proyectos",
+            adding: "Añadiendo…",
+            addFailed: "No se pudo añadir esta carpeta",
+          },
+        },
+        orchestration: {
+          label: "Orquestación",
+          title: "Deja que los agentes usen Paseo",
+          description: "Deja que tus agentes creen espacios de trabajo y hablen con otros agentes",
+        },
+        phone: {
+          label: "Móvil",
+          title: "Lleva tus agentes contigo",
+          description:
+            "La app móvil nativa completa te permite controlar cualquier ordenador con Paseo desde tu teléfono",
+          appStore: "App Store",
+          googlePlay: "Google Play",
+          connectTitle: "Elige cómo conectarte",
+          connectDocs: "Docs",
+          openConnectDocs: "Abrir la documentación de conectividad",
+          recommended: "Recomendado",
+          relay: { title: "Relé", hint: "Cifrado de extremo a extremo, escanea un código QR" },
+          tailscale: { title: "Tailscale", hint: "Requiere algo de configuración" },
+        },
+      },
+    },
     title: "Bienvenido aPaseo",
     subtitle: "Conecte su computadora para comenzar",
     actions: {
@@ -1913,6 +2016,8 @@ export const es: TranslationResources = {
       notNow: "Ahora no",
       directConnectionHint:
         "Sin relé, conéctese directamente por TCP, Tailscale u otra VPN. No se crea ningún código QR.",
+      tailscaleDocs: "Configurar Tailscale",
+      tailscaleDocsAccessibility: "Leer cómo conectarse con Tailscale",
       updateRequired: "Actualice el host para habilitar el relé desde Paseo Desktop.",
       unavailable: "Oferta de maridaje no disponible.",
       hint: "Escanee este códigoQRconPaseoen su teléfono o copie el enlace a continuación.",
@@ -1986,6 +2091,20 @@ export const es: TranslationResources = {
     archiveTooltip: "Subagente de archivo",
     archiveFinishedAction: "Archivar subagentes finalizados",
     archiveFinishedRetry: "Reintentar ({{failed}}/{{total}})",
+    providerInternalTask: "Tarea interna de {{provider}}",
+    providerLogUnavailable:
+      "El proveedor no comparte el registro de esta tarea. Solo se muestra su estado.",
+    stopProviderDelegationsAction: "Detener al padre y sus tareas delegadas",
+    stopProviderDelegationsRequesting: "Deteniendo...",
+    stopProviderDelegationsDialogTitle: "¿Detener {{provider}}?",
+    stopProviderDelegationsDialogMessage:
+      "Esto detiene el turno del padre y todas las tareas que {{provider}} delegó ({{count}} en ejecución). Los mensajes que el proveedor puso en cola se retiran si lo permite; si no, pueden ejecutarse más tarde.",
+    stopProviderDelegationsConfirm: "Detener todo",
+    stopProviderDelegationsStopped: "Detenido: no hay tareas delegadas en ejecución",
+    stopProviderDelegationsPartial: "{{count}} tareas delegadas siguen en ejecución",
+    stopProviderDelegationsUnknown:
+      "Resultado de la detención desconocido: el proveedor no lo confirmó. Revisa el estado de las tareas.",
+    stopProviderDelegationsFailed: "No se pudieron detener las tareas delegadas: {{message}}",
   },
   panels: {
     draft: {
@@ -2376,6 +2495,12 @@ export const es: TranslationResources = {
     general: {
       title: "General",
       sending: "Envío",
+      setup: {
+        label: "Configuración inicial",
+        description:
+          "Vuelve a recorrer apariencia, proveedores, proyectos y emparejamiento del teléfono",
+        action: "Mostrar configuración de nuevo",
+      },
       browserData: {
         title: "Datos del navegador",
         siteData: "Cookies y datos de sitios",
@@ -2671,11 +2796,7 @@ export const es: TranslationResources = {
       commandLine: {
         title: "línea de comando",
         description: "Agentes de control y script desde tu terminal",
-      },
-      actions: {
-        install: "Instalar",
-        installing: "Instalando...",
-        installed: "Instalado",
+        accessibilityLabel: "Instalar la CLI de Paseo",
       },
     },
     permissions: {
@@ -2753,10 +2874,9 @@ export const es: TranslationResources = {
         ...en.settings.host.skills,
         sectionTitle: "Habilidades de orquestación",
         title: "Habilidades de orquestación",
-        description: "Enseñe a sus agentes a orquestar a través delCLI",
+        description: "Enseña a tus agentes a usar las herramientas de Paseo",
         updateAvailable: "Actualización disponible",
         updateTitle: "¿Actualizar las habilidades dePaseo?",
-        updateFallback: "Sincronice las habilidades incluidas con su máquina.",
         uninstallTitle: "¿Desinstalar las habilidadesPaseo?",
         uninstallMessage:
           "Elimina todas las habilidades de orquestaciónPaseode ~/.agents, ~/.claude, ~/.codex.",
@@ -2775,9 +2895,6 @@ export const es: TranslationResources = {
         uninstallFailed: "No se pueden desinstalar las habilidades de orquestación.",
         saveSelectionFailed: "No se puede guardar la selección de habilidades de orquestación.",
         actions: {
-          install: "Instalar",
-          installing: "Instalando...",
-          installed: "Instalado",
           update: "Actualizar",
           working: "Laboral...",
           remove: "Eliminar",
@@ -2799,6 +2916,7 @@ export const es: TranslationResources = {
           title: "Habilitar herramientasPaseo",
           hint: "Los agentes podrán gestionar árboles de trabajo, agentes y horarios.",
           accessibilityLabel: "Inyectar herramientasPaseo",
+          updateFailed: "No se pudieron actualizar las herramientas de Paseo.",
         },
         systemPrompt: {
           title: "Aviso del sistema",

@@ -283,6 +283,28 @@ function createRecentSessionsClient(
   return { fetchRecentProviderSessions, importAgent };
 }
 
+/**
+ * An import that never resolves, like a provider still replaying a history.
+ * Cancelling it rejects the way the daemon does: no agent, no error to report.
+ */
+function createBlockedImportAgent(onSignal: (signal: AbortSignal | undefined) => void) {
+  return vi.fn(
+    (_input: unknown, signal?: AbortSignal) =>
+      new Promise<Awaited<ReturnType<DaemonClient["importAgent"]>>>((_resolve, reject) => {
+        onSignal(signal);
+        signal?.addEventListener(
+          "abort",
+          () => {
+            const error = new Error("Import cancelled");
+            error.name = "AbortError";
+            reject(error);
+          },
+          { once: true },
+        );
+      }),
+  );
+}
+
 function createImportedAgentSnapshot(id: string): Awaited<ReturnType<DaemonClient["importAgent"]>> {
   return {
     id,
@@ -483,11 +505,14 @@ describe("ImportSessionSheet", () => {
     );
 
     await waitFor(() => {
-      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-        cwd: "/repo/paseo",
-        providers: ["claude"],
-        limit: 15,
-      });
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          cwd: "/repo/paseo",
+          providers: ["claude"],
+          limit: 15,
+        },
+        expect.anything(),
+      );
     });
 
     await screen.findByText("Implement the importer sheet");
@@ -545,12 +570,61 @@ describe("ImportSessionSheet", () => {
 
     await screen.findByText("Cached importable session");
     await waitFor(() => {
-      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-        cwd: "/repo/paseo",
-        providers: ["claude"],
-        limit: 15,
-      });
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          cwd: "/repo/paseo",
+          providers: ["claude"],
+          limit: 15,
+        },
+        expect.anything(),
+      );
     });
+  });
+
+  it("cancels a listing already in flight when the sheet closes", async () => {
+    const fetchRecentProviderSessions = vi.fn(
+      (_options: unknown, _signal?: AbortSignal) =>
+        new Promise<Awaited<ReturnType<DaemonClient["fetchRecentProviderSessions"]>>>(() => {}),
+    );
+    const importAgent = vi.fn();
+    const client = createRecentSessionsClient(fetchRecentProviderSessions, importAgent);
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    mockSnapshot.current = {
+      entries: [createSnapshotEntry("claude")],
+      supportsSnapshot: true,
+    };
+
+    function TestSheet({ visible }: { visible: boolean }) {
+      return (
+        <QueryClientProvider client={queryClient}>
+          <ImportSessionSheet
+            visible={visible}
+            client={client}
+            serverId="server-1"
+            cwd="/repo/paseo"
+            onClose={vi.fn()}
+            onImportedAgent={vi.fn()}
+          />
+        </QueryClientProvider>
+      );
+    }
+
+    const { rerender } = render(<TestSheet visible />);
+
+    await waitFor(() => expect(fetchRecentProviderSessions).toHaveBeenCalledTimes(1));
+    const signal = fetchRecentProviderSessions.mock.calls[0]?.[1];
+    expect(signal?.aborted).toBe(false);
+
+    // The sheet stays mounted while hidden, so turning the query off is not
+    // enough: closing has to abort the listing the daemon is still walking.
+    rerender(<TestSheet visible={false} />);
+
+    await waitFor(() => expect(signal?.aborted).toBe(true));
   });
 
   it("imports a selected session by provider handle and reports the imported agent", async () => {
@@ -600,12 +674,15 @@ describe("ImportSessionSheet", () => {
     resolveImport(createImportedAgentSnapshot("agent-imported"));
 
     await waitFor(() => {
-      expect(importAgent).toHaveBeenCalledWith({
-        providerId: "claude",
-        providerHandleId: "provider-thread-1",
-        cwd: "/repo/paseo-realpath",
-        workspaceId: "ws-current",
-      });
+      expect(importAgent).toHaveBeenCalledWith(
+        {
+          providerId: "claude",
+          providerHandleId: "provider-thread-1",
+          cwd: "/repo/paseo-realpath",
+          workspaceId: "ws-current",
+        },
+        expect.anything(),
+      );
       expect(events).toEqual(["fetch", "close", "navigate"]);
     });
     expect(onImportedAgent).toHaveBeenCalledWith("agent-imported");
@@ -639,13 +716,156 @@ describe("ImportSessionSheet", () => {
     fireEvent.click(await screen.findByTestId("import-session-session-claude-provider-thread-1"));
 
     await screen.findByText("Could not import selected session.");
-    expect(importAgent).toHaveBeenCalledWith({
-      providerId: "claude",
-      providerHandleId: "provider-thread-1",
-      cwd: "/repo/paseo",
-    });
+    expect(importAgent).toHaveBeenCalledWith(
+      {
+        providerId: "claude",
+        providerHandleId: "provider-thread-1",
+        cwd: "/repo/paseo",
+      },
+      expect.anything(),
+    );
     expect(onImportedAgent).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("warns before importing a session whose provider has to rebuild the history", async () => {
+    const fetchRecentProviderSessions = vi.fn(async () => ({
+      requestId: "recent-provider-sessions",
+      entries: [
+        createProviderSessionEntry({
+          providerId: "minimax-code",
+          providerLabel: "MiniMax Code",
+          providerHandleId: "big-thread",
+        }),
+      ],
+      // The provider listed descriptors only: importing has to rebuild the whole
+      // conversation, so the sheet warns before that work starts.
+      previewsUnavailable: true,
+    }));
+    const importAgent = vi.fn(async () => createImportedAgentSnapshot("agent-imported"));
+
+    renderSheet(
+      { fetchRecentProviderSessions, importAgent } as Pick<
+        DaemonClient,
+        "fetchRecentProviderSessions" | "importAgent"
+      >,
+      {
+        workspaceId: "ws-current",
+        snapshot: { supportsSnapshot: true, entries: [createSnapshotEntry("minimax-code")] },
+      },
+    );
+
+    fireEvent.click(await screen.findByTestId("import-session-session-minimax-code-big-thread"));
+
+    await screen.findByTestId("import-session-import-warning");
+    expect(screen.getByText(/several minutes and a lot of memory/)).toBeTruthy();
+    // Nothing expensive has started yet.
+    expect(importAgent).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("import-session-import-warning-confirm"));
+
+    await waitFor(() => {
+      expect(importAgent).toHaveBeenCalledWith(
+        {
+          providerId: "minimax-code",
+          providerHandleId: "big-thread",
+          cwd: "/repo/paseo",
+          workspaceId: "ws-current",
+        },
+        expect.anything(),
+      );
+    });
+  });
+
+  it("drops the import when the warning is dismissed", async () => {
+    const fetchRecentProviderSessions = vi.fn(async () => ({
+      requestId: "recent-provider-sessions",
+      entries: [
+        createProviderSessionEntry({
+          providerId: "minimax-code",
+          providerLabel: "MiniMax Code",
+          providerHandleId: "big-thread",
+        }),
+      ],
+      previewsUnavailable: true,
+    }));
+    const importAgent = vi.fn();
+
+    renderSheet(
+      { fetchRecentProviderSessions, importAgent } as Pick<
+        DaemonClient,
+        "fetchRecentProviderSessions" | "importAgent"
+      >,
+      {
+        workspaceId: "ws-current",
+        snapshot: { supportsSnapshot: true, entries: [createSnapshotEntry("minimax-code")] },
+      },
+    );
+
+    fireEvent.click(await screen.findByTestId("import-session-session-minimax-code-big-thread"));
+    await screen.findByTestId("import-session-import-warning");
+    fireEvent.click(screen.getByTestId("import-session-import-warning-cancel"));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("import-session-import-warning")).toBeNull();
+    });
+    expect(importAgent).not.toHaveBeenCalled();
+  });
+
+  it("shows that the import is loading and stops it with a real abort", async () => {
+    const fetchRecentProviderSessions = vi.fn(async () => ({
+      requestId: "recent-provider-sessions",
+      entries: [
+        createProviderSessionEntry({
+          providerId: "minimax-code",
+          providerLabel: "MiniMax Code",
+          providerHandleId: "big-thread",
+        }),
+      ],
+      previewsUnavailable: true,
+    }));
+    let importSignal: AbortSignal | undefined;
+    const importAgent = createBlockedImportAgent((signal) => {
+      importSignal = signal;
+    });
+    const onClose = vi.fn();
+    const onImportedAgent = vi.fn();
+
+    renderSheet(
+      { fetchRecentProviderSessions, importAgent } as Pick<
+        DaemonClient,
+        "fetchRecentProviderSessions" | "importAgent"
+      >,
+      {
+        onClose,
+        onImportedAgent,
+        workspaceId: "ws-current",
+        snapshot: { supportsSnapshot: true, entries: [createSnapshotEntry("minimax-code")] },
+      },
+    );
+
+    fireEvent.click(await screen.findByTestId("import-session-session-minimax-code-big-thread"));
+    await screen.findByTestId("import-session-import-warning");
+    fireEvent.click(screen.getByTestId("import-session-import-warning-confirm"));
+
+    await screen.findByTestId("import-session-import-progress");
+    screen.getByText("Importing history…");
+    screen.getByTestId("import-session-import-elapsed");
+    expect(importSignal?.aborted).toBe(false);
+
+    fireEvent.click(screen.getByTestId("import-session-import-cancel"));
+
+    // Cancelling means the request really stops, not just that the sheet looks
+    // busy: the signal the client handed to importAgent is aborted.
+    await waitFor(() => {
+      expect(importSignal?.aborted).toBe(true);
+    });
+    await screen.findByTestId("import-session-import-cancelled");
+    screen.getByText("Import stopped. Nothing was added to your workspace.");
+    expect(onImportedAgent).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    // A stopped import is not reported as a failure.
+    expect(screen.queryByText("Could not import selected session.")).toBeNull();
   });
 
   it("fans out one request per enabled provider when snapshot is supported", async () => {
@@ -684,25 +904,34 @@ describe("ImportSessionSheet", () => {
     );
 
     await waitFor(() => {
-      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          cwd: "/repo/paseo",
+          providers: ["claude"],
+          limit: 15,
+        },
+        expect.anything(),
+      );
+    });
+    expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+      {
         cwd: "/repo/paseo",
-        providers: ["claude"],
+        providers: ["codex"],
         limit: 15,
-      });
-    });
-    expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-      cwd: "/repo/paseo",
-      providers: ["codex"],
-      limit: 15,
-    });
+      },
+      expect.anything(),
+    );
     expect(fetchRecentProviderSessions).not.toHaveBeenCalledWith(
       expect.objectContaining({ providers: ["opencode"] }),
     );
-    expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-      cwd: "/repo/paseo",
-      providers: ["z-ai"],
-      limit: 15,
-    });
+    expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+      {
+        cwd: "/repo/paseo",
+        providers: ["z-ai"],
+        limit: 15,
+      },
+      expect.anything(),
+    );
 
     await screen.findByText("Session claude");
     await screen.findByText("Session codex");
@@ -880,10 +1109,13 @@ describe("ImportSessionSheet", () => {
     );
 
     await waitFor(() => {
-      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-        providers: ["claude"],
-        limit: 15,
-      });
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          providers: ["claude"],
+          limit: 15,
+        },
+        expect.anything(),
+      );
     });
     expect(fetchRecentProviderSessions).not.toHaveBeenCalledWith(
       expect.objectContaining({ cwd: expect.anything() }),
@@ -927,11 +1159,14 @@ describe("ImportSessionSheet", () => {
     fireEvent.click(await screen.findByTestId("import-session-session-claude-provider-thread-1"));
 
     await waitFor(() => {
-      expect(importAgent).toHaveBeenCalledWith({
-        providerId: "claude",
-        providerHandleId: "provider-thread-1",
-        cwd: "/home/me/work/other-project",
-      });
+      expect(importAgent).toHaveBeenCalledWith(
+        {
+          providerId: "claude",
+          providerHandleId: "provider-thread-1",
+          cwd: "/home/me/work/other-project",
+        },
+        expect.anything(),
+      );
     });
     expect(onImported).toHaveBeenCalledTimes(1);
     expect(onImported).toHaveBeenCalledWith(expect.objectContaining({ id: "agent-imported" }));
@@ -966,9 +1201,10 @@ describe("ImportSessionSheet", () => {
 
     fireEvent.click(screen.getByTestId("import-session-show-all"));
     await screen.findByText("Sessions on workbench");
-    // A widening the user asked for needs no explanation; the search-driven one
-    // does, and that is covered by the search test.
-    expect(screen.queryByTestId("import-session-scope-reason")).toBeNull();
+    // Widening is the user's own choice, so the sheet offers the way back
+    // instead of explaining why it happened.
+    expect(screen.queryByTestId("import-session-show-all")).toBeNull();
+    screen.getByTestId("import-session-scope-workspace");
   });
 
   it("lists unscoped rows newest first and names each row's folder", async () => {
@@ -1092,11 +1328,14 @@ describe("ImportSessionSheet", () => {
     });
 
     await waitFor(() => {
-      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-        providers: ["claude"],
-        limit: 15,
-        query: "invoice",
-      });
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          providers: ["claude"],
+          limit: 15,
+          query: "invoice",
+        },
+        expect.anything(),
+      );
     });
   });
 
@@ -1146,10 +1385,13 @@ describe("ImportSessionSheet", () => {
     fireEvent.click(await screen.findByTestId("import-session-load-more"));
 
     await waitFor(() => {
-      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-        providers: ["claude"],
-        limit: 45,
-      });
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          providers: ["claude"],
+          limit: 45,
+        },
+        expect.anything(),
+      );
     });
     await waitFor(() => {
       expect(screen.queryByTestId("import-session-load-more")).toBeNull();
@@ -1200,11 +1442,14 @@ describe("ImportSessionSheet", () => {
     fireEvent.click(screen.getByTestId("import-session-retry-claude"));
 
     await waitFor(() => {
-      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-        cwd: "/repo/paseo",
-        providers: ["claude"],
-        limit: 15,
-      });
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          cwd: "/repo/paseo",
+          providers: ["claude"],
+          limit: 15,
+        },
+        expect.anything(),
+      );
     });
     expect(fetchRecentProviderSessions).toHaveBeenCalledTimes(1);
   });
@@ -1230,7 +1475,7 @@ describe("ImportSessionSheet", () => {
     await screen.findByText("Could not load Codex sessions");
   });
 
-  it("starts on the workspace, widens while searching, and narrows back on request", async () => {
+  it("searches within the chosen scope and widens only on request", async () => {
     const fetchRecentProviderSessions = vi.fn(async (options: { cwd?: string } | undefined) => ({
       requestId: "recent-provider-sessions",
       entries: [
@@ -1258,43 +1503,69 @@ describe("ImportSessionSheet", () => {
     // Nothing typed yet: the cheap listing of this workspace, whose rows the
     // daemon matched with realpaths resolved.
     await screen.findByText("Scoped session");
-    expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-      cwd: "/repo/paseo",
-      providers: ["claude"],
-      limit: 15,
-    });
+    expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+      {
+        cwd: "/repo/paseo",
+        providers: ["claude"],
+        limit: 15,
+      },
+      expect.anything(),
+    );
     await screen.findByText("This workspace");
-    expect(screen.queryByTestId("import-session-scope-reason")).toBeNull();
 
-    // A query is the case where the wanted session lives in another project, so
-    // the list widens by itself and says why.
+    // A query searches the scope the user chose. It does not widen the list on
+    // its own: the scope is what says which directories the rows come from.
     fireEvent.change(screen.getByTestId("import-session-search"), {
       target: { value: "foreign" },
     });
 
     await waitFor(() => {
-      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-        providers: ["claude"],
-        limit: 15,
-        query: "foreign",
-      });
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          cwd: "/repo/paseo",
+          providers: ["claude"],
+          limit: 15,
+          query: "foreign",
+        },
+        expect.anything(),
+      );
+    });
+    await screen.findByText("Scoped session");
+    expect(screen.queryByText("Foreign session")).toBeNull();
+    await screen.findByText("This workspace");
+
+    // Widening is the user's own choice, and it keeps the query.
+    fireEvent.click(screen.getByTestId("import-session-show-all"));
+
+    await waitFor(() => {
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          providers: ["claude"],
+          limit: 15,
+          query: "foreign",
+        },
+        expect.anything(),
+      );
     });
     await screen.findByText("Foreign session");
     await screen.findByText("Sessions on workbench");
-    screen.getByTestId("import-session-scope-reason");
 
     // Narrowing by hand keeps the query but goes back to the workspace rows.
     fireEvent.click(screen.getByTestId("import-session-scope-workspace"));
 
     await waitFor(() => {
-      expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-        cwd: "/repo/paseo",
-        providers: ["claude"],
-        limit: 15,
-        query: "foreign",
-      });
+      expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+        {
+          cwd: "/repo/paseo",
+          providers: ["claude"],
+          limit: 15,
+          query: "foreign",
+        },
+        expect.anything(),
+      );
     });
-    expect(screen.queryByTestId("import-session-scope-reason")).toBeNull();
+    await screen.findByText("Scoped session");
+    expect(screen.queryByText("Foreign session")).toBeNull();
   });
 
   it("imports a cross-project row without the current workspace once the list is widened", async () => {
@@ -1330,19 +1601,25 @@ describe("ImportSessionSheet", () => {
     fireEvent.click(screen.getByTestId("import-session-show-all"));
 
     await screen.findByText("Foreign session");
-    expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
-      providers: ["claude"],
-      limit: 15,
-    });
+    expect(fetchRecentProviderSessions).toHaveBeenCalledWith(
+      {
+        providers: ["claude"],
+        limit: 15,
+      },
+      expect.anything(),
+    );
 
     fireEvent.click(screen.getByTestId("import-session-session-claude-foreign-thread"));
 
     await waitFor(() => {
-      expect(importAgent).toHaveBeenCalledWith({
-        providerId: "claude",
-        providerHandleId: "foreign-thread",
-        cwd: "/home/me/work/other-project",
-      });
+      expect(importAgent).toHaveBeenCalledWith(
+        {
+          providerId: "claude",
+          providerHandleId: "foreign-thread",
+          cwd: "/home/me/work/other-project",
+        },
+        expect.anything(),
+      );
     });
     expect(onImported).toHaveBeenCalledWith(expect.objectContaining({ id: "agent-imported" }));
     expect(onImportedAgent).not.toHaveBeenCalled();
