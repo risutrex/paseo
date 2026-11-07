@@ -11,22 +11,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Trace the timeout value
+      - name: Find the 120 second default
         run: |
           cat > /tmp/probe.py <<'PY'
           import pathlib
           import pr_agent
 
           root = pathlib.Path(pr_agent.__file__).parent
-          target = None
-          for path in root.rglob("litellm_ai_handler.py"):
-              target = path
-          lines = target.read_text(errors="ignore").splitlines()
-          hits = [(n, l.strip()[:140]) for n, l in enumerate(lines, 1) if "timeout" in l.lower()]
-          print("file:", target)
-          print(chr(10).join(str(n) + " | " + l for n, l in hits[:40]))
-          print("--- context 3290-3335 ---")
-          print(chr(10).join(str(n) + " | " + lines[n - 1] for n in range(3290, min(3336, len(lines)))))
+          hits = [(str(p.relative_to(root)), n, l.strip()[:150]) for p in root.rglob("*.py") for n, l in enumerate(p.read_text(errors="ignore").splitlines(), 1) if "= 120" in l or "120)" in l and "timeout" in l.lower() or "CONFIG__" in l or "class Settings" in l]
+          print(chr(10).join(" | ".join(map(str, h)) for h in hits[:35]) or "no hits")
           PY
           docker run --rm -v /tmp/probe.py:/probe.py:ro --entrypoint python3 \
             pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c /probe.py
