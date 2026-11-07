@@ -9,22 +9,41 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
-      - name: Resolve, connect, answer
+      - name: Host network
         run: |
           set -u
           host="gate.trinity.guru"
-          echo "== DNS =="
-          getent hosts "$host" || echo "DNS: no answer"
-          echo "== TCP 443 =="
-          timeout 15 bash -c "cat < /dev/null > /dev/tcp/$host/443" && echo "TCP: connected" || echo "TCP: failed or timed out"
-          echo "== HTTPS GET / =="
-          curl -sS -o /dev/null -m 15 -w 'GET / -> %{http_code} in %{time_total}s\n' "https://$host/" || echo "GET /: failed"
-          echo "== HTTPS POST /omni/v1/messages (no key) =="
-          curl -sS -o /dev/null -m 20 -w 'POST -> %{http_code} in %{time_total}s\n' \
-            -X POST "https://$host/omni/v1/messages" \
-            -H 'content-type: application/json' \
-            -d '{"model":"x","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' || echo "POST: failed"
-          echo "== control: api.github.com =="
-          curl -sS -o /dev/null -m 15 -w 'github -> %{http_code} in %{time_total}s\n' https://api.github.com || echo "github: failed"
+          echo "== host DNS =="
+          getent ahosts "$host" | head -4
+          echo "== host POST =="
+          curl -sS -o /dev/null -m 20 -w 'host POST -> %{http_code} in %{time_total}s\n' \
+            -X POST "https://$host/omni/v1/messages" -H 'content-type: application/json' \
+            -d '{"model":"x","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' || echo "host POST failed"
+
+      - name: Inside the PR-Agent image
+        run: |
+          docker run --rm --entrypoint python3 pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c -c "
+import socket, ssl, urllib.request, json, time
+host='gate.trinity.guru'
+try:
+    infos=socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    print('getaddrinfo:', [(i[0].name, i[4][0]) for i in infos])
+except Exception as e:
+    print('getaddrinfo failed:', e)
+for fam,addr in [(i[0], i[4]) for i in infos][:4]:
+    t0=time.time()
+    try:
+        s=socket.socket(fam, socket.SOCK_STREAM); s.settimeout(8); s.connect(addr)
+        print('connect', addr, 'ok in %.2fs' % (time.time()-t0)); s.close()
+    except Exception as e:
+        print('connect', addr, 'failed:', type(e).__name__, e, 'after %.2fs' % (time.time()-t0))
+try:
+    req=urllib.request.Request('https://'+host+'/omni/v1/messages', data=json.dumps({'model':'x','max_tokens':1,'messages':[{'role':'user','content':'hi'}]}).encode(), headers={'content-type':'application/json'})
+    t0=time.time()
+    with urllib.request.urlopen(req, timeout=12) as r:
+        print('urllib POST ->', r.status, '%.2fs' % (time.time()-t0))
+except Exception as e:
+    print('urllib POST failed:', type(e).__name__, str(e)[:200], '%.2fs' % (time.time()-t0))
+"
