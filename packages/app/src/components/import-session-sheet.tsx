@@ -264,7 +264,7 @@ function ProviderErrorBannerRow({
       </Text>
       <Button
         variant="ghost"
-        size="xs"
+        size="sm"
         onPress={handleRetry}
         testID={`import-session-retry-${row.provider}`}
       >
@@ -329,7 +329,7 @@ function ScopeSubtitle({
       {canScope ? (
         <Button
           variant="ghost"
-          size="xs"
+          size="sm"
           onPress={isScoped ? onShowAll : onScopeToWorkspace}
           testID={isScoped ? "import-session-show-all" : "import-session-scope-workspace"}
           style={styles.subtitleAction}
