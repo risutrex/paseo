@@ -4324,7 +4324,9 @@ describe("ACPAgentSession", () => {
         enqueueStarted.resolve();
         return enqueueAnswer.promise;
       }
-      return { item: { itemId: "item-1", status: "cancelled" } };
+      return {
+        item: { itemId: "item-1", sessionId: "session-1", status: "cancelled", finishedAt: 1 },
+      };
     });
     const cancel = vi.fn().mockResolvedValue(undefined);
 
@@ -4594,7 +4596,9 @@ describe("ACPAgentSession", () => {
       if (method === "mcode/session/queue/enqueue") {
         return { status: "queued", itemId: "item-1" };
       }
-      return { item: { itemId: "item-1", status: "cancelled" } };
+      return {
+        item: { itemId: "item-1", sessionId: "session-1", status: "cancelled", finishedAt: 1 },
+      };
     });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
@@ -4628,9 +4632,10 @@ describe("ACPAgentSession", () => {
     expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(true);
   });
 
-  test("says the queued message stays when the provider already claimed it", async () => {
-    // Once the provider takes the item for a turn, the removal is refused. A
-    // Stop cannot undo that, and telling the user otherwise is a lie.
+  test("does not treat a failed removal as proof the provider claimed the message", async () => {
+    // A failed removal says the item could not be taken back. It does not say
+    // the provider is running it: measured against MiniMax Code 0.7.3, repeating
+    // a delete only reports that the item is no longer there.
     const session = createSession();
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
@@ -4645,7 +4650,7 @@ describe("ACPAgentSession", () => {
       if (method === "mcode/session/queue/enqueue") {
         return { status: "queued", itemId: "item-1" };
       }
-      throw new Error("Queue item is not editable: session-1/item-1");
+      throw new Error("Queue item not found: session-1/item-1");
     });
 
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
@@ -4670,10 +4675,1140 @@ describe("ACPAgentSession", () => {
     const notifications = events.flatMap((event) =>
       event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
     );
-    const warning = notifications.find((item) => item.level === "warning");
-    expect(warning?.message).toMatch(/cannot be withdrawn/);
-    // The stop is not reported as a withdrawal that did not happen.
+    // The outcome is unknown: neither a withdrawal nor proof that it is running.
+    expect(
+      notifications.some((item) => /answer did not confirm the withdrawal/.test(item.message)),
+    ).toBe(true);
+    expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(false);
+    expect(notifications.some((item) => /already be running/.test(item.message))).toBe(false);
+  });
+
+  test("does not confirm a removal whose item came back with another status", async () => {
+    // The measured removal answers with `status: cancelled`. Any other status
+    // is not a removal, even when the item id matches.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      return {
+        item: { itemId: "item-1", sessionId: "session-1", status: "queued" },
+      };
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    await session.interrupt();
+
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(false);
+    expect(
+      notifications.some((item) => /answer did not confirm the withdrawal/.test(item.message)),
+    ).toBe(true);
+  });
+
+  test("does not confirm a removal whose item came back for another session", async () => {
+    // The removal answer names the session it belongs to. Another session is
+    // another queue, even when the item id matches.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      return {
+        item: { itemId: "item-1", sessionId: "session-2", status: "cancelled" },
+      };
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    await session.interrupt();
+
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(false);
+    expect(
+      notifications.some((item) => /answer did not confirm the withdrawal/.test(item.message)),
+    ).toBe(true);
+  });
+
+  test("does not confirm a removal the provider answers with no item", async () => {
+    // `item: null` says the provider no longer holds the item. It does not say
+    // the message ran, so it is reported as unknown, not as a claim.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      return { item: null };
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    await session.interrupt();
+
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(false);
+    expect(notifications.some((item) => /already be running/.test(item.message))).toBe(false);
+    expect(
+      notifications.some((item) => /answer did not confirm the withdrawal/.test(item.message)),
+    ).toBe(true);
+  });
+
+  test("does not report the client's own removal as a message that left the queue", async () => {
+    // The provider publishes the queue before it answers the removal. That
+    // departure is what this client's own request looks like, so it must not be
+    // reported as a message that ran unobserved a moment before the withdrawal
+    // is confirmed.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const deleteAnswer = Promise.withResolvers<Record<string, unknown>>();
+    const extMethod = vi.fn(async (method: string): Promise<Record<string, unknown>> => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      return deleteAnswer.promise;
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const notifications = () =>
+      events.flatMap((event) =>
+        event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+      );
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+
+    // The provider has shown the item in its queue before the stop.
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-1",
+      items: [{ itemId: "item-1", status: "queued", content: "hello", createdAt: 1 }],
+    });
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    const stopping = session.interrupt();
+    // The queue update reports the departure while the removal is unanswered.
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-1",
+      items: [],
+    });
+    expect(notifications().some((item) => /left the provider's queue/.test(item.message))).toBe(
+      false,
+    );
+
+    deleteAnswer.resolve({
+      item: { itemId: "item-1", sessionId: "session-1", status: "cancelled", finishedAt: 1 },
+    });
+    await stopping;
+
+    // The confirmed removal is the only report: no unexplained departure first,
+    // and nothing to warn about at all.
+    expect(notifications().some((item) => /left the provider's queue/.test(item.message))).toBe(
+      false,
+    );
+    expect(notifications().filter((item) => item.level === "warning")).toHaveLength(0);
+    expect(
+      notifications().filter((item) => /withdrawn from the provider's queue/.test(item.message)),
+    ).toHaveLength(1);
+  });
+
+  test("says why a removal that failed after the item left the queue is unknown", async () => {
+    // Our request is the likely reason the item left, but the answer refuses it.
+    // The honest report says the item left and the reason is unknown - it is
+    // neither a withdrawal nor a claim that the provider is running it.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const deleteAnswer = Promise.withResolvers<Record<string, unknown>>();
+    const extMethod = vi.fn(async (method: string): Promise<Record<string, unknown>> => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      return deleteAnswer.promise;
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const notifications = () =>
+      events.flatMap((event) =>
+        event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+      );
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-1",
+      items: [{ itemId: "item-1", status: "queued", content: "hello", createdAt: 1 }],
+    });
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    const stopping = session.interrupt();
+    await session.extNotification("mcode/session/queue_update", {
+      sessionId: "session-1",
+      items: [],
+    });
+    deleteAnswer.reject(new Error("Queue item not found: session-1/item-1"));
+    await stopping;
+
+    // One warning, and it is the one that names both facts: the item left while
+    // the removal was in flight, and the answer did not confirm it. The generic
+    // "a message left the queue" report would be a second, contradictory one.
+    expect(
+      notifications().filter((item) =>
+        /left the provider's queue while its removal was in flight/.test(item.message),
+      ),
+    ).toHaveLength(1);
+    expect(
+      notifications().some((item) =>
+        item.message.startsWith("A message left the provider's queue"),
+      ),
+    ).toBe(false);
+    expect(notifications().filter((item) => item.level === "warning")).toHaveLength(1);
+    expect(notifications().some((item) => /withdrawn/.test(item.message))).toBe(false);
+    expect(notifications().some((item) => /already be running/.test(item.message))).toBe(false);
+  });
+
+  test("a throwing subscriber does not turn a queue removal report into an unhandled rejection", async () => {
+    // The removal report runs in a detached chain, and its notice delivery is
+    // guarded. A subscriber that throws must not turn either into an unhandled
+    // rejection.
+    const logger = createTestLogger();
+    const warn = vi.spyOn(logger, "warn");
+    const session = createSessionWithConfig({}, logger);
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string): Promise<Record<string, unknown>> => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      return {
+        item: { itemId: "item-1", sessionId: "session-1", status: "cancelled", finishedAt: 1 },
+      };
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    // Registered after the turn is queued, and only the removal report throws:
+    // subscribe replays buffered events, which must not trip it.
+    session.subscribe((event) => {
+      if (
+        event.type === "timeline" &&
+        event.item.type === "notification" &&
+        /withdrawn|did not confirm|not answered/.test(event.item.message)
+      ) {
+        throw new Error("subscriber exploded");
+      }
+    });
+
+    await session.interrupt();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.any(Error) }),
+      "ACP queue notice delivery failed",
+    );
+  });
+
+  test("a throwing subscriber on the still-pending notice cannot block the cancel", async () => {
+    // The stop reports the queue phase it could not finish before it cancels.
+    // That report is a notice, not a step of the stop: a subscriber that throws
+    // while reading it must not reject the interrupt and leave session/cancel
+    // unsent.
+    vi.useFakeTimers();
+    try {
+      const logger = createTestLogger();
+      const warn = vi.spyOn(logger, "warn");
+      const session = createSessionWithConfig({}, logger);
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      let promptCalls = 0;
+      const prompt = vi.fn((): Promise<PromptResponse> => {
+        promptCalls += 1;
+        // The first turn is refused as busy, so its message is queued.
+        if (promptCalls <= 2) {
+          return Promise.reject(
+            new Error(
+              "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+            ),
+          );
+        }
+        // The turn the stop targets never answers.
+        return new Promise<never>(() => undefined);
+      });
+      let itemIndex = 0;
+      const extMethod = vi.fn(async (method: string): Promise<Record<string, unknown>> => {
+        if (method === "mcode/session/queue/enqueue") {
+          itemIndex += 1;
+          return { status: "queued", itemId: `item-${itemIndex}` };
+        }
+        // The removal never answers, so the queue phase spends its whole budget.
+        return new Promise<Record<string, unknown>>(() => undefined);
+      });
+      const cancel = vi.fn().mockResolvedValue(undefined);
+
+      asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+      asInternals<ACPSessionInternals>(session).connection = {
+        prompt,
+        extMethod,
+        cancel,
+        signal: new AbortController().signal,
+      };
+      asInternals<ACPSessionInternals>(session).agentMeta = {
+        "minimax-code/extensions": {
+          methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+        },
+      };
+
+      await session.startTurn("one");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(events.filter((event) => event.type === "turn_queued")).toHaveLength(1);
+
+      await session.startTurn("two");
+
+      // Throws only on the notice in question.
+      session.subscribe((event) => {
+        if (
+          event.type === "timeline" &&
+          event.item.type === "notification" &&
+          /before the queued message withdrawal finished/.test(event.item.message)
+        ) {
+          throw new Error("subscriber exploded");
+        }
+      });
+
+      const stopping = session.interrupt().then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      );
+
+      // The notice fires at 200ms; the throw is caught and the cancel still goes
+      // out in the same turn of the loop.
+      await vi.advanceTimersByTimeAsync(200);
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error) }),
+        "ACP queue notice delivery failed",
+      );
+
+      // The provider never released the turn, so the stop reports that - with
+      // the cancel already dispatched, which is the point of the test.
+      await vi.advanceTimersByTimeAsync(1_200);
+      await expect(stopping).resolves.toBe("rejected");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a throwing subscriber on the unsupported-delete notice cannot block the cancel", async () => {
+    // A provider that advertises enqueue but no delete cannot take a message
+    // back. The stop says so before it cancels; that notice must not be able to
+    // reject the interrupt and leave session/cancel unsent.
+    vi.useFakeTimers();
+    try {
+      const logger = createTestLogger();
+      const warn = vi.spyOn(logger, "warn");
+      const session = createSessionWithConfig({}, logger);
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      let promptCalls = 0;
+      const prompt = vi.fn((): Promise<PromptResponse> => {
+        promptCalls += 1;
+        if (promptCalls <= 2) {
+          return Promise.reject(
+            new Error(
+              "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+            ),
+          );
+        }
+        // The turn the stop targets never answers.
+        return new Promise<never>(() => undefined);
+      });
+      const extMethod = vi.fn(async (method: string): Promise<Record<string, unknown>> => {
+        if (method === "mcode/session/queue/enqueue") {
+          return { status: "queued", itemId: "item-1" };
+        }
+        throw new Error(`Unexpected method ${method}`);
+      });
+      const cancel = vi.fn().mockResolvedValue(undefined);
+
+      asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+      asInternals<ACPSessionInternals>(session).connection = {
+        prompt,
+        extMethod,
+        cancel,
+        signal: new AbortController().signal,
+      };
+      // Only enqueue is advertised: there is no way to take the item back.
+      asInternals<ACPSessionInternals>(session).agentMeta = {
+        "minimax-code/extensions": { methods: ["mcode/session/queue/enqueue"] },
+      };
+
+      await session.startTurn("one");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(events.filter((event) => event.type === "turn_queued")).toHaveLength(1);
+
+      await session.startTurn("two");
+
+      session.subscribe((event) => {
+        if (
+          event.type === "timeline" &&
+          event.item.type === "notification" &&
+          /cannot be withdrawn/.test(event.item.message)
+        ) {
+          throw new Error("subscriber exploded");
+        }
+      });
+
+      const stopping = session.interrupt().then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      );
+
+      // There is no queue phase to wait for: the notice fires, its throw is
+      // caught, and the cancel goes out on the same tick.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error) }),
+        "ACP queue notice delivery failed",
+      );
+
+      await vi.advanceTimersByTimeAsync(1_200);
+      await expect(stopping).resolves.toBe("rejected");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("sends the cancel without waiting for a queue acknowledgment that has not arrived", async () => {
+    // The manager bounds a stop at about 2s. An enqueue the provider is slow to
+    // answer used to be awaited here (up to 5s), so the cancel was never sent and
+    // the stop came back as refused. The turn is already marked stopped, so the
+    // late answer takes its item back on its own.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const enqueueStarted = Promise.withResolvers<void>();
+    const enqueueAnswer = Promise.withResolvers<unknown>();
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        enqueueStarted.resolve();
+        return enqueueAnswer.promise;
+      }
+      return {
+        item: { itemId: "item-1", sessionId: "session-1", status: "cancelled", finishedAt: 1 },
+      };
+    });
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      cancel,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    await session.startTurn("hello");
+    await enqueueStarted.promise;
+
+    const deleteRequests = (): number =>
+      extMethod.mock.calls.filter(([method]) => method === "mcode/session/queue/delete").length;
+
+    const stopping = session.interrupt();
+    // The cancel is the part the user asked for, so it must not wait for the
+    // queue answer. Before the fix this only happened after the 5s ack wait.
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
+    expect(deleteRequests()).toBe(0);
+
+    enqueueAnswer.resolve({ status: "queued", itemId: "item-1" });
+    await stopping;
+
+    // The late answer still takes back what it created.
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/delete", {
+      sessionId: "session-1",
+      itemId: "item-1",
+    });
+    expect(events.some((event) => event.type === "turn_queued")).toBe(false);
+    expect(events.some((event) => event.type === "turn_canceled")).toBe(true);
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(true);
+  });
+
+  test("stops inside the rescue timeout when queue/delete never answers", async () => {
+    // A provider can accept the removal request and never answer it. Waiting for
+    // that answer kept the stop past the manager's 2s, so the stop answers on
+    // its own budget and the item's real outcome arrives when the provider
+    // finally answers - it is never counted as withdrawn on a timeout.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      // The removal never settles: the provider is stuck on this method.
+      return new Promise<Record<string, unknown>>(() => undefined);
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    const notifications = () =>
+      events.flatMap((event) =>
+        event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+      );
+
+    const startedAt = Date.now();
+    await session.interrupt();
+    // The stop answers on the queue budget, far inside the manager's 2s rescue.
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/delete", {
+      sessionId: "session-1",
+      itemId: "item-1",
+    });
+    // Nothing is claimed about an item the provider has not answered for.
+    expect(
+      notifications().some((item) =>
+        /before the queued message withdrawal finished/.test(item.message),
+      ),
+    ).toBe(true);
+    expect(notifications().some((item) => /will not run/.test(item.message))).toBe(false);
+
+    const hasUnansweredWithdrawal = (): boolean =>
+      notifications().some((item) => /has not answered the withdrawal/.test(item.message));
+    // The delete deadline passes with no answer: the report says exactly that,
+    // and no withdrawal is claimed.
+    await vi.waitFor(() => expect(hasUnansweredWithdrawal()).toBe(true), { timeout: 3_000 });
+    expect(notifications().some((item) => /will not run/.test(item.message))).toBe(false);
+  });
+
+  test("bounds the stop when several removals hang and the cancel never answers", async () => {
+    // The worst case the manager's rescue timeout can meet: two messages wait in
+    // the queue, every removal hangs, the cancel notification hangs and the
+    // provider never releases the running turn. The stop has to answer inside
+    // the 2s race, and both removals have to report their own outcome after it.
+    vi.useFakeTimers();
+    try {
+      const session = createSession();
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      let promptCalls = 0;
+      const prompt = vi.fn(() => {
+        promptCalls += 1;
+        // The first two turns are refused as busy, so their messages are queued.
+        if (promptCalls <= 4) {
+          return Promise.reject(
+            new Error(
+              "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+            ),
+          );
+        }
+        // The last turn never answers: the provider keeps owning it.
+        return new Promise<never>(() => undefined);
+      });
+      let itemIndex = 0;
+      const extMethod = vi.fn(async (method: string): Promise<Record<string, unknown>> => {
+        if (method === "mcode/session/queue/enqueue") {
+          itemIndex += 1;
+          return { status: "queued", itemId: `item-${itemIndex}` };
+        }
+        // Every removal hangs.
+        return new Promise<Record<string, unknown>>(() => undefined);
+      });
+      const cancel = vi.fn(() => new Promise<never>(() => undefined));
+
+      asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+      asInternals<ACPSessionInternals>(session).connection = {
+        prompt,
+        extMethod,
+        cancel,
+        signal: new AbortController().signal,
+      };
+      asInternals<ACPSessionInternals>(session).agentMeta = {
+        "minimax-code/extensions": {
+          methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+        },
+      };
+
+      const deleteCalls = (): number =>
+        extMethod.mock.calls.filter(([method]) => method === "mcode/session/queue/delete").length;
+      const notifications = () =>
+        events.flatMap((event) =>
+          event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+        );
+
+      await session.startTurn("one");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(events.filter((event) => event.type === "turn_queued")).toHaveLength(1);
+      await session.startTurn("two");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(events.filter((event) => event.type === "turn_queued")).toHaveLength(2);
+
+      await session.startTurn("three");
+      expect(events.filter((event) => event.type === "turn_started")).toHaveLength(3);
+
+      const startedAt = Date.now();
+      let outcome: "pending" | "resolved" | "rejected" = "pending";
+      void session.interrupt().then(
+        () => {
+          outcome = "resolved";
+          return outcome;
+        },
+        () => {
+          outcome = "rejected";
+          return outcome;
+        },
+      );
+
+      // Both removals are issued together, so neither one waits behind the
+      // other; the shared budget bounds the waiting, not the requests.
+      await vi.advanceTimersByTimeAsync(200);
+      expect(deleteCalls()).toBe(2);
+
+      // Fake time is exact, so this is the whole path: 200ms of queue budget,
+      // 500ms for the cancel notification that never answers and 1200ms of
+      // release wait. The stop is still waiting at 1750ms...
+      await vi.advanceTimersByTimeAsync(1_550);
+      expect(outcome).toBe("pending");
+      expect(cancel).toHaveBeenCalledTimes(1);
+
+      // ...and answers at 1900ms (200 + 500 + 1200). The provider never released
+      // the turn, so the stop says so - but it does so inside the manager's 2s,
+      // instead of losing the race to a queue phase that used to spend 5s
+      // before the cancel was even sent. This is also where a phase without its
+      // own bound fails: with a 500ms delete timeout but no shared budget, its
+      // two removals run one after another and push the answer to 2700ms (the
+      // pre-fix code had no delete bound at all and never answered).
+      await vi.advanceTimersByTimeAsync(150);
+      expect(outcome).toBe("rejected");
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+
+      // The stop said nothing about a withdrawal the provider had not answered
+      // for, and both removals report their own outcome afterwards.
+      expect(
+        notifications().some((item) =>
+          /before the queued message withdrawal finished/.test(item.message),
+        ),
+      ).toBe(true);
+
+      // Both removals stay tracked and report that no answer has arrived; a
+      // second stop still does not ask for them twice. Neither is claimed to be
+      // a withdrawal.
+      expect(
+        notifications().filter((item) => /has not answered the withdrawal/.test(item.message)),
+      ).toHaveLength(2);
+      expect(notifications().some((item) => /will not run/.test(item.message))).toBe(false);
+      expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/delete", {
+        sessionId: "session-1",
+        itemId: "item-1",
+      });
+      expect(extMethod).toHaveBeenCalledWith("mcode/session/queue/delete", {
+        sessionId: "session-1",
+        itemId: "item-2",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not cancel a turn that ended while the queue phase was running", async () => {
+    // `session/cancel` names no turn: the provider applies it to whatever runs
+    // at that moment. When the stopped turn answers during the queue phase there
+    // is nothing left to cancel, so the cancel is skipped instead of being sent
+    // into whatever the provider does next.
+    vi.useFakeTimers();
+    try {
+      const session = createSession();
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      let promptCalls = 0;
+      const turnAnswer = Promise.withResolvers<PromptResponse>();
+      const prompt = vi.fn((): Promise<PromptResponse> => {
+        promptCalls += 1;
+        // The first turn is refused as busy, so its message is queued and the
+        // removal below hangs. The turn the stop targets answers on its own.
+        if (promptCalls <= 2) {
+          return Promise.reject(
+            new Error(
+              "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+            ),
+          );
+        }
+        return turnAnswer.promise;
+      });
+      const extMethod = vi.fn(async (method: string) => {
+        if (method === "mcode/session/queue/enqueue") {
+          return { status: "queued", itemId: "item-1" };
+        }
+        // The removal never answers, so the queue phase spends its whole budget.
+        return new Promise<Record<string, unknown>>(() => undefined);
+      });
+      const cancel = vi.fn().mockResolvedValue(undefined);
+
+      asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+      asInternals<ACPSessionInternals>(session).connection = {
+        prompt,
+        extMethod,
+        cancel,
+        signal: new AbortController().signal,
+      };
+      asInternals<ACPSessionInternals>(session).agentMeta = {
+        "minimax-code/extensions": {
+          methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+        },
+      };
+
+      await session.startTurn("one");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(events.filter((event) => event.type === "turn_queued")).toHaveLength(1);
+
+      await session.startTurn("two");
+      const stopping = session.interrupt();
+      // The provider answers the turn while the queue phase is still spending
+      // its budget.
+      await vi.advanceTimersByTimeAsync(50);
+      turnAnswer.resolve({ stopReason: "end_turn" } as PromptResponse);
+      await vi.advanceTimersByTimeAsync(250);
+
+      // The stop still waits on the turn it captured and reports its release.
+      await expect(stopping).resolves.toBeUndefined();
+      expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+      // That turn is already over, so there is nothing to cancel.
+      expect(cancel).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not cancel a turn that started after the stop", async () => {
+    // The provider answers the stopped turn and starts another one while the
+    // queue phase runs. The user asked to stop the first one, so a session-wide
+    // cancel must not be sent into the second.
+    vi.useFakeTimers();
+    try {
+      const session = createSession();
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      let promptCalls = 0;
+      const turnAnswer = Promise.withResolvers<PromptResponse>();
+      const laterTurnAnswer = Promise.withResolvers<PromptResponse>();
+      const prompt = vi.fn((): Promise<PromptResponse> => {
+        promptCalls += 1;
+        if (promptCalls <= 2) {
+          return Promise.reject(
+            new Error(
+              "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+            ),
+          );
+        }
+        // The stopped turn answers; the turn that starts afterwards does not.
+        if (promptCalls === 3) {
+          return turnAnswer.promise;
+        }
+        return laterTurnAnswer.promise;
+      });
+      const extMethod = vi.fn(async (method: string) => {
+        if (method === "mcode/session/queue/enqueue") {
+          return { status: "queued", itemId: "item-1" };
+        }
+        return new Promise<Record<string, unknown>>(() => undefined);
+      });
+      const cancel = vi.fn().mockResolvedValue(undefined);
+
+      asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+      asInternals<ACPSessionInternals>(session).connection = {
+        prompt,
+        extMethod,
+        cancel,
+        signal: new AbortController().signal,
+      };
+      asInternals<ACPSessionInternals>(session).agentMeta = {
+        "minimax-code/extensions": {
+          methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+        },
+      };
+
+      await session.startTurn("one");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(events.filter((event) => event.type === "turn_queued")).toHaveLength(1);
+
+      await session.startTurn("two");
+      const stopping = session.interrupt();
+      await vi.advanceTimersByTimeAsync(50);
+      turnAnswer.resolve({ stopReason: "end_turn" } as PromptResponse);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+
+      // The provider starts another turn before the stop finishes its budget.
+      await session.startTurn("three");
+      await vi.advanceTimersByTimeAsync(250);
+
+      await expect(stopping).resolves.toBeUndefined();
+      expect(cancel).not.toHaveBeenCalled();
+      // The turn that started after the stop keeps running untouched.
+      expect(events.filter((event) => event.type === "turn_started")).toHaveLength(3);
+      expect(events.some((event) => event.type === "turn_canceled")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("reports a queue removal that answers after the deadline", async () => {
+    // The stop stops waiting after the deadline, but the request is not
+    // cancelled. The answer is the only report of the removal, so it is still
+    // read and reported, and it can confirm or deny the withdrawal.
+    vi.useFakeTimers();
+    try {
+      const session = createSession();
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      const prompt = vi
+        .fn()
+        .mockRejectedValue(
+          new Error(
+            "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+          ),
+        );
+      const deleteAnswer = Promise.withResolvers<Record<string, unknown>>();
+      let deleteCalls = 0;
+      const extMethod = vi.fn(async (method: string): Promise<Record<string, unknown>> => {
+        if (method === "mcode/session/queue/enqueue") {
+          return { status: "queued", itemId: "item-1" };
+        }
+        deleteCalls += 1;
+        return deleteAnswer.promise;
+      });
+
+      asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+      asInternals<ACPSessionInternals>(session).connection = {
+        prompt,
+        extMethod,
+        signal: new AbortController().signal,
+      };
+      asInternals<ACPSessionInternals>(session).agentMeta = {
+        "minimax-code/extensions": {
+          methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+        },
+      };
+
+      const notifications = () =>
+        events.flatMap((event) =>
+          event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+        );
+
+      await session.startTurn("hello");
+      await vi.advanceTimersByTimeAsync(300);
+      expect(events.filter((event) => event.type === "turn_queued")).toHaveLength(1);
+
+      const stopping = session.interrupt();
+      await vi.advanceTimersByTimeAsync(200);
+      await stopping;
+      // Stop-time snapshot: nothing is claimed, only that the removal is still
+      // pending.
+      expect(
+        notifications().some((item) =>
+          /before the queued message withdrawal finished/.test(item.message),
+        ),
+      ).toBe(true);
+      expect(notifications().some((item) => /withdrawn/.test(item.message))).toBe(false);
+
+      // The delete deadline passes with no answer at all.
+      await vi.advanceTimersByTimeAsync(300);
+      expect(
+        notifications().some((item) => /has not answered the withdrawal/.test(item.message)),
+      ).toBe(true);
+      expect(notifications().some((item) => /withdrawn/.test(item.message))).toBe(false);
+
+      // The provider answers late and names the item it removed.
+      deleteAnswer.resolve({ item: { itemId: "item-1", status: "cancelled" } });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Snapshot after the late answer: the real outcome, reported once.
+      expect(
+        notifications().filter((item) => /withdrawn from the provider's queue/.test(item.message)),
+      ).toHaveLength(1);
+      expect(deleteCalls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not report a malformed queue/delete answer as a withdrawal", async () => {
+    // A provider can answer the removal with something that says nothing about
+    // the item. Only an answer naming the removed item is a confirmation; a
+    // bare or unreadable answer leaves the outcome unknown, and reporting it as
+    // a withdrawal would claim a message is gone that may still run.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        return { status: "queued", itemId: "item-1" };
+      }
+      // A success without the removed item proves nothing about this one.
+      return { ok: true };
+    });
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    const turnIsQueued = (): boolean => events.some((event) => event.type === "turn_queued");
+    await session.startTurn("hello");
+    await vi.waitFor(() => expect(turnIsQueued()).toBe(true));
+
+    await session.interrupt();
+
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(false);
     expect(notifications.some((item) => /will not run/.test(item.message))).toBe(false);
+    expect(
+      notifications.some((item) => /answer did not confirm the withdrawal/.test(item.message)),
+    ).toBe(true);
+  });
+
+  test("reports a late acknowledged message whose removal failed as unknown", async () => {
+    // The enqueue answer arrives after the cancel was sent, so the removal may
+    // fail. A failed removal is not proof that the item is running, and it is
+    // certainly not a withdrawal: the stop says exactly that.
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const prompt = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Internal error: MiniMax Code Runtime failed: Session already has an active Turn. Use queue send to deliver the message after it.",
+        ),
+      );
+    const enqueueStarted = Promise.withResolvers<void>();
+    const enqueueAnswer = Promise.withResolvers<unknown>();
+    const extMethod = vi.fn(async (method: string) => {
+      if (method === "mcode/session/queue/enqueue") {
+        enqueueStarted.resolve();
+        return enqueueAnswer.promise;
+      }
+      throw new Error("Queue item not found: session-1/item-1");
+    });
+    const cancel = vi.fn().mockResolvedValue(undefined);
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = {
+      prompt,
+      extMethod,
+      cancel,
+      signal: new AbortController().signal,
+    };
+    asInternals<ACPSessionInternals>(session).agentMeta = {
+      "minimax-code/extensions": {
+        methods: ["mcode/session/queue/enqueue", "mcode/session/queue/delete"],
+      },
+    };
+
+    await session.startTurn("hello");
+    await enqueueStarted.promise;
+
+    const stopping = session.interrupt();
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
+    enqueueAnswer.resolve({ status: "queued", itemId: "item-1" });
+    await stopping;
+
+    const notifications = events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "notification" ? [event.item] : [],
+    );
+    expect(
+      notifications.some((item) => /answer did not confirm the withdrawal/.test(item.message)),
+    ).toBe(true);
+    expect(events.some((event) => event.type === "turn_queued")).toBe(false);
+    expect(events.some((event) => event.type === "turn_canceled")).toBe(true);
+    expect(notifications.some((item) => /withdrawn/.test(item.message))).toBe(false);
+    expect(notifications.some((item) => /will not run/.test(item.message))).toBe(false);
+    expect(notifications.some((item) => /already be running/.test(item.message))).toBe(false);
   });
 
   test("fails the turn when the provider is busy and offers no queue", async () => {

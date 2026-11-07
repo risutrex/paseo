@@ -513,6 +513,47 @@ function readQueuedItemId(response: unknown): string | null {
 }
 
 /**
+ * What the provider's answer to `queue/delete` proves about one item.
+ *
+ * Measured against MiniMax Code 0.7.3 (see the captured frames in the probe
+ * notes): a real removal answers with the item snapshot, `status: "cancelled"`,
+ * and the session the item belonged to. Only that shape confirms anything. A
+ * bare success, another status, a different item or session, and `item: null`
+ * all prove nothing about this message, and counting them as removed would
+ * report a message as gone that may still run. None of them is proof that the
+ * provider claimed the item either: the provider answers a repeat delete with
+ * an error that says only that it no longer holds the item.
+ */
+type QueueDeleteOutcome = "removed" | "unknown";
+
+function readQueueDeleteOutcome(
+  response: unknown,
+  request: { sessionId: string; itemId: string },
+): QueueDeleteOutcome {
+  if (!isRecord(response) || !("item" in response)) {
+    return "unknown";
+  }
+  const item = (response as { item?: unknown }).item;
+  if (!isRecord(item)) {
+    // `item: null` included: the provider no longer holds the item, which says
+    // nothing about whether the message ran.
+    return "unknown";
+  }
+  if (item.itemId !== request.itemId) {
+    return "unknown";
+  }
+  if (item.status !== "cancelled") {
+    return "unknown";
+  }
+  // The answer names the session when it has one; another session is another
+  // queue, and its cancellation is not this item's.
+  if (typeof item.sessionId === "string" && item.sessionId !== request.sessionId) {
+    return "unknown";
+  }
+  return "removed";
+}
+
+/**
  * What became of a message the busy provider refused.
  *
  * `skipped` never reached the queue; `queued` was confirmed with an item id;
@@ -538,10 +579,23 @@ const MCODE_QUEUE_ENQUEUE_METHOD = "mcode/session/queue/enqueue";
 // current turn. `mcode/session/queue/delete` cancels a queued item, and the
 // provider refuses (`not_editable`) once it has claimed the item for a turn.
 const MCODE_QUEUE_DELETE_METHOD = "mcode/session/queue/delete";
-// The provider answers `queue/enqueue` with the item it created. A Stop cannot
-// withdraw an item whose id has not arrived yet, so it waits for that answer
-// instead of guessing whether a message is about to appear in the queue.
+// The provider answers `queue/enqueue` with the item it created. A caller
+// cannot withdraw an item whose id has not arrived yet, so it waits for that
+// answer instead of guessing whether a message is about to appear in the
+// queue. A stop that already marked the queued turn stopped does not wait: the
+// answer takes the item back itself.
 const ACP_QUEUE_ACK_WAIT_MS = 5_000;
+// How long the stop waits for a queue removal answer. The request is not
+// cancelled - an answer that arrives later is still read and reported - but the
+// stop cannot hold on for it: an unbounded wait is what made the interrupt lose
+// the manager's timeout.
+const ACP_QUEUE_DELETE_TIMEOUT_MS = 500;
+// The manager races the whole interrupt against about 2s. After this phase,
+// session/cancel may take 500ms and the foreground release 1200ms, so the queue
+// gets 200ms: the worst case stays at 1900ms. The budget covers the phase as a
+// whole, so several removals the provider never answers cannot add up past it;
+// the withdrawal keeps running afterwards and reports its real outcome then.
+const ACP_INTERRUPT_QUEUE_WITHDRAW_BUDGET_MS = 200;
 // What the provider is holding for later turns. The list is the only report that
 // survives a reconnect: the provider does not replay its queue notifications after
 // a resume, so a client that reconnects has to ask. Bound the call - a provider
@@ -2451,6 +2505,25 @@ export class ACPAgentSession implements AgentSession, ACPClient {
    * own doing, so it must not be reported as a message that ran unobserved.
    */
   private readonly withdrawnQueueItemIds = new Set<string>();
+  /**
+   * Removals this client has asked for and the provider has not answered yet.
+   *
+   * The items are already out of `queuedProviderItems`, but they are not
+   * forgotten: their outcome is still reported when the answer arrives, and a
+   * second stop does not ask for the same removal twice.
+   */
+  private readonly withdrawingQueueItemIds = new Set<string>();
+  /**
+   * Items that left the provider's queue while this client's removal for them
+   * was still in flight, by item id.
+   *
+   * That departure is consistent with the request this client already sent, so
+   * it is not reported as a message that left on its own. It is kept until the
+   * answer arrives, because an answer that does not confirm the removal still
+   * means the item left the queue for a reason this client cannot name - a real
+   * unknown, not a withdrawal.
+   */
+  private readonly leftQueueWhileWithdrawing = new Set<string>();
   private readonly terminateProcess: ProcessTerminator;
 
   constructor(config: AgentSessionConfig, options: ACPAgentSessionOptions) {
@@ -3607,13 +3680,34 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private applyProviderQueueSnapshot(items: ProviderQueueItemSnapshot[]): void {
     const previous = this.providerQueueItems;
     this.providerQueueItems = items;
-    if (previous.length === 0) {
-      return;
-    }
     const present = new Set(items.map((item) => item.itemId));
-    const leftBehind = previous.filter(
-      (item) => !present.has(item.itemId) && !this.withdrawnQueueItemIds.delete(item.itemId),
-    );
+    const leftBehind: ProviderQueueItemSnapshot[] = [];
+    for (const item of previous) {
+      if (present.has(item.itemId)) {
+        continue;
+      }
+      if (this.withdrawnQueueItemIds.delete(item.itemId)) {
+        // The removal this client already confirmed.
+        continue;
+      }
+      if (this.withdrawingQueueItemIds.has(item.itemId)) {
+        // The departure is what this client's own removal looks like before
+        // its answer arrives. Reporting it here as an unexplained run would
+        // contradict the answer a moment later; the answer is what reports the
+        // outcome, including when it fails.
+        this.leftQueueWhileWithdrawing.add(item.itemId);
+        continue;
+      }
+      leftBehind.push(item);
+    }
+    // A marker only ever suppresses the one departure it was recorded for. An
+    // item that is already absent can never leave again, so a marker left for
+    // it would otherwise stay in memory for the life of the session.
+    for (const itemId of this.withdrawnQueueItemIds) {
+      if (!present.has(itemId)) {
+        this.withdrawnQueueItemIds.delete(itemId);
+      }
+    }
     if (leftBehind.length === 0) {
       return;
     }
@@ -3624,13 +3718,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         }
       });
     }
-    this.pushEvent(
-      this.wrapTimeline({
-        type: "notification",
-        level: "warning",
-        message:
-          "A message left the provider's queue. The provider does not report the result of a queued message, so whether it ran is unknown.",
-      }),
+    this.pushQueueNotice(
+      "warning",
+      "A message left the provider's queue. The provider does not report the result of a queued message, so whether it ran is unknown.",
     );
     this.logger.info(
       { items: leftBehind.map((item) => item.itemId) },
@@ -3954,13 +4044,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
    * Reports a message whose queue id is unknown, so the stop cannot take it back.
    */
   private reportQueuedMessageUnknown(): void {
-    this.pushEvent(
-      this.wrapTimeline({
-        type: "notification",
-        level: "warning",
-        message:
-          "A message handed to the provider's queue was not confirmed: it may still be in the queue and cannot be withdrawn.",
-      }),
+    this.pushQueueNotice(
+      "warning",
+      "A message handed to the provider's queue was not confirmed: it may still be in the queue and cannot be withdrawn.",
     );
   }
 
@@ -3970,8 +4056,16 @@ export class ACPAgentSession implements AgentSession, ACPClient {
    * The provider cancels a queued item on request and refuses once it has
    * claimed that item for a turn. A refused removal is reported as it is: the
    * message will run, and telling the user it stopped would be a lie.
+   *
+   * `awaitInFlightEnqueues` decides whether an enqueue that has not answered
+   * yet is waited for. A stop that already marked those turns stopped does not
+   * wait: the answer withdraws the item itself, and the wait only delays the
+   * cancellation the user asked for.
    */
-  private async withdrawQueuedPrompts(): Promise<void> {
+  private async withdrawQueuedPrompts(options?: {
+    awaitInFlightEnqueues?: boolean;
+  }): Promise<void> {
+    const awaitInFlightEnqueues = options?.awaitInFlightEnqueues ?? true;
     if (this.queuedProviderItems.size === 0 && this.pendingQueueEnqueues.size === 0) {
       return;
     }
@@ -3984,7 +4078,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
     // An enqueue still in flight has no item id to delete yet. Wait for the answer: it
     // either makes the item withdrawable or ends the turn as unconfirmed.
-    const inFlight = [...this.pendingQueueEnqueues.values()];
+    const inFlight = awaitInFlightEnqueues ? [...this.pendingQueueEnqueues.values()] : [];
     if (inFlight.length > 0) {
       try {
         await withTimeout(
@@ -4002,60 +4096,239 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
     const pending = [...this.queuedProviderItems];
     this.queuedProviderItems.clear();
-    for (const [turnId, itemId] of pending) {
-      await this.withdrawQueuedPrompt(turnId, itemId);
-    }
+    // The removals are issued together. The provider answers one request at a
+    // time, so awaiting them in turn made every item pay its own timeout, and a
+    // shared budget only ever covered the first one. The wait is bounded by the
+    // caller; a request still unanswered keeps running and reports its own
+    // outcome, so the item stays tracked instead of being dropped.
+    await Promise.all(pending.map(([turnId, itemId]) => this.withdrawQueuedPrompt(turnId, itemId)));
   }
 
   /**
    * Asks the provider to drop one queued item and reports the answer as it is.
    */
   private async withdrawQueuedPrompt(turnId: string, itemId: string): Promise<void> {
+    // A removal already in flight owns this item's outcome: asking again would
+    // send a second delete for the same item and could report it twice.
+    if (this.withdrawingQueueItemIds.has(itemId)) {
+      return;
+    }
     const connection = this.connection;
     const sessionId = this.sessionId;
     if (!connection || !sessionId) {
       this.reportQueuedMessageUnknown();
       return;
     }
-    try {
-      const response = await connection.extMethod(MCODE_QUEUE_DELETE_METHOD, {
-        sessionId,
-        itemId,
+    // The answer is the only report of the removal, and it can arrive after
+    // the stop has given up waiting. The request keeps its own handler, so a
+    // late answer still reports what really happened, and the item stays
+    // tracked until then instead of being forgotten.
+    this.withdrawingQueueItemIds.add(itemId);
+    let answered = false;
+    // ACP requests are bounded by the caller, not cancelled by it: this one is
+    // still alive after the deadline and its answer is still the truth.
+    const request = connection.extMethod(MCODE_QUEUE_DELETE_METHOD, { sessionId, itemId });
+    void request
+      .then(
+        (response) => {
+          answered = true;
+          this.withdrawingQueueItemIds.delete(itemId);
+          this.applyQueueDeleteAnswer(turnId, itemId, sessionId, response);
+          return undefined;
+        },
+        (error) => {
+          answered = true;
+          this.withdrawingQueueItemIds.delete(itemId);
+          this.logger.warn(
+            { err: error, turnId, itemId },
+            "ACP provider did not withdraw the queued prompt",
+          );
+          // A failed removal is not proof that the provider claimed the item: the
+          // measured refusal for an item it no longer holds says only that - not
+          // that the message is running. The outcome stays unknown.
+          this.reportQueuedMessageWithdrawalUnconfirmed(
+            turnId,
+            itemId,
+            "queue/delete failed",
+            this.leftQueueWhileWithdrawing.delete(itemId),
+          );
+          return undefined;
+        },
+      )
+      // This chain is detached from the caller, and a report can throw (a
+      // subscriber, for one). Without a terminal handler such an exception
+      // becomes an unhandled rejection with no record of which item it
+      // belonged to.
+      .catch((error: unknown) => {
+        this.logger.warn({ err: error, turnId, itemId }, "ACP queue removal report failed");
       });
-      if (isRecord(response) && "item" in response && response.item === null) {
-        this.reportQueuedMessageStuck(turnId, itemId);
+    // The stop only waits this long; it does not cancel the request.
+    const timeoutMessage = `ACP queue delete did not answer within ${ACP_QUEUE_DELETE_TIMEOUT_MS}ms`;
+    try {
+      await withTimeout(request, ACP_QUEUE_DELETE_TIMEOUT_MS, timeoutMessage);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== timeoutMessage) {
+        // The request failed, and its handler above already reported the
+        // refusal. This is not a timeout and must not be reported as one.
         return;
       }
-      // The item left the queue because this client took it back, so its
-      // departure is not a message that ran unobserved.
-      this.withdrawnQueueItemIds.add(itemId);
-      this.pushEvent(
-        this.wrapTimeline({
-          type: "notification",
-          level: "info",
-          message: "The queued message was withdrawn from the provider and will not run.",
-        }),
-      );
-    } catch (error) {
-      this.logger.warn(
-        { err: error, turnId, itemId },
-        "ACP provider refused to withdraw the queued prompt",
-      );
-      this.reportQueuedMessageStuck(turnId, itemId);
+      if (!answered) {
+        this.reportQueuedMessageWithdrawalUnanswered(
+          turnId,
+          itemId,
+          this.leftQueueWhileWithdrawing.has(itemId),
+        );
+      }
     }
   }
 
-  private reportQueuedMessageStuck(turnId: string, itemId: string): void {
-    this.logger.warn({ turnId, itemId }, "ACP provider did not withdraw the queued prompt");
-    // The provider refuses the removal once it claimed the item, so the
-    // message is either running or already past the queue. Saying which one
-    // would be a guess; saying that it will not run would be a lie.
-    this.pushEvent(
-      this.wrapTimeline({
-        type: "notification",
-        level: "warning",
-        message: "The queued message cannot be withdrawn; the provider may already be running it.",
-      }),
+  /**
+   * Reports what a completed `queue/delete` answer proves about one item.
+   *
+   * Read the same way whether the answer arrived inside the stop's waiting
+   * window or after it: the answer is the only report of the removal.
+   */
+  private applyQueueDeleteAnswer(
+    turnId: string,
+    itemId: string,
+    sessionId: string,
+    response: unknown,
+  ): void {
+    const leftQueue = this.leftQueueWhileWithdrawing.delete(itemId);
+    const outcome = readQueueDeleteOutcome(response, { sessionId, itemId });
+    if (outcome !== "removed") {
+      this.reportQueuedMessageWithdrawalUnconfirmed(
+        turnId,
+        itemId,
+        "queue/delete answered without a cancelled copy of this item",
+        leftQueue,
+      );
+      return;
+    }
+    // The item left the queue because this client took it back, so its
+    // departure is not a message that ran unobserved. Only the removal is
+    // confirmed here: this answer cannot promise that a provider which already
+    // started the turn would not still run it.
+    this.withdrawnQueueItemIds.add(itemId);
+    this.pushQueueNotice("info", "The queued message was withdrawn from the provider's queue.");
+  }
+
+  /**
+   * Publishes a queue notice to the session stream.
+   *
+   * A closed session has no stream left to deliver to, so a notice produced
+   * after that point is logged only. This is also why no queue message promises
+   * that an answer arriving later will be reported: it is reported while the
+   * session is open, and not after it is gone.
+   *
+   * Delivery is best effort. A notice is a report, not a step of the stop: a
+   * subscriber that throws while reading it must not reject the interrupt and
+   * leave `session/cancel` unsent.
+   */
+  private pushQueueNotice(level: "info" | "warning", message: string): void {
+    if (this.closed) {
+      this.logger.info({ level, message }, "ACP queue notice not delivered: the session is closed");
+      return;
+    }
+    try {
+      this.pushEvent(this.wrapTimeline({ type: "notification", level, message }));
+    } catch (error) {
+      this.logger.warn({ err: error, level }, "ACP queue notice delivery failed");
+    }
+  }
+
+  /**
+   * Reports a completed removal answer that does not confirm the withdrawal.
+   *
+   * The provider answered, but the answer does not name the item it took back.
+   * Saying the message will not run would be a guess.
+   */
+  private reportQueuedMessageWithdrawalUnconfirmed(
+    turnId: string,
+    itemId: string,
+    reason: string,
+    leftQueue: boolean,
+  ): void {
+    if (leftQueue) {
+      this.reportQueuedMessageLeftQueueUnconfirmed(turnId, itemId, reason);
+      return;
+    }
+    this.logger.warn(
+      { reason, turnId, itemId },
+      "ACP provider did not confirm the queued prompt withdrawal",
+    );
+    this.pushQueueNotice(
+      "warning",
+      "The provider's answer did not confirm the withdrawal: the queued message may still run.",
+    );
+  }
+
+  /**
+   * Reports a removal the provider has not answered yet.
+   *
+   * This is not the last word: the answer is still being listened for. It says
+   * exactly what is known at this point - nothing - and the real outcome is
+   * reported when the provider answers.
+   */
+  private reportQueuedMessageWithdrawalUnanswered(
+    turnId: string,
+    itemId: string,
+    leftQueue: boolean,
+  ): void {
+    if (leftQueue) {
+      // The item is gone from the queue but the answer that would say why has
+      // not arrived. That is still an unknown, not a withdrawal.
+      this.reportQueuedMessageLeftQueueUnconfirmed(turnId, itemId, "queue/delete has not answered");
+      return;
+    }
+    this.logger.warn(
+      { turnId, itemId },
+      "ACP provider has not answered the queued prompt withdrawal",
+    );
+    this.pushQueueNotice(
+      "warning",
+      "The provider has not answered the withdrawal of the queued message yet: it may still run.",
+    );
+  }
+
+  /**
+   * Reports an item that left the queue while its removal was in flight and
+   * whose removal is not confirmed.
+   *
+   * The departure is consistent with this client's request, so it is not
+   * reported as a message that ran unobserved - but an answer that did not
+   * confirm the removal means the reason is unknown: the withdrawal landed, or
+   * the provider took the item for a turn. Saying which one would be a guess.
+   */
+  private reportQueuedMessageLeftQueueUnconfirmed(
+    turnId: string,
+    itemId: string,
+    reason: string,
+  ): void {
+    this.logger.warn(
+      { reason, turnId, itemId },
+      "ACP queued item left the queue without a confirmed withdrawal",
+    );
+    this.pushQueueNotice(
+      "warning",
+      "The queued message left the provider's queue while its removal was in flight, and the removal was not confirmed: whether it ran is unknown.",
+    );
+  }
+
+  /**
+   * Reports a withdrawal that was still running when the stop answered.
+   *
+   * Nothing is claimed about the item: the provider has not answered yet, so it
+   * may still run. Its real outcome is reported when that answer arrives.
+   */
+  private reportQueuedMessageWithdrawalStillPending(): void {
+    this.logger.warn(
+      { budgetMs: ACP_INTERRUPT_QUEUE_WITHDRAW_BUDGET_MS },
+      "ACP queue withdrawal did not finish before the stop returned",
+    );
+    this.pushQueueNotice(
+      "warning",
+      "The stop returned before the queued message withdrawal finished: the provider may still run it.",
     );
   }
 
@@ -4064,37 +4337,92 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       return;
     }
 
+    // Everything that names the turn the user stopped is captured before the
+    // first await: the queue phase below takes time, and by then the provider
+    // may have answered this turn and moved on. Capturing the pending prompt
+    // here also keeps the release wait on the turn that was actually
+    // cancelled, instead of on whatever the provider starts next.
+    const activeTurnId = this.activeForegroundTurnId;
+    const pending = activeTurnId ? (this.foregroundPrompts.get(activeTurnId) ?? null) : null;
+    if (activeTurnId) {
+      this.interruptingForegroundTurnId = activeTurnId;
+    }
+
     this.cancelPendingPermissions();
     // A Stop stops the session, not only the turn that happens to be running:
     // a message already waiting in the provider's queue would otherwise run
     // right after the stop the user was promised.
     // An enqueue still in flight is marked first: nobody could withdraw an item whose
     // id had not arrived, so its answer withdraws what it just created.
+    //
+    // Those answers are not awaited here. This call has to report whether the
+    // running turn was released inside the caller's timeout, and waiting for a
+    // provider that is slow to answer the enqueue would spend that timeout on
+    // the queue instead: the stop would come back as refused before
+    // session/cancel was even sent. An item already in the queue is still
+    // withdrawn before the cancel, so cancelling is not what claims it.
     for (const turnId of this.pendingQueueEnqueues.keys()) this.stoppedWhileQueueing.add(turnId);
-    await this.withdrawQueuedPrompts();
+    // The wait is bounded as a whole and the removals are issued together:
+    // several that hang one after another would otherwise spend the timeout the
+    // cancel and the release wait need, and the stop would be reported as
+    // refused. Nothing is assumed when the budget runs out - the withdrawal
+    // keeps running and each item reports its real outcome when it answers.
+    const withdrawal = this.withdrawQueuedPrompts({ awaitInFlightEnqueues: false });
+    const queuePhaseTimeout = `ACP queue withdrawal did not finish within ${ACP_INTERRUPT_QUEUE_WITHDRAW_BUDGET_MS}ms`;
+    let queuePhaseFinished = true;
+    try {
+      await withTimeout(
+        withdrawal.then(() => undefined),
+        ACP_INTERRUPT_QUEUE_WITHDRAW_BUDGET_MS,
+        queuePhaseTimeout,
+      );
+    } catch (error) {
+      // Only the budget expiring means "still running". A real failure of the
+      // withdrawal is not a timeout and must not be reported as one.
+      if (!(error instanceof Error) || error.message !== queuePhaseTimeout) {
+        throw error;
+      }
+      queuePhaseFinished = false;
+    }
+    if (!queuePhaseFinished) {
+      this.reportQueuedMessageWithdrawalStillPending();
+    }
 
-    const activeTurnId = this.activeForegroundTurnId;
     if (!activeTurnId) {
       return;
     }
 
-    // Capture the pending prompt before cancelling: the provider may answer
-    // the cancelled turn and start another one while the notification is in
-    // flight, and waiting for that other turn would report a release that
-    // never happened.
-    const pending = this.foregroundPrompts.get(activeTurnId) ?? null;
-    this.interruptingForegroundTurnId = activeTurnId;
-
-    try {
-      await withTimeout(
-        this.connection.cancel({ sessionId: this.sessionId }),
-        ACP_CANCEL_NOTIFICATION_TIMEOUT_MS,
-        `ACP session/cancel timed out after ${ACP_CANCEL_NOTIFICATION_TIMEOUT_MS}ms`,
-      );
-    } catch (error) {
-      this.logger.warn(
-        { err: error, turnId: activeTurnId },
-        "Failed to send the ACP session/cancel notification",
+    // `session/cancel` names no turn: the provider applies it to whatever it is
+    // running at that moment. The queue phase above takes time, so re-check that
+    // the stopped turn is still the active one right before sending it - a turn
+    // that started after the stop is not the one the user asked to stop.
+    //
+    // The check cannot be atomic with the provider's own turn switch: a provider
+    // that starts another turn between this line and its handling of the
+    // notification may still cancel it. Skipping the cancel once the stopped
+    // turn is gone is the conservative half that this side can do.
+    // The captured prompt is the other half of the same question: a turn whose
+    // prompt already settled is over even if the active id has not been cleared
+    // yet. Both have to agree before the session-wide cancel is sent.
+    const stoppedTurnStillRunning =
+      this.activeForegroundTurnId === activeTurnId && this.foregroundPrompts.has(activeTurnId);
+    if (stoppedTurnStillRunning) {
+      try {
+        await withTimeout(
+          this.connection.cancel({ sessionId: this.sessionId }),
+          ACP_CANCEL_NOTIFICATION_TIMEOUT_MS,
+          `ACP session/cancel timed out after ${ACP_CANCEL_NOTIFICATION_TIMEOUT_MS}ms`,
+        );
+      } catch (error) {
+        this.logger.warn(
+          { err: error, turnId: activeTurnId },
+          "Failed to send the ACP session/cancel notification",
+        );
+      }
+    } else {
+      this.logger.info(
+        { turnId: activeTurnId },
+        "Skipped ACP session/cancel: the stopped turn is no longer the active one",
       );
     }
 
