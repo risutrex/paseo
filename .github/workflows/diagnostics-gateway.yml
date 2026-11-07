@@ -1,0 +1,30 @@
+name: Diagnostics (gateway reachability)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Resolve, connect, answer
+        run: |
+          set -u
+          host="gate.trinity.guru"
+          echo "== DNS =="
+          getent hosts "$host" || echo "DNS: no answer"
+          echo "== TCP 443 =="
+          timeout 15 bash -c "cat < /dev/null > /dev/tcp/$host/443" && echo "TCP: connected" || echo "TCP: failed or timed out"
+          echo "== HTTPS GET / =="
+          curl -sS -o /dev/null -m 15 -w 'GET / -> %{http_code} in %{time_total}s\n' "https://$host/" || echo "GET /: failed"
+          echo "== HTTPS POST /omni/v1/messages (no key) =="
+          curl -sS -o /dev/null -m 20 -w 'POST -> %{http_code} in %{time_total}s\n' \
+            -X POST "https://$host/omni/v1/messages" \
+            -H 'content-type: application/json' \
+            -d '{"model":"x","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' || echo "POST: failed"
+          echo "== control: api.github.com =="
+          curl -sS -o /dev/null -m 15 -w 'github -> %{http_code} in %{time_total}s\n' https://api.github.com || echo "github: failed"
