@@ -9,50 +9,44 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
-      - name: Host network
-        run: |
-          set -u
-          host="gate.trinity.guru"
-          echo "== host DNS =="
-          getent ahosts "$host" | head -4
-          echo "== host POST =="
-          curl -sS -o /dev/null -m 20 -w 'host POST -> %{http_code} in %{time_total}s\n' \
-            -X POST "https://$host/omni/v1/messages" -H 'content-type: application/json' \
-            -d '{"model":"x","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' || echo "host POST failed"
-
-      - name: Inside the reviewer image
+      - name: Where does LiteLLM connect
         run: |
           cat > /tmp/probe.py <<'PY'
-          import json
+          import os
           import socket
           import time
           import urllib.request
 
-          host = "gate.trinity.guru"
-          infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-          print("getaddrinfo:", [(i[0].name, i[4][0]) for i in infos])
-          for info in infos[:4]:
-              family = info[0]
-              address = info[4]
-              started = time.time()
-              try:
-                  sock = socket.socket(family, socket.SOCK_STREAM)
-                  sock.settimeout(8)
-                  sock.connect(address)
-                  print("connect", address, "ok in %.2fs" % (time.time() - started))
-                  sock.close()
-              except Exception as error:
-                  print("connect", address, "failed:", type(error).__name__, error, "after %.2fs" % (time.time() - started))
-          body = json.dumps({"model": "x", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode()
-          request = urllib.request.Request("https://" + host + "/omni/v1/messages", data=body, headers={"content-type": "application/json"})
+          print("--- plain https to api.anthropic.com ---")
           started = time.time()
           try:
-              with urllib.request.urlopen(request, timeout=12) as response:
-                  print("urllib POST ->", response.status, "%.2fs" % (time.time() - started))
+              request = urllib.request.Request("https://api.anthropic.com/v1/messages", data=b"{}", headers={"content-type": "application/json"})
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  print("anthropic.com ->", response.status, "%.2fs" % (time.time() - started))
           except Exception as error:
-              print("urllib POST failed:", type(error).__name__, str(error)[:200], "%.2fs" % (time.time() - started))
+              print("anthropic.com failed:", type(error).__name__, str(error)[:120], "%.2fs" % (time.time() - started))
+
+          print("--- litellm with ANTHROPIC_API_BASE set ---")
+          os.environ["ANTHROPIC_API_BASE"] = "https://gate.trinity.guru/omni"
+          os.environ["ANTHROPIC_API_KEY"] = "dummy-key"
+          import litellm
+
+          print("litellm version:", getattr(litellm, "__version__", "?"))
+          print("litellm.api_base:", litellm.api_base)
+          started = time.time()
+          try:
+              litellm.completion(
+                  model="anthropic/deepseek-v4.1-flash",
+                  messages=[{"role": "user", "content": "hi"}],
+                  timeout=25,
+              )
+              print("completion OK %.2fs" % (time.time() - started))
+          except Exception as error:
+              print("completion failed:", type(error).__name__, str(error)[:300], "%.2fs" % (time.time() - started))
+              print("  api_base:", getattr(error, "api_base", None))
+              print("  model:", getattr(error, "model", None))
           PY
           docker run --rm -v /tmp/probe.py:/probe.py:ro --entrypoint python3 \
             pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c /probe.py
