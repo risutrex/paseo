@@ -13,20 +13,9 @@ jobs:
     steps:
       - name: Find the timeout setting
         run: |
-          cat > /tmp/probe.py <<'PY'
-          import pathlib
-          import pr_agent
-
-          root = pathlib.Path(pr_agent.__file__).parent
-          print("package:", root)
-          print("--- timeout settings in pr_agent ---")
-          for path in sorted(root.rglob("*.py")):
-              if "setting" not in path.name and "config" not in path.name:
-                  continue
-              for number, line in enumerate(path.read_text(errors="ignore").splitlines(), 1):
-                  lowered = line.lower()
-                  if "timeout" in lowered and "=" in line:
-                  print("   ", path.relative_to(root), number, ":", line.strip()[:150])
-          PY
-          docker run --rm -v /tmp/probe.py:/probe.py:ro --entrypoint python3 \
-            pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c /probe.py
+          docker run --rm --entrypoint sh pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c -c "
+          echo '--- request_timeout definitions ---'
+          grep -rn 'request_timeout' /usr/local/lib/python3.14/site-packages/pr_agent/ | head -12
+          echo '--- CONFIG__ env prefix ---'
+          grep -rn 'CONFIG__' /usr/local/lib/python3.14/site-packages/pr_agent/settings/configuration.py | head -8
+          "
