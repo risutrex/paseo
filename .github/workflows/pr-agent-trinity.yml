@@ -35,9 +35,11 @@ jobs:
         uses: docker://pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ANTHROPIC_API_KEY: ${{ secrets.TRINITY_API_KEY }}
+          # The key and the endpoint of the model gateway are repository secrets,
+          # so a public fork does not publish either of them.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # LiteLLM appends /v1/messages unless it is already present.
-          ANTHROPIC_API_BASE: https://gate.trinity.guru/omni
+          ANTHROPIC_API_BASE: ${{ secrets.ANTHROPIC_API_BASE }}
           CONFIG__MODEL: anthropic/deepseek-v4.1-flash
           CONFIG__MODEL_WEAK: anthropic/deepseek-v4.1-flash
           CONFIG__FALLBACK_MODELS: "[]"
